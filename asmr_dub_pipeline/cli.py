@@ -14,6 +14,7 @@ from asmr_dub_pipeline.gemma.llama_cpp_client import (
     DEFAULT_LLAMA_CPP_MODEL,
 )
 
+from .config import load_project_config, save_project_config
 from .logging import console
 from .orchestrator import run_pipeline
 from .pipeline.manifest_io import manifest_path
@@ -40,6 +41,29 @@ RIGHTS_HELP = (
     "references, and distribution."
 )
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FULL_REAL_QUALITY_PRESET = {
+    "source_language": "ja",
+    "candidate_count": 8,
+    "duration_tolerance": 0.15,
+    "gemma_llama_cpp_ctx_size": 8192,
+    "gemma_llama_cpp_n_predict": 2048,
+    "gemma_text_batch_size": 24,
+    "gemma_text_concurrency": 1,
+    "gemma_text_n_predict": 4096,
+    "gemma_text_retries": 2,
+    "gemma_text_timeout_sec": 300.0,
+    "gsv_timeout_sec": 240.0,
+    "gsv_retries": 3,
+    "gsv_concurrency": 1,
+    "gsv_few_shot_target_sec": 180.0,
+    "gsv_few_shot_min_clip_sec": 2.0,
+    "gsv_few_shot_max_clip_sec": 8.0,
+    "gsv_few_shot_min_quality_score": 0.35,
+    "gsv_ref_min_quality_score": 0.40,
+    "gsv_gpt_weights_policy": "auto",
+    "gsv_sovits_weights_policy": "auto",
+    "mix_allow_korean_timing_draft": False,
+}
 
 app = typer.Typer(
     help=(
@@ -96,6 +120,15 @@ def _configure_local_model_cache() -> list[str]:
     lines.append(f"llama.cpp mmproj: {'found' if llama_mmproj.exists() else 'missing'}")
     lines.append(f"llama.cpp CLI: {'found' if llama_cli.exists() else 'missing'}")
     return lines
+
+
+def _apply_full_real_quality_preset(project_dir: Path, target_language: str) -> None:
+    init_project(project_dir)
+    cfg = load_project_config(project_dir)
+    payload = cfg.model_dump(mode="json")
+    payload.update(FULL_REAL_QUALITY_PRESET)
+    payload["target_language"] = target_language
+    save_project_config(type(cfg).model_validate(payload), project_dir / "pipeline.yaml")
 
 
 @app.command()
@@ -433,7 +466,7 @@ def full(
         help="Use real Gemma/GPT-SoVITS backends. Default uses deterministic mock backends.",
     ),
     gemma_backend: str = typer.Option(
-        "hf",
+        "llama_cpp",
         "--gemma-backend",
         help="hf|http|llama_cpp when --real is set.",
     ),
@@ -458,9 +491,9 @@ def full(
         help="Fine-tune GPT-SoVITS from source segments when --real is set.",
     ),
     gsv_few_shot_force: bool = typer.Option(
-        False,
-        "--force-few-shot",
-        help="Re-run GPT-SoVITS few-shot training even when cached weights match.",
+        True,
+        "--force-few-shot/--reuse-few-shot",
+        help="Re-run GPT-SoVITS few-shot training for maximum quality, or reuse cached weights.",
     ),
     cache_status: bool = typer.Option(True, "--cache-status/--no-cache-status"),
 ) -> None:
@@ -473,6 +506,9 @@ def full(
     if cache_status:
         for line in cache_lines:
             console.print(f"[dim]{line}[/dim]")
+    if real:
+        _apply_full_real_quality_preset(project_dir, target_language)
+        console.print("[dim]Applied full --real high-quality preset to pipeline.yaml[/dim]")
     try:
         manifest = run_pipeline(
             input_path,

@@ -5,9 +5,12 @@ from pathlib import Path
 
 from conftest import sha256
 
+import asmr_dub_pipeline.cli as cli_module
 from asmr_dub_pipeline.cli import app
+from asmr_dub_pipeline.config import load_project_config
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest
 from asmr_dub_pipeline.pipeline.steps import extract_step, mix_step, segment_step
+from asmr_dub_pipeline.schemas import PipelineManifest
 
 
 def test_mock_pipeline_e2e(cli_runner, tiny_wav_path: Path, tmp_project_dir: Path) -> None:
@@ -75,6 +78,54 @@ def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path
     assert manifest.rights_audit.confirmed is True
     assert manifest.artifacts["export"].endswith("_dub.wav")
     assert Path(manifest.artifacts["export"]).exists()
+
+
+def test_full_real_applies_high_quality_preset_by_default(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "full_real_hq"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--real",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = load_project_config(project)
+    assert cfg.target_language == "ko"
+    assert cfg.candidate_count == 8
+    assert cfg.duration_tolerance == 0.15
+    assert cfg.gsv_few_shot_target_sec == 180.0
+    assert cfg.gsv_few_shot_min_clip_sec == 2.0
+    assert cfg.gsv_few_shot_max_clip_sec == 8.0
+    assert cfg.gsv_concurrency == 1
+    assert cfg.gemma_text_concurrency == 1
+    assert cfg.mix_allow_korean_timing_draft is False
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["mock"] is False
+    assert kwargs["gemma_backend"] == "llama_cpp"
+    assert kwargs["few_shot"] is True
+    assert kwargs["gsv_few_shot_force"] is True
 
 
 def test_mix_requires_completed_qc(tiny_wav_path: Path, tmp_project_dir: Path) -> None:
