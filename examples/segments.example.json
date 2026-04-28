@@ -1,0 +1,15 @@
+{
+  "segments": [
+    {
+      "audio_for_gemma": "work/segments/audio/seg_0001_gemma.wav",
+      "audio_for_mix": "work/segments/audio/seg_0001_mix.wav",
+      "duration": 2.0,
+      "end": 2.0,
+      "estimated_pan": 0.0,
+      "id": "seg_0001",
+      "keep_original_texture": true,
+      "start": 0.0,
+      "status": "raw"
+    }
+  ]
+}

@@ -1,0 +1,2480 @@
+from __future__ import annotations
+
+import json
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from threading import Lock
+from time import monotonic
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+import numpy as np
+import soundfile as sf
+from rich.markup import escape
+
+from asmr_dub_pipeline.asr import ASRChunk, create_asr_backend, map_chunks_to_segments
+from asmr_dub_pipeline.audio import ffmpeg
+from asmr_dub_pipeline.audio.duration import duration_ratio, suggest_speed_factor
+from asmr_dub_pipeline.audio.features import duration_sec, trim_edge_silence, write_audio
+from asmr_dub_pipeline.audio.mixing import (
+    build_dialogue_stem,
+    build_source_suppressed_background,
+    mix_with_background,
+)
+from asmr_dub_pipeline.audio.preprocess import extract_project_audio, probe_with_fallback
+from asmr_dub_pipeline.audio.quality import AudioQualityMetrics, measure_source_voice_quality
+from asmr_dub_pipeline.audio.segmentation import (
+    energy_segments,
+    load_manual_segments,
+    write_segment_audio_clips,
+)
+from asmr_dub_pipeline.audio.separation import (
+    SourceSeparationUnavailable,
+    separate_source_audio,
+)
+from asmr_dub_pipeline.config import create_project_structure, load_project_config
+from asmr_dub_pipeline.gemma.base import create_gemma_backend
+from asmr_dub_pipeline.gemma.schemas import validate_gemma_task_response
+from asmr_dub_pipeline.gemma.text_server import (
+    ManagedGemmaTextServer,
+    default_llama_server_command,
+)
+from asmr_dub_pipeline.gemma.text_translate import (
+    LlamaServerTranslationClient,
+    MockTranslationClient,
+)
+from asmr_dub_pipeline.gpt_sovits.client import (
+    GPTSoVITSClient,
+    GPTSoVITSError,
+    normalize_api_language_code,
+)
+from asmr_dub_pipeline.gpt_sovits.few_shot import (
+    FEW_SHOT_ARTIFACT_GPT,
+    FEW_SHOT_ARTIFACT_SOVITS,
+    FEW_SHOT_STAGE,
+    train_few_shot,
+)
+from asmr_dub_pipeline.gpt_sovits.refs import load_refs, resolve_ref, resolve_refs_json_path
+from asmr_dub_pipeline.gpt_sovits.retry import (
+    GPTSoVITSRetrySignal,
+    adjust_for_repetition_or_omission,
+    adjust_speed_for_duration,
+    adjust_speed_for_short_duration,
+    duration_too_long,
+    duration_too_short,
+    retry_signal_values,
+)
+from asmr_dub_pipeline.gpt_sovits.schemas import GPTSoVITSRef, GPTSoVITSTTSOptions
+from asmr_dub_pipeline.gpt_sovits.server import ManagedGPTSoVITSServer
+from asmr_dub_pipeline.logging import console
+from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest, write_json_atomic
+from asmr_dub_pipeline.pipeline.state import mark_stage
+from asmr_dub_pipeline.qc.audio_qc import measure_audio_qc
+from asmr_dub_pipeline.qc.scoring import score_qc
+from asmr_dub_pipeline.rights import (
+    RightsError,
+    ensure_inside_project,
+    ensure_not_same_path,
+    merge_rights_audit,
+    record_rights_reliance,
+    require_confirmed_rights,
+    require_existing_or_confirmed_rights,
+    sha256_file,
+)
+from asmr_dub_pipeline.schemas import (
+    JapaneseScript,
+    PipelineManifest,
+    Segment,
+    SourceScript,
+    TTSCandidate,
+    TTSMetadata,
+)
+from asmr_dub_pipeline.script.duration_rewrite import rewrite_for_duration
+from asmr_dub_pipeline.script.normalizer import normalize_korean_tts_text, normalize_script_payload
+from asmr_dub_pipeline.script.text_qc import preflight_tts_text
+
+SKIP_STATUSES = {"needs_manual_review", "failed"}
+KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES = {"duration_ratio_out_of_range", "too_much_silence"}
+PROGRESS_LOG_SECONDS = 30.0
+JAPANESE_TTS_LANGUAGES = {"ja", "jp", "jpn", "japanese"}
+KOREAN_TTS_LANGUAGES = {"ko", "kr", "kor", "korean"}
+
+
+def _canonical_language(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in JAPANESE_TTS_LANGUAGES:
+        return "ja"
+    if normalized in KOREAN_TTS_LANGUAGES:
+        return "ko"
+    return normalized
+
+
+def _segment_counts(manifest: PipelineManifest) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for segment in manifest.segments:
+        counts[segment.status] = counts.get(segment.status, 0) + 1
+    return counts
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, second = divmod(seconds, 60)
+    hour, minute = divmod(minutes, 60)
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
+def _format_segment_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
+
+def _parallel_base_urls(base_url: str, count: int) -> list[str]:
+    if count <= 1:
+        return [base_url.rstrip("/")]
+    parsed = urlparse(base_url)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError(f"Parallel server URL must include scheme and host: {base_url}")
+    default_port = 443 if parsed.scheme == "https" else 80
+    start_port = parsed.port or default_port
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    path = parsed.path.rstrip("/")
+    urls: list[str] = []
+    for offset in range(count):
+        netloc = f"{userinfo}{host}:{start_port + offset}"
+        urls.append(urlunparse((parsed.scheme, netloc, path, "", "", "")))
+    return urls
+
+
+def _segment_lane_index(segment: Segment, fallback_index: int, lane_count: int) -> int:
+    if lane_count <= 1:
+        return 0
+    suffix = segment.id.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return max(0, int(suffix) - 1) % lane_count
+    return max(0, fallback_index) % lane_count
+
+
+def _effective_lane_count(configured: int, item_count: int) -> int:
+    return min(max(1, int(configured)), max(1, item_count))
+
+
+def _log_text_snippet(text: str | None, max_chars: int = 160) -> str:
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return "(empty)"
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 1].rstrip() + "..."
+
+
+def _manifest_tts_languages(manifest: PipelineManifest) -> set[str]:
+    languages: set[str] = set()
+    for segment in manifest.segments:
+        if not segment.script:
+            continue
+        language = _canonical_language(segment.script.tts_language)
+        if language:
+            languages.add(language)
+    return languages
+
+
+def _resolve_manifest_path(project_dir: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    return path
+
+
+def _few_shot_base_gpt_weights(project_dir: Path, manifest: PipelineManifest) -> str | None:
+    candidates: list[Path] = []
+    metadata_path = _resolve_manifest_path(project_dir, manifest.artifacts.get("gsv_few_shot_manifest"))
+    if metadata_path and metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text("utf-8"))
+        except json.JSONDecodeError:
+            metadata = {}
+        gsv_metadata = metadata.get("fingerprint_payload", {}).get("gpt_sovits", {})
+        pretrained_gpt = _resolve_manifest_path(project_dir, gsv_metadata.get("pretrained_gpt_path"))
+        if pretrained_gpt:
+            candidates.append(pretrained_gpt)
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates.extend(
+        [
+            repo_root / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models" / "s1v3.ckpt",
+            repo_root
+            / ".cache"
+            / "third_party"
+            / "GPT-SoVITS"
+            / "GPT_SoVITS"
+            / "pretrained_models"
+            / "s1v3.ckpt",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return None
+
+
+def _resolve_gpt_weights_for_tts(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: Any,
+    explicit_gpt_weights_path: str | None,
+    model_switch: dict[str, str],
+) -> str | None:
+    policy = getattr(cfg, "gsv_gpt_weights_policy", "auto")
+    configured = explicit_gpt_weights_path or cfg.gsv_gpt_weights_path
+    if configured:
+        model_switch["gpt_weights_mode"] = "explicit"
+        return configured
+
+    few_shot_gpt = manifest.artifacts.get(FEW_SHOT_ARTIFACT_GPT)
+    target_language = _canonical_language(getattr(cfg, "target_language", "ko"))
+    model_switch["source_language"] = _canonical_language(getattr(cfg, "source_language", "ja"))
+    model_switch["target_language"] = target_language
+    if policy == "unchanged":
+        model_switch["gpt_weights_mode"] = "unchanged_by_policy"
+        return None
+    if not few_shot_gpt:
+        return None
+
+    languages = _manifest_tts_languages(manifest)
+    model_switch["tts_languages"] = ",".join(sorted(languages)) if languages else "unknown"
+    if policy == "few_shot" or (target_language == "ja" and languages and languages <= {"ja"}):
+        model_switch["gpt_weights_mode"] = "few_shot"
+        return few_shot_gpt
+
+    base_gpt = _few_shot_base_gpt_weights(project_dir, manifest)
+    model_switch["gpt_weights_skipped_path"] = few_shot_gpt
+    model_switch["gpt_weights_skip_reason"] = (
+        "source_few_shot_gpt_language_ja_does_not_match_tts_output_ko"
+        if target_language == "ko"
+        else "few-shot GPT was trained from source-language clips; using base GPT for non-Japanese TTS text"
+    )
+    if base_gpt:
+        model_switch["gpt_weights_mode"] = "base_for_non_japanese_tts"
+        return base_gpt
+    if target_language == "ko" and policy in {"auto", "base_for_korean"}:
+        raise GPTSoVITSError(
+            "Korean TTS output cannot safely load Japanese source-trained few-shot GPT weights, "
+            "and no base GPT weights were found. Configure gsv_gpt_weights_path or set "
+            "gsv_gpt_weights_policy='unchanged' explicitly."
+        )
+    model_switch["gpt_weights_mode"] = "unchanged_no_base_gpt_found"
+    return None
+
+
+def _ref_for_tts_language(ref: GPTSoVITSRef, tts_language: str) -> GPTSoVITSRef:
+    _ = tts_language
+    return ref
+
+
+def _can_rewrite_script_for_duration(script: JapaneseScript) -> bool:
+    return script.tts_language.strip().lower() in JAPANESE_TTS_LANGUAGES
+
+
+def _valid_asr_chunks(
+    chunks: list[ASRChunk],
+    audio_duration_sec: float | None,
+) -> list[ASRChunk]:
+    valid: list[ASRChunk] = []
+    for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
+        text = chunk.text.strip()
+        if not text:
+            continue
+        start = max(0.0, float(chunk.start))
+        end = max(start, float(chunk.end))
+        if audio_duration_sec is not None:
+            end = min(float(audio_duration_sec), end)
+        if end - start <= 0.05:
+            continue
+        valid.append(chunk.model_copy(update={"start": start, "end": end, "text": text}))
+    return valid
+
+
+def _group_asr_chunks_for_tts(
+    chunks: list[ASRChunk],
+    *,
+    min_segment_sec: float,
+    merge_gap_sec: float,
+) -> list[list[ASRChunk]]:
+    groups: list[list[ASRChunk]] = []
+    current: list[ASRChunk] = []
+    for chunk in chunks:
+        if not current:
+            current = [chunk]
+            continue
+        current_duration = current[-1].end - current[0].start
+        gap = chunk.start - current[-1].end
+        if current_duration < min_segment_sec and gap <= merge_gap_sec:
+            current.append(chunk)
+            continue
+        groups.append(current)
+        current = [chunk]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _segments_from_asr_chunks(
+    chunks: list[ASRChunk],
+    *,
+    project_dir: Path,
+    backend: str,
+    fallback_language: str,
+    audio_duration_sec: float | None,
+    min_segment_sec: float,
+    merge_gap_sec: float,
+) -> list[Segment]:
+    groups = _group_asr_chunks_for_tts(
+        _valid_asr_chunks(chunks, audio_duration_sec),
+        min_segment_sec=min_segment_sec,
+        merge_gap_sec=merge_gap_sec,
+    )
+    segments: list[Segment] = []
+    last_end = 0.0
+    for index, group in enumerate(groups, start=1):
+        start = max(last_end, group[0].start)
+        end = max(start + 0.05, group[-1].end)
+        start = round(start, 3)
+        end = round(end, 3)
+        if end <= start:
+            continue
+        duration = round(end - start, 3)
+        seg_id = f"seg_{index:04d}"
+        text = " ".join(chunk.text.strip() for chunk in group if chunk.text.strip()).strip()
+        language = next((chunk.language for chunk in group if chunk.language), fallback_language)
+        confidence = _asr_group_confidence(group)
+        audio_base = project_dir / "work" / "segments" / "audio"
+        segments.append(
+            Segment(
+                id=seg_id,
+                start=start,
+                end=end,
+                duration=duration,
+                audio_for_gemma=str(audio_base / f"{seg_id}_gemma.wav"),
+                audio_for_mix=str(audio_base / f"{seg_id}_mix.wav"),
+                keep_original_texture=True,
+                source_script=SourceScript(
+                    text=text,
+                    language=language,
+                    confidence=confidence,
+                    backend=backend,
+                    start=start,
+                    end=end,
+                ),
+            )
+        )
+        last_end = end
+    return segments
+
+
+def _asr_group_confidence(group: list[ASRChunk]) -> float | None:
+    weighted = [
+        (float(chunk.confidence), max(0.0, chunk.end - chunk.start))
+        for chunk in group
+        if chunk.confidence is not None
+    ]
+    total = sum(duration for _, duration in weighted)
+    if total <= 0:
+        return None
+    return sum(confidence * duration for confidence, duration in weighted) / total
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+        "utf-8",
+    )
+    tmp.replace(path)
+    return path
+
+
+def _log_stage_start(stage: str, detail: str | None = None) -> None:
+    suffix = f" - {detail}" if detail else ""
+    console.print(f"[cyan]{stage}[/cyan] started{suffix}")
+
+
+def _log_stage_complete(stage: str, manifest: PipelineManifest, detail: str | None = None) -> None:
+    parts = [f"[green]{stage} complete[/green]"]
+    if detail:
+        parts.append(detail)
+    if manifest.segments:
+        parts.append(f"counts={_format_segment_counts(_segment_counts(manifest))}")
+    console.print(" - ".join(parts))
+
+
+def _progress_interval(total: int) -> int:
+    if total <= 20:
+        return 1
+    if total <= 300:
+        return 10
+    return 25
+
+
+def _log_segment_progress(
+    stage: str,
+    index: int,
+    total: int,
+    segment: Segment,
+    manifest: PipelineManifest | None,
+    started_at: float,
+    last_logged_at: float,
+    note: str | None = None,
+) -> float:
+    now = monotonic()
+    interval = _progress_interval(total)
+    should_log = (
+        index == 1
+        or index == total
+        or index % interval == 0
+        or now - last_logged_at >= PROGRESS_LOG_SECONDS
+    )
+    if not should_log:
+        return last_logged_at
+    percent = (index / total * 100.0) if total else 100.0
+    counts = (
+        f" counts={_format_segment_counts(_segment_counts(manifest))}"
+        if manifest and manifest.segments
+        else ""
+    )
+    suffix = f" - {note}" if note else ""
+    console.print(
+        f"[dim]{stage}: {index}/{total} ({percent:.1f}%) "
+        f"elapsed={_format_elapsed(now - started_at)} "
+        f"latest={segment.id} status={segment.status}{counts}{suffix}[/dim]"
+    )
+    return now
+
+
+def _log_translate_progress(
+    index: int,
+    total: int,
+    segment: Segment,
+    status: str,
+    source_text: str | None,
+    translated_text: str | None,
+    started_at: float,
+    last_logged_at: float,
+) -> float:
+    now = monotonic()
+    interval = _progress_interval(total)
+    should_log = (
+        index == 1
+        or index == total
+        or index % interval == 0
+        or now - last_logged_at >= PROGRESS_LOG_SECONDS
+    )
+    if not should_log:
+        return last_logged_at
+    percent = (index / total * 100.0) if total else 100.0
+    console.print(
+        f"[dim]translate-ko: {index}/{total} ({percent:.1f}%) "
+        f"elapsed={_format_elapsed(now - started_at)} "
+        f"latest={segment.id} status={status}[/dim]\n"
+        f"[dim]  - 원문: {escape(_log_text_snippet(source_text))}[/dim]\n"
+        f"[dim]  - 번역문: {escape(_log_text_snippet(translated_text))}[/dim]"
+    )
+    return now
+
+
+def _resolve_project_read_path(project_dir: Path, raw_path: str, field_name: str) -> Path:
+    path = Path(raw_path)
+    resolved = (project_dir / path).resolve() if not path.is_absolute() else path.resolve()
+    try:
+        resolved.relative_to(project_dir.resolve())
+    except ValueError as exc:
+        raise RightsError(f"{field_name} must stay inside the project directory: {resolved}") from exc
+    return resolved
+
+
+def _validate_audio_contract(path: Path, sample_rate: int, channels: int, description: str) -> None:
+    info = sf.info(str(path))
+    if info.samplerate != sample_rate or info.channels != channels:
+        raise ValueError(
+            f"{description} must be {channels} channel(s) at {sample_rate} Hz: "
+            f"{path} is {info.channels} channel(s) at {info.samplerate} Hz"
+        )
+
+
+def _validate_segment_audio_paths(project_dir: Path, segment: Segment, check_formats: bool = False) -> None:
+    gemma_path = _resolve_project_read_path(project_dir, segment.audio_for_gemma, "audio_for_gemma")
+    mix_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+    if check_formats:
+        _validate_audio_contract(gemma_path, 16_000, 1, "audio_for_gemma")
+        _validate_audio_contract(mix_path, 48_000, 2, "audio_for_mix")
+    segment.audio_for_gemma = str(gemma_path)
+    segment.audio_for_mix = str(mix_path)
+
+
+def _manifest_source_path(manifest: PipelineManifest) -> Path | None:
+    return Path(manifest.source_info.path) if manifest.source_info else None
+
+
+def _require_audio_stage_rights(
+    manifest: PipelineManifest,
+    stage: str,
+    confirm_rights: bool = False,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    manifest.rights_audit = require_existing_or_confirmed_rights(
+        manifest.rights_audit,
+        confirm_rights,
+        stage,
+        _manifest_source_path(manifest),
+        metadata=metadata,
+    )
+
+
+def init_project(project_dir: Path) -> None:
+    create_project_structure(project_dir)
+
+
+def inspect_input(input_path: Path) -> Any:
+    return probe_with_fallback(input_path)
+
+
+def _load_config_into_manifest(project_dir: Path, manifest: PipelineManifest) -> None:
+    manifest.project_config = load_project_config(project_dir)
+
+
+def extract_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> PipelineManifest:
+    _log_stage_start("extract", f"input={input_path}")
+    create_project_structure(project_dir)
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    audit = require_confirmed_rights(confirm_rights, "extract", input_path)
+    manifest.rights_audit = merge_rights_audit(manifest.rights_audit, audit)
+    stereo, mono = extract_project_audio(input_path, project_dir)
+    manifest.source_info = probe_with_fallback(input_path)
+    manifest.artifacts["original_stereo_48k"] = str(stereo)
+    manifest.artifacts["gemma_mono_16k"] = str(mono)
+    mark_stage(manifest, "extract", "completed")
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("extract", manifest, "audio prepared")
+    return manifest
+
+
+def source_separation_step(
+    project_dir: Path,
+    confirm_rights: bool = False,
+    force: bool = False,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    backend = cfg.source_separation_backend
+    _log_stage_start("source-separation", f"backend={backend}, model={cfg.source_separation_model}")
+    _require_audio_stage_rights(
+        manifest,
+        "source-separation",
+        confirm_rights,
+        metadata={"backend": backend, "model": cfg.source_separation_model},
+    )
+    original_audio = Path(
+        manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav")
+    )
+    if backend == "none":
+        mark_stage(manifest, "source-separation", "skipped", backend=backend, reason="disabled")
+        save_manifest(project_dir, manifest)
+        _log_stage_complete("source-separation", manifest, "skipped=disabled")
+        return manifest
+    try:
+        result = separate_source_audio(
+            original_audio,
+            project_dir,
+            backend=backend,
+            model=cfg.source_separation_model,
+            device=cfg.source_separation_device,
+            sample_rate=cfg.mix_sample_rate,
+            mono_sample_rate=cfg.gemma_sample_rate,
+            force=force,
+        )
+    except SourceSeparationUnavailable as exc:
+        if backend != "auto":
+            raise
+        warning = f"Source separation skipped because no separator backend is available: {exc}"
+        if warning not in manifest.warnings:
+            manifest.warnings.append(warning)
+        mark_stage(manifest, "source-separation", "skipped", backend=backend, reason=str(exc))
+        save_manifest(project_dir, manifest)
+        _log_stage_complete("source-separation", manifest, "skipped=no backend")
+        return manifest
+    if result is None:
+        mark_stage(manifest, "source-separation", "skipped", backend=backend, reason="disabled")
+        save_manifest(project_dir, manifest)
+        _log_stage_complete("source-separation", manifest, "skipped")
+        return manifest
+
+    _validate_audio_contract(result.vocals_path, cfg.mix_sample_rate, 2, "source_vocals_48k")
+    _validate_audio_contract(result.vocals_mono_path, cfg.gemma_sample_rate, 1, "source_vocals_mono_16k")
+    _validate_audio_contract(result.background_path, cfg.mix_sample_rate, 2, "background_only_48k")
+    manifest.artifacts["source_vocals_48k"] = str(result.vocals_path)
+    manifest.artifacts["source_vocals_mono_16k"] = str(result.vocals_mono_path)
+    manifest.artifacts["background_only_48k"] = str(result.background_path)
+    manifest.artifacts["source_separation_manifest"] = str(result.metadata_path)
+
+    resliced_segments = 0
+    if manifest.segments:
+        started_at = monotonic()
+        last_logged_at = started_at
+
+        def log_reslice_progress(index: int, total: int, segment: Segment) -> None:
+            nonlocal last_logged_at
+            last_logged_at = _log_segment_progress(
+                "source-separation clips",
+                index,
+                total,
+                segment,
+                manifest,
+                started_at,
+                last_logged_at,
+            )
+
+        write_segment_audio_clips(
+            manifest.segments,
+            result.vocals_mono_path,
+            result.vocals_path,
+            project_dir,
+            progress_callback=log_reslice_progress,
+        )
+        resliced_segments = len(manifest.segments)
+        out_path = project_dir / "work" / "segments" / "manifests" / "segments_source_separated.json"
+        write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
+        manifest.artifacts["segments_source_separated"] = str(out_path)
+
+    mark_stage(
+        manifest,
+        "source-separation",
+        "completed",
+        backend=result.backend,
+        model=result.model,
+        reused_existing=result.reused_existing,
+        vocals_path=str(result.vocals_path),
+        vocals_mono_path=str(result.vocals_mono_path),
+        background_path=str(result.background_path),
+        resliced_segments=resliced_segments,
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete(
+        "source-separation",
+        manifest,
+        f"backend={result.backend}, reused={result.reused_existing}",
+    )
+    return manifest
+
+
+def segment_step(project_dir: Path, confirm_rights: bool = False) -> PipelineManifest:
+    _log_stage_start("segment", f"project={project_dir}")
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    _require_audio_stage_rights(manifest, "segment", confirm_rights)
+    cfg = manifest.project_config
+    started_at = monotonic()
+    last_logged_at = started_at
+
+    def log_segment_progress(index: int, total: int, segment: Segment) -> None:
+        nonlocal last_logged_at
+        last_logged_at = _log_segment_progress(
+            "segment",
+            index,
+            total,
+            segment,
+            None,
+            started_at,
+            last_logged_at,
+            note="writing segment audio",
+        )
+
+    manual = project_dir / "work" / "segments" / "manifests" / "segments_manual.json"
+    if manual.exists():
+        segments = load_manual_segments(manual)
+        total = len(segments)
+        for index, segment in enumerate(segments, start=1):
+            _validate_segment_audio_paths(project_dir, segment, check_formats=True)
+            log_segment_progress(index, total, segment)
+    else:
+        gemma_audio = Path(
+            manifest.artifacts.get(
+                "source_vocals_mono_16k",
+                manifest.artifacts.get("gemma_mono_16k", project_dir / "work/audio/gemma_mono_16k.wav"),
+            )
+        )
+        mix_audio = Path(
+            manifest.artifacts.get(
+                "source_vocals_48k",
+                manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav"),
+            )
+        )
+        segments = energy_segments(
+            gemma_audio,
+            mix_audio,
+            project_dir,
+            min_segment_sec=cfg.segmentation_min_segment_sec,
+            max_segment_sec=cfg.segmentation_max_segment_sec,
+            silence_db=cfg.segmentation_silence_db,
+            min_silence_sec=cfg.segmentation_min_silence_sec,
+            progress_callback=log_segment_progress,
+        )
+    manifest.segments = segments
+    raw_path = project_dir / "work" / "segments" / "manifests" / "segments_raw.json"
+    write_json_atomic(raw_path, {"segments": [s.model_dump(mode="json") for s in segments]})
+    manifest.artifacts["segments_raw"] = str(raw_path)
+    mark_stage(manifest, "segment", "completed", segment_count=len(segments), segment_counts=_segment_counts(manifest))
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("segment", manifest, f"created={len(segments)}")
+    return manifest
+
+
+def _gemma_context(manifest: PipelineManifest) -> dict[str, Any]:
+    return {
+        "schema_version": manifest.schema_version,
+        "source_info": manifest.source_info.model_dump(mode="json") if manifest.source_info else None,
+    }
+
+
+def _gemma_backend_config(cfg: Any, model_id: str | None = None) -> dict[str, Any]:
+    return {
+        "model_id": model_id or cfg.gemma_model_id,
+        "url": cfg.gemma_http_url,
+        "send_audio": cfg.gemma_http_send_audio,
+        "local_files_only": cfg.hf_local_files_only,
+        "llama_cpp_cli_path": cfg.gemma_llama_cpp_cli_path,
+        "llama_cpp_model_path": cfg.gemma_llama_cpp_model_path,
+        "llama_cpp_mmproj_path": cfg.gemma_llama_cpp_mmproj_path,
+        "llama_cpp_timeout_sec": cfg.gemma_llama_cpp_timeout_sec,
+        "llama_cpp_ctx_size": cfg.gemma_llama_cpp_ctx_size,
+        "llama_cpp_n_predict": cfg.gemma_llama_cpp_n_predict,
+        "llama_cpp_gpu_layers": cfg.gemma_llama_cpp_gpu_layers,
+        "llama_cpp_temperature": cfg.gemma_llama_cpp_temperature,
+        "llama_cpp_seed": cfg.gemma_llama_cpp_seed,
+        "llama_cpp_extra_args": cfg.gemma_llama_cpp_extra_args,
+    }
+
+
+def _asr_backend_config(cfg: Any) -> dict[str, Any]:
+    return {
+        "model_id": cfg.asr_model_id,
+        "language": cfg.asr_language,
+        "local_files_only": cfg.asr_local_files_only,
+    }
+
+
+def _format_server_command(command: list[str], base_url: str, lane_index: int) -> list[str]:
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return [
+        str(part)
+        .replace("{base_url}", base_url)
+        .replace("{host}", host)
+        .replace("{port}", str(port))
+        .replace("{lane}", str(lane_index))
+        for part in command
+    ]
+
+
+def _gemma_text_server_command(
+    cfg: Any,
+    *,
+    base_url: str | None = None,
+    lane_index: int = 0,
+) -> list[str]:
+    effective_base_url = base_url or cfg.gemma_text_server_url
+    if cfg.gemma_text_server_command:
+        return _format_server_command(
+            [str(part) for part in cfg.gemma_text_server_command],
+            effective_base_url,
+            lane_index,
+        )
+    return default_llama_server_command(
+        base_url=effective_base_url,
+        model_path=cfg.gemma_llama_cpp_model_path,
+        ctx_size=cfg.gemma_llama_cpp_ctx_size,
+        gpu_layers=cfg.gemma_llama_cpp_gpu_layers,
+        n_predict=cfg.gemma_text_n_predict,
+    )
+
+
+def transcribe_step(
+    project_dir: Path,
+    asr_backend: str | None = None,
+    confirm_rights: bool = False,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    backend_kind = asr_backend or cfg.asr_backend
+    total = len(manifest.segments)
+    _log_stage_start("transcribe", f"backend={backend_kind}, segments={total}")
+    _require_audio_stage_rights(manifest, "transcribe", confirm_rights, metadata={"backend": backend_kind})
+    if not manifest.segments:
+        raise ValueError("Transcribe requires existing segments. Run segment first.")
+    audio_path = Path(
+        manifest.artifacts.get(
+            "source_vocals_mono_16k",
+            manifest.artifacts.get("gemma_mono_16k", project_dir / "work/audio/gemma_mono_16k.wav"),
+        )
+    )
+    _validate_audio_contract(audio_path, cfg.gemma_sample_rate, 1, audio_path.stem)
+    backend = create_asr_backend(backend_kind, _asr_backend_config(cfg))
+    chunks = backend.transcribe(audio_path, manifest.segments)
+    resegmented_from_chunks = False
+    previous_segment_count = len(manifest.segments)
+    manual_segments_path = project_dir / "work" / "segments" / "manifests" / "segments_manual.json"
+    if cfg.asr_resegment_from_chunks and backend_kind != "mock" and chunks and not manual_segments_path.exists():
+        mix_audio_path = Path(
+            manifest.artifacts.get(
+                "source_vocals_48k",
+                manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav"),
+            )
+        )
+        resegmented = _segments_from_asr_chunks(
+            chunks,
+            project_dir=project_dir,
+            backend=backend.name,
+            fallback_language=cfg.asr_language,
+            audio_duration_sec=duration_sec(audio_path),
+            min_segment_sec=cfg.asr_resegment_min_sec,
+            merge_gap_sec=cfg.asr_resegment_merge_gap_sec,
+        )
+        if resegmented:
+            write_segment_audio_clips(resegmented, audio_path, mix_audio_path, project_dir)
+            manifest.segments = resegmented
+            total = len(manifest.segments)
+            resegmented_from_chunks = True
+    mapped = (
+        {segment.id: segment.source_script for segment in manifest.segments}
+        if resegmented_from_chunks
+        else map_chunks_to_segments(
+            manifest.segments,
+            chunks,
+            backend=backend.name,
+            fallback_language=cfg.asr_language,
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    started_at = monotonic()
+    last_logged_at = started_at
+    with_text = 0
+    for index, segment in enumerate(manifest.segments, start=1):
+        source_script = mapped.get(segment.id)
+        segment.source_script = source_script
+        if source_script and source_script.text:
+            with_text += 1
+            status = "transcribed"
+        else:
+            status = "needs_manual_review"
+        rows.append(
+            {
+                "segment_id": segment.id,
+                "status": status,
+                "source_script": source_script.model_dump(mode="json") if source_script else None,
+            }
+        )
+        last_logged_at = _log_segment_progress(
+            "transcribe", index, total, segment, manifest, started_at, last_logged_at
+        )
+    jsonl_path = project_dir / "work" / "transcribe" / "source_segments.jsonl"
+    _write_jsonl_atomic(jsonl_path, rows)
+    out_path = project_dir / "work" / "segments" / "manifests" / "segments_transcribed.json"
+    write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
+    manifest.artifacts["source_segments"] = str(jsonl_path)
+    manifest.artifacts["segments_transcribed"] = str(out_path)
+    if resegmented_from_chunks:
+        manifest.artifacts["segments_asr_resegmented"] = str(out_path)
+    mark_stage(
+        manifest,
+        "transcribe",
+        "completed",
+        backend=backend_kind,
+        segment_count=total,
+        previous_segment_count=previous_segment_count,
+        asr_chunk_count=len(chunks),
+        resegmented_from_chunks=resegmented_from_chunks,
+        transcribed=with_text,
+        needs_manual_review=total - with_text,
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("transcribe", manifest, f"backend={backend_kind}")
+    return manifest
+
+
+def analyze_step(
+    project_dir: Path,
+    backend_kind: str,
+    model_id: str | None = None,
+    confirm_rights: bool = False,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    total = len(manifest.segments)
+    _log_stage_start("analyze", f"backend={backend_kind}, segments={total}")
+    _require_audio_stage_rights(manifest, "analyze", confirm_rights, metadata={"backend": backend_kind})
+    cfg = manifest.project_config
+    backend = create_gemma_backend(backend_kind, _gemma_backend_config(cfg, model_id))
+    context = _gemma_context(manifest)
+    started_at = monotonic()
+    last_logged_at = started_at
+    for index, segment in enumerate(manifest.segments, start=1):
+        if segment.status in SKIP_STATUSES:
+            last_logged_at = _log_segment_progress(
+                "analyze", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
+        _validate_segment_audio_paths(project_dir, segment, check_formats=True)
+        try:
+            segment.analysis = validate_gemma_task_response(
+                "analyze",
+                backend.analyze_segment(Path(segment.audio_for_gemma), segment, context),
+            )
+            segment.status = "analyzed"
+        except Exception as exc:
+            segment.errors.append(str(exc))
+            segment.status = "needs_manual_review"
+        last_logged_at = _log_segment_progress(
+            "analyze", index, total, segment, manifest, started_at, last_logged_at
+        )
+    out_path = project_dir / "work" / "segments" / "manifests" / "segments_gemma.json"
+    write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
+    manifest.artifacts["segments_gemma"] = str(out_path)
+    mark_stage(manifest, "analyze", "completed", backend=backend_kind, segment_counts=_segment_counts(manifest))
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("analyze", manifest, f"backend={backend_kind}")
+    return manifest
+
+
+def script_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    total = len(manifest.segments)
+    _log_stage_start("script", f"backend={backend_kind}, segments={total}")
+    _require_audio_stage_rights(manifest, "script", confirm_rights, metadata={"backend": backend_kind})
+    cfg = manifest.project_config
+    backend = create_gemma_backend(backend_kind, _gemma_backend_config(cfg))
+    context = _gemma_context(manifest)
+    started_at = monotonic()
+    last_logged_at = started_at
+    for index, segment in enumerate(manifest.segments, start=1):
+        if segment.status in SKIP_STATUSES:
+            last_logged_at = _log_segment_progress(
+                "script", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
+        _validate_segment_audio_paths(project_dir, segment, check_formats=True)
+        try:
+            payload = validate_gemma_task_response(
+                "script",
+                backend.generate_script(Path(segment.audio_for_gemma), segment, context),
+            )
+            segment.script = normalize_script_payload(payload)
+            segment.status = "scripted"
+        except Exception as exc:
+            segment.errors.append(str(exc))
+            segment.status = "needs_manual_review"
+        last_logged_at = _log_segment_progress(
+            "script", index, total, segment, manifest, started_at, last_logged_at
+        )
+    out_path = project_dir / "work" / "segments" / "manifests" / "segments_script.json"
+    write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
+    manifest.artifacts["segments_script"] = str(out_path)
+    mark_stage(manifest, "script", "completed", backend=backend_kind, segment_counts=_segment_counts(manifest))
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("script", manifest, f"backend={backend_kind}")
+    return manifest
+
+
+def translate_ko_step(
+    project_dir: Path,
+    gemma_text_backend: str | None = None,
+    confirm_rights: bool = False,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    backend_kind = (gemma_text_backend or "llama_server").replace("-", "_")
+    total = len(manifest.segments)
+    _log_stage_start("translate-ko", f"backend={backend_kind}, segments={total}")
+    _require_audio_stage_rights(
+        manifest, "translate-ko", confirm_rights, metadata={"backend": backend_kind}
+    )
+    if manifest.stage_state.get("transcribe", {}).get("status") != "completed":
+        raise ValueError("translate-ko requires a completed transcribe stage.")
+    if backend_kind not in {"llama_server", "mock"}:
+        raise ValueError(f"Unsupported Gemma text backend: {gemma_text_backend}")
+
+    jsonl_path = project_dir / "work" / "translate_ko" / "translation_bundles.jsonl"
+    summary_path = project_dir / "work" / "translate_ko" / "summary.json"
+    rows: list[dict[str, Any]] = []
+    translated = 0
+    needs_manual_review = 0
+    model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
+    translatable: list[Segment] = []
+    for segment in manifest.segments:
+        if segment.translation_ko and segment.translation_ko.ko_natural.strip():
+            translated += 1
+            rows.append(
+                {
+                    "batch_id": segment.translation_ko.batch_id,
+                    "segment_id": segment.id,
+                    "status": "translated",
+                    "source_text": segment.source_script.text if segment.source_script else "",
+                    "translation_ko": segment.translation_ko.model_dump(mode="json"),
+                    "resumed": True,
+                }
+            )
+        elif segment.source_script and segment.source_script.text.strip():
+            translatable.append(segment)
+        else:
+            needs_manual_review += 1
+            rows.append(
+                {
+                    "segment_id": segment.id,
+                    "status": "needs_manual_review",
+                    "reason": "missing source_script text",
+                    "source_text": segment.source_script.text if segment.source_script else "",
+                    "translation_ko": None,
+                }
+            )
+
+    translation_lane_count = (
+        _effective_lane_count(cfg.gemma_text_concurrency, len(translatable))
+        if backend_kind == "llama_server" and translatable
+        else 1
+    )
+    translation_base_urls = (
+        _parallel_base_urls(cfg.gemma_text_server_url, translation_lane_count)
+        if backend_kind == "llama_server"
+        else [cfg.gemma_text_server_url]
+    )
+    translation_locks = [Lock() for _ in range(translation_lane_count)]
+
+    def create_translation_client(lane_index: int = 0) -> Any:
+        if backend_kind == "llama_server":
+            return LlamaServerTranslationClient(
+                translation_base_urls[lane_index],
+                timeout_sec=cfg.gemma_text_timeout_sec,
+                retries=cfg.gemma_text_retries,
+                n_predict=cfg.gemma_text_n_predict,
+                model=model_name,
+            )
+        return MockTranslationClient(model=model_name)
+
+    server_managers: list[ManagedGemmaTextServer] = []
+    if backend_kind == "llama_server" and translatable:
+        for lane_index, base_url in enumerate(translation_base_urls):
+            command = (
+                _gemma_text_server_command(cfg, base_url=base_url, lane_index=lane_index)
+                if cfg.gemma_text_server_auto_start
+                else []
+            )
+            log_name = (
+                "llama_server.log"
+                if translation_lane_count == 1
+                else f"llama_server_lane_{lane_index + 1:02d}.log"
+            )
+            server_managers.append(
+                ManagedGemmaTextServer(
+                    enabled=cfg.gemma_text_server_auto_start,
+                    base_url=base_url,
+                    command=command,
+                    log_path=project_dir / "work" / "translate_ko" / log_name,
+                    startup_timeout_sec=cfg.gemma_text_server_startup_timeout_sec,
+                    shutdown_timeout_sec=cfg.gemma_text_server_shutdown_timeout_sec,
+                )
+            )
+
+    started_at = monotonic()
+    last_logged_at = started_at
+    processed = translated + needs_manual_review
+
+    def persist_partial() -> None:
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_jsonl_atomic(jsonl_path, rows)
+        write_json_atomic(
+            summary_path,
+            {
+                "backend": backend_kind,
+                "model": model_name,
+                "segments": total,
+                "translated": translated,
+                "needs_manual_review": needs_manual_review,
+                "concurrency": translation_lane_count,
+                "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
+                "partial": True,
+            },
+        )
+        manifest.artifacts["translation_bundles"] = str(jsonl_path)
+        manifest.artifacts["translation_summary"] = str(summary_path)
+        save_manifest(project_dir, manifest)
+
+    def translate_batch_with_retries(
+        batch: list[Segment],
+        batch_id: str,
+        lane_index: int,
+    ) -> tuple[list[Segment], str, dict[str, Any], dict[str, list[str]]]:
+        with translation_locks[lane_index]:
+            client = create_translation_client(lane_index)
+            translation_failures: dict[str, list[str]] = {}
+            translations: dict[str, Any] = {}
+
+            def record_failure(segment: Segment, message: str) -> None:
+                translation_failures.setdefault(segment.id, []).append(message)
+
+            def retry_single(missing_segment: Segment, retry_batch_id: str) -> None:
+                try:
+                    translations.update(client.translate_batch([missing_segment], retry_batch_id))
+                except Exception as exc:
+                    message = f"Korean translation retry failed for {retry_batch_id}: {exc}"
+                    record_failure(missing_segment, message)
+                    return
+                if missing_segment.id not in translations:
+                    record_failure(
+                        missing_segment,
+                        f"Korean translation retry failed for {retry_batch_id}: missing model response",
+                    )
+
+            def translate_group(group: list[Segment], group_batch_id: str) -> None:
+                if not group:
+                    return
+                try:
+                    group_translations = client.translate_batch(group, group_batch_id)
+                except Exception as exc:
+                    message = f"Korean translation batch failed for {group_batch_id}: {exc}"
+                    if len(group) == 1:
+                        record_failure(group[0], message)
+                        return
+                    for segment in group:
+                        record_failure(segment, message)
+                    midpoint = max(1, len(group) // 2)
+                    translate_group(group[:midpoint], f"{group_batch_id}_split_01")
+                    translate_group(group[midpoint:], f"{group_batch_id}_split_02")
+                    return
+                translations.update(group_translations)
+                missing_after_group = [segment for segment in group if segment.id not in translations]
+                if not missing_after_group:
+                    return
+                if len(group) == 1:
+                    retry_single(group[0], f"{group_batch_id}_single_01")
+                    return
+                if len(missing_after_group) == 1:
+                    retry_single(missing_after_group[0], f"{group_batch_id}_single_01")
+                    return
+                midpoint = max(1, len(missing_after_group) // 2)
+                translate_group(missing_after_group[:midpoint], f"{group_batch_id}_missing_01")
+                translate_group(missing_after_group[midpoint:], f"{group_batch_id}_missing_02")
+
+            translate_group(batch, batch_id)
+            return batch, batch_id, translations, translation_failures
+
+    def apply_batch_result(
+        batch: list[Segment],
+        batch_id: str,
+        translations: dict[str, Any],
+        translation_failures: dict[str, list[str]],
+    ) -> None:
+        nonlocal last_logged_at, needs_manual_review, processed, translated
+        for segment in batch:
+            for message in translation_failures.get(segment.id, []):
+                if message not in segment.errors:
+                    segment.errors.append(message)
+            translation = translations.get(segment.id)
+            if translation is None:
+                needs_manual_review += 1
+                processed += 1
+                source_text = segment.source_script.text if segment.source_script else ""
+                rows.append(
+                    {
+                        "batch_id": batch_id,
+                        "segment_id": segment.id,
+                        "status": "needs_manual_review",
+                        "reason": "missing translation in model response",
+                        "source_text": source_text,
+                        "translation_ko": None,
+                        "error": "; ".join(translation_failures.get(segment.id, [])) or None,
+                    }
+                )
+                last_logged_at = _log_translate_progress(
+                    processed,
+                    total,
+                    segment,
+                    "needs_manual_review",
+                    source_text,
+                    None,
+                    started_at,
+                    last_logged_at,
+                )
+                continue
+            segment.translation_ko = translation
+            segment.errors = [
+                error
+                for error in segment.errors
+                if not error.startswith("Korean translation retry failed")
+                and not error.startswith("Korean translation batch failed")
+            ]
+            translated += 1
+            processed += 1
+            source_text = segment.source_script.text if segment.source_script else ""
+            rows.append(
+                {
+                    "batch_id": batch_id,
+                    "segment_id": segment.id,
+                    "status": "translated",
+                    "source_text": source_text,
+                    "translation_ko": translation.model_dump(mode="json"),
+                }
+            )
+            last_logged_at = _log_translate_progress(
+                processed,
+                total,
+                segment,
+                "translated",
+                source_text,
+                translation.ko_natural,
+                started_at,
+                last_logged_at,
+            )
+
+    try:
+        for server_manager in server_managers:
+            server_manager.start()
+        batch_jobs = []
+        effective_batch_size = cfg.gemma_text_batch_size
+        if backend_kind == "llama_server":
+            effective_batch_size = min(effective_batch_size, 10)
+        segment_positions = {id(segment): index for index, segment in enumerate(manifest.segments)}
+        lane_segments: list[list[Segment]] = [[] for _ in range(translation_lane_count)]
+        for segment in translatable:
+            fallback_index = segment_positions.get(id(segment), len(lane_segments[0]))
+            lane_index = _segment_lane_index(segment, fallback_index, translation_lane_count)
+            lane_segments[lane_index].append(segment)
+        raw_jobs: list[tuple[int, int, list[Segment]]] = []
+        for lane_index, segments_for_lane in enumerate(lane_segments):
+            for batch_start in range(0, len(segments_for_lane), effective_batch_size):
+                batch = segments_for_lane[batch_start : batch_start + effective_batch_size]
+                first_position = min(segment_positions[id(segment)] for segment in batch)
+                raw_jobs.append((first_position, lane_index, batch))
+        for job_index, (_, lane_index, batch) in enumerate(sorted(raw_jobs, key=lambda item: item[0])):
+            if translation_lane_count == 1:
+                batch_id = f"batch_{job_index + 1:04d}"
+            else:
+                batch_id = f"batch_{job_index + 1:04d}_lane_{lane_index + 1:02d}"
+            batch_jobs.append((job_index, batch, batch_id, lane_index))
+        if translation_lane_count > 1 and len(batch_jobs) > 1:
+            pending: dict[int, tuple[list[Segment], str, dict[str, Any], dict[str, list[str]]]] = {}
+            next_to_apply = 0
+            with ThreadPoolExecutor(max_workers=translation_lane_count) as executor:
+                futures = {
+                    executor.submit(
+                        translate_batch_with_retries,
+                        batch,
+                        batch_id,
+                        lane_index,
+                    ): job_index
+                    for job_index, batch, batch_id, lane_index in batch_jobs
+                }
+                for future in as_completed(futures):
+                    job_index = futures[future]
+                    pending[job_index] = future.result()
+                    while next_to_apply in pending:
+                        apply_batch_result(*pending.pop(next_to_apply))
+                        persist_partial()
+                        next_to_apply += 1
+        else:
+            for _, batch, batch_id, lane_index in batch_jobs:
+                apply_batch_result(*translate_batch_with_retries(batch, batch_id, lane_index))
+                persist_partial()
+    finally:
+        for server_manager in reversed(server_managers):
+            server_manager.stop()
+
+    _write_jsonl_atomic(jsonl_path, rows)
+    summary = {
+        "backend": backend_kind,
+        "model": model_name,
+        "segments": total,
+        "translated": translated,
+        "needs_manual_review": needs_manual_review,
+        "concurrency": translation_lane_count,
+        "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
+    }
+    write_json_atomic(summary_path, summary)
+    manifest.artifacts["translation_bundles"] = str(jsonl_path)
+    manifest.artifacts["translation_summary"] = str(summary_path)
+    server_metadata = None
+    if backend_kind == "llama_server":
+        instances = [
+            {
+                "base_url": getattr(manager, "base_url", translation_base_urls[index]),
+                "started": manager.started,
+                "reused_existing": manager.reused_existing,
+                "log_path": str(manager.log_path) if manager.log_path else None,
+            }
+            for index, manager in enumerate(server_managers)
+        ]
+        server_metadata = {
+            "auto_start": cfg.gemma_text_server_auto_start,
+            "concurrency": translation_lane_count,
+            "base_urls": translation_base_urls,
+            "instances": instances,
+        }
+        if len(instances) == 1:
+            server_metadata.update(
+                started=instances[0]["started"],
+                reused_existing=instances[0]["reused_existing"],
+                log_path=instances[0]["log_path"],
+            )
+    mark_stage(
+        manifest,
+        "translate-ko",
+        "completed",
+        backend=backend_kind,
+        model=model_name,
+        translated=translated,
+        needs_manual_review=needs_manual_review,
+        concurrency=translation_lane_count,
+        server=server_metadata,
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("translate-ko", manifest, f"backend={backend_kind}")
+    return manifest
+
+
+def korean_script_step(project_dir: Path, confirm_rights: bool = False) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    if _canonical_language(cfg.target_language) != "ko":
+        raise ValueError("korean-script requires project_config.target_language='ko'.")
+    total = len(manifest.segments)
+    _log_stage_start("korean-script", f"segments={total}")
+    _require_audio_stage_rights(manifest, "korean-script", confirm_rights)
+    if manifest.stage_state.get("translate-ko", {}).get("status") != "completed":
+        raise ValueError("korean-script requires a completed translate-ko stage.")
+
+    scripted = 0
+    needs_manual_review = 0
+    started_at = monotonic()
+    last_logged_at = started_at
+    for index, segment in enumerate(manifest.segments, start=1):
+        translation = segment.translation_ko
+        text = translation.ko_natural.strip() if translation else ""
+        source_text = segment.source_script.text.strip() if segment.source_script else ""
+        normalized = normalize_korean_tts_text(text) if text else None
+        if not text or normalized is None or not normalized.text:
+            needs_manual_review += 1
+            segment.status = "needs_manual_review"
+            segment.errors.append("Cannot build Korean TTS script without translation_ko.ko_natural.")
+            last_logged_at = _log_segment_progress(
+                "korean-script", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
+        segment.script = JapaneseScript(
+            literal_ja=source_text,
+            ja_text=source_text or normalized.text,
+            tts_text=normalized.text,
+            tts_language="ko",
+            source_language=cfg.source_language,
+            target_language=cfg.target_language,
+            ref_style="whisper_close",
+            emotion="gentle",
+            pace="slow",
+            volume="soft",
+            nonverbal_cues=normalized.cues,
+            spatial_style="center",
+            expected_tts_duration_sec=segment.duration,
+            style_tags=["korean_translation", "soft_whisper"],
+            risk_flags=["source_script_translated_to_ko", *normalized.risk_flags],
+        )
+        preflight = preflight_tts_text(
+            segment.script,
+            target_language=cfg.target_language,
+            source_text=source_text,
+            min_hangul_ratio=cfg.gsv_ko_text_min_hangul_ratio,
+        )
+        segment.analysis["pre_synth_text_qc"] = preflight.as_payload()
+        if preflight.blocked:
+            needs_manual_review += 1
+            segment.status = "needs_manual_review"
+            segment.errors.append(
+                "Korean TTS preflight blocked synthesis: " + ", ".join(preflight.issues)
+            )
+            last_logged_at = _log_segment_progress(
+                "korean-script", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
+        segment.status = "scripted"
+        scripted += 1
+        last_logged_at = _log_segment_progress(
+            "korean-script", index, total, segment, manifest, started_at, last_logged_at
+        )
+
+    out_path = project_dir / "work" / "segments" / "manifests" / "segments_ko_script.json"
+    write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
+    manifest.artifacts["segments_ko_script"] = str(out_path)
+    mark_stage(
+        manifest,
+        "korean-script",
+        "completed",
+        scripted=scripted,
+        needs_manual_review=needs_manual_review,
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("korean-script", manifest, "tts_language=ko")
+    return manifest
+
+
+def _select_voice_ref_segment(manifest: PipelineManifest) -> Segment | None:
+    selected = _select_voice_ref_segments(Path("."), manifest, manifest.project_config, max_refs=1)
+    return selected[0] if selected else None
+
+
+def _select_voice_ref_segments(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: Any,
+    max_refs: int = 5,
+) -> list[Segment]:
+    source_language = _canonical_language(getattr(cfg, "source_language", "ja"))
+    scored: list[tuple[tuple[float, ...], Segment, AudioQualityMetrics | None]] = []
+    for segment in manifest.segments:
+        if (
+            not segment.source_script
+            or not segment.source_script.text.strip()
+            or not segment.audio_for_mix
+            or segment.duration <= 0
+            or _canonical_language(segment.source_script.language) != source_language
+        ):
+            continue
+        metrics = None
+        try:
+            source_audio = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+            metrics = measure_source_voice_quality(source_audio)
+        except Exception:
+            pass
+        scored.append((_voice_ref_segment_score(segment, metrics), segment, metrics))
+    selected = [
+        (score, segment, metrics)
+        for score, segment, metrics in sorted(scored, key=lambda item: item[0], reverse=True)
+        if metrics is None or metrics.score >= getattr(cfg, "gsv_ref_min_quality_score", 0.25)
+    ]
+    if not selected:
+        selected = sorted(scored, key=lambda item: item[0], reverse=True)
+    return [segment for _, segment, _ in selected[:max_refs]]
+
+
+def _voice_ref_segment_score(
+    segment: Segment,
+    metrics: AudioQualityMetrics | None = None,
+) -> tuple[float, float, float, float, float]:
+    text_len = len(segment.source_script.text.strip()) if segment.source_script else 0
+    quality = metrics.score if metrics is not None else 0.5
+    return (
+        quality,
+        3.0 <= segment.duration <= 10.0,
+        min(segment.duration, 10.0),
+        min(text_len / 80.0, 1.0),
+        -segment.start,
+    )
+
+
+def prepare_source_voice_refs_step(
+    project_dir: Path,
+    refs_path: Path | None = None,
+    confirm_rights: bool = False,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    _log_stage_start("prepare-refs", f"project={project_dir}")
+    manifest.rights_audit = require_existing_or_confirmed_rights(
+        manifest.rights_audit,
+        confirm_rights,
+        "prepare-refs",
+        _manifest_source_path(manifest),
+        metadata={"source_derived_voice_refs": True},
+    )
+    cfg = manifest.project_config
+    selected_refs = _select_voice_ref_segments(project_dir, manifest, cfg)
+    selected = selected_refs[0] if selected_refs else None
+    if selected is None or selected.source_script is None:
+        raise ValueError("Cannot prepare source voice refs without a transcribed segment.")
+
+    actual_refs_path = resolve_refs_json_path(refs_path or Path("refs/refs.json"), project_dir)
+    data = json.loads(actual_refs_path.read_text("utf-8")) if actual_refs_path.exists() else {}
+    if not isinstance(data, dict):
+        raise ValueError(f"refs JSON must be an object keyed by style name: {actual_refs_path}")
+
+    source_audio = _resolve_project_read_path(project_dir, selected.audio_for_mix, "audio_for_mix")
+    aux_segments = [segment for segment in selected_refs[1:] if segment.audio_for_mix]
+    prepared: dict[str, str] = {}
+    ref_qc_rows: list[dict[str, Any]] = []
+    for style in ("whisper_close", "sleepy"):
+        entry = data.get(style) if isinstance(data.get(style), dict) else {}
+        raw_ref_path = str(entry.get("ref_audio_path") or f"refs/{style}.wav")
+        ref_path = Path(raw_ref_path).expanduser()
+        resolved_ref_path = (
+            project_dir / ref_path if not ref_path.is_absolute() else ref_path
+        ).resolve()
+        resolved_ref_path = ensure_inside_project(project_dir, resolved_ref_path)
+        resolved_ref_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_audio, resolved_ref_path)
+        selected_metrics = measure_source_voice_quality(resolved_ref_path)
+        aux_ref_audio_paths: list[str] = []
+        for aux_index, aux_segment in enumerate(aux_segments, start=1):
+            aux_raw_path = f"refs/{style}_aux_{aux_index}.wav"
+            aux_path = ensure_inside_project(project_dir, (project_dir / aux_raw_path).resolve())
+            aux_source = _resolve_project_read_path(project_dir, aux_segment.audio_for_mix, "audio_for_mix")
+            aux_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(aux_source, aux_path)
+            aux_ref_audio_paths.append(aux_raw_path)
+        data[style] = {
+            **entry,
+            "ref_audio_path": raw_ref_path,
+            "prompt_text": selected.source_script.text,
+            "prompt_lang": selected.source_script.language or cfg.source_language,
+            "aux_ref_audio_paths": aux_ref_audio_paths,
+            "source_language": cfg.source_language,
+            "target_language": cfg.target_language,
+            "cross_lingual_role": "ja_source_prompt_for_ko_tts",
+        }
+        prepared[style] = str(resolved_ref_path)
+        ref_qc_rows.append(
+            {
+                "style": style,
+                "segment_id": selected.id,
+                "source_language": cfg.source_language,
+                "target_language": cfg.target_language,
+                "prompt_lang": selected.source_script.language or cfg.source_language,
+                "metrics": selected_metrics.as_payload(),
+                "selected_aux_segment_ids": [segment.id for segment in aux_segments],
+            }
+        )
+
+    write_json_atomic(actual_refs_path, data)
+    ref_qc_path = project_dir / "work" / "gpt_sovits" / "ref_qc.json"
+    write_json_atomic(ref_qc_path, {"refs": ref_qc_rows})
+    manifest.artifacts["source_voice_refs"] = str(actual_refs_path)
+    manifest.artifacts["source_voice_ref_qc"] = str(ref_qc_path)
+    mark_stage(
+        manifest,
+        "prepare-refs",
+        "completed",
+        segment_id=selected.id,
+        refs=prepared,
+        source_language=cfg.source_language,
+        target_language=cfg.target_language,
+        cross_lingual_voice_transfer=cfg.source_language != cfg.target_language,
+        ref_qc_path=str(ref_qc_path),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("prepare-refs", manifest, f"segment={selected.id}")
+    return manifest
+
+
+def gsv_few_shot_step(
+    project_dir: Path,
+    confirm_rights: bool = False,
+    force: bool | None = None,
+    gsv_url: str | None = None,
+    gsv_server_command: list[str] | str | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    training_cfg = cfg.model_copy(update={"gsv_url": gsv_url or cfg.gsv_url})
+    _log_stage_start(FEW_SHOT_STAGE, f"target={cfg.gsv_few_shot_target_sec:g}s")
+    manifest.rights_audit = require_existing_or_confirmed_rights(
+        manifest.rights_audit,
+        confirm_rights,
+        FEW_SHOT_STAGE,
+        _manifest_source_path(manifest),
+        metadata={"source_derived_few_shot_training": True},
+    )
+    result = train_few_shot(
+        project_dir,
+        manifest,
+        training_cfg,
+        force=force,
+        command=gsv_server_command if gsv_server_command is not None else cfg.gsv_server_command,
+    )
+    manifest.artifacts[FEW_SHOT_ARTIFACT_GPT] = str(result.gpt_weights_path)
+    manifest.artifacts[FEW_SHOT_ARTIFACT_SOVITS] = str(result.sovits_weights_path)
+    manifest.artifacts["gsv_few_shot_dataset"] = str(result.dataset.list_path)
+    manifest.artifacts["gsv_few_shot_manifest"] = str(result.metadata_path)
+    source_clip_qc_path = project_dir / "work" / "gpt_sovits" / "few_shot" / "source_clip_qc.json"
+    if source_clip_qc_path.exists():
+        manifest.artifacts["gsv_few_shot_source_clip_qc"] = str(source_clip_qc_path)
+    manifest.rights_audit = record_rights_reliance(
+        manifest.rights_audit,
+        FEW_SHOT_STAGE,
+        _manifest_source_path(manifest),
+        metadata={
+            "source_derived_few_shot_training": True,
+            "selected_duration_sec": result.dataset.total_duration_sec,
+            "selected_segment_ids": [item.segment_id for item in result.dataset.items],
+            "source_language": cfg.source_language,
+            "target_language": cfg.target_language,
+            "cross_lingual_voice_transfer": cfg.source_language != cfg.target_language,
+            "gpt_weights_sha256": result.gpt_weights_sha256,
+            "sovits_weights_sha256": result.sovits_weights_sha256,
+        },
+    )
+    mark_stage(
+        manifest,
+        FEW_SHOT_STAGE,
+        result.status,
+        reused_existing=result.reused_existing,
+        fingerprint=result.fingerprint,
+        selected_duration_sec=result.dataset.total_duration_sec,
+        selected_segment_ids=[item.segment_id for item in result.dataset.items],
+        source_language=cfg.source_language,
+        target_language=cfg.target_language,
+        cross_lingual_voice_transfer=cfg.source_language != cfg.target_language,
+        source_clip_qc_path=str(source_clip_qc_path) if source_clip_qc_path.exists() else None,
+        gpt_weights_path=str(result.gpt_weights_path),
+        sovits_weights_path=str(result.sovits_weights_path),
+        gpt_weights_sha256=result.gpt_weights_sha256,
+        sovits_weights_sha256=result.sovits_weights_sha256,
+        gpt_sovits_root=str(result.install.root),
+        gpt_sovits_checkout=result.install.checkout,
+        gpt_sovits_version=result.install.version,
+        log_path=str(result.log_path),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete(
+        FEW_SHOT_STAGE,
+        manifest,
+        f"{'reused' if result.reused_existing else 'trained'} version={result.install.version}",
+    )
+    return manifest
+
+
+def _mock_synthesize(output_path: Path, duration: float, seed: int, sample_rate: int = 48_000) -> Path:
+    rng = np.random.default_rng(seed)
+    frames = max(1, int(round(duration * sample_rate)))
+    t = np.arange(frames, dtype=np.float32) / sample_rate
+    freq = 220.0 + (seed % 60)
+    tone = 0.04 * np.sin(2 * np.pi * freq * t)
+    noise = 0.003 * rng.standard_normal(frames).astype(np.float32)
+    data = np.stack([tone + noise, tone + noise], axis=1)
+    fade = min(frames, int(0.02 * sample_rate))
+    if fade > 1:
+        data[:fade] *= np.linspace(0.0, 1.0, fade)[:, None]
+        data[-fade:] *= np.linspace(1.0, 0.0, fade)[:, None]
+    write_audio(output_path, data, sample_rate)
+    return output_path
+
+
+def _refs_audit_metadata(refs_path: Path, refs: dict[str, Any]) -> dict[str, object]:
+    ref_audio_paths = sorted({ref.ref_audio_path for ref in refs.values()})
+    aux_ref_audio_paths = sorted({path for ref in refs.values() for path in ref.aux_ref_audio_paths})
+    return {
+        "refs_path": str(refs_path),
+        "refs_sha256": sha256_file(refs_path) if refs_path.exists() else None,
+        "ref_audio_paths": ref_audio_paths,
+        "aux_ref_audio_paths": aux_ref_audio_paths,
+    }
+
+
+def _tts_candidate_path(project_dir: Path, segment_id: str, candidate_index: int, attempt: int) -> Path:
+    suffix = "" if attempt == 0 else f"_retry_{attempt}"
+    return project_dir / "work" / "tts" / "candidates" / f"{segment_id}_cand_{candidate_index}{suffix}.wav"
+
+
+def synth_step(
+    project_dir: Path,
+    gsv_url: str | None,
+    refs_path: Path,
+    mock: bool = False,
+    confirm_rights: bool = False,
+    gpt_weights_path: str | None = None,
+    sovits_weights_path: str | None = None,
+    auto_gsv_server: bool | None = None,
+    gsv_server_command: list[str] | str | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    total = len(manifest.segments)
+    synth_backend_name = "mock" if mock else "gpt-sovits"
+    _log_stage_start("synth", f"backend={synth_backend_name}, segments={total}")
+    if not mock and not confirm_rights:
+        raise RightsError(
+            "Real GPT-SoVITS synthesis requires --confirm-rights for the current source and voice references."
+        )
+    if mock:
+        _require_audio_stage_rights(manifest, "synth", confirm_rights, metadata={"backend": "mock"})
+    refs = load_refs(refs_path, project_dir=project_dir)
+    actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
+    refs_metadata = _refs_audit_metadata(actual_refs_path, refs)
+    if not mock:
+        manifest.rights_audit = require_existing_or_confirmed_rights(
+            manifest.rights_audit,
+            True,
+            "synth",
+            _manifest_source_path(manifest),
+            metadata={"backend": "gpt-sovits", **refs_metadata},
+        )
+    effective_gsv_url = gsv_url or cfg.gsv_url
+    should_auto_start_server = (
+        False if mock else cfg.gsv_auto_start if auto_gsv_server is None else auto_gsv_server
+    )
+    gsv_lane_count = 1 if mock else _effective_lane_count(cfg.gsv_concurrency, total)
+    gsv_base_urls = [effective_gsv_url] if mock else _parallel_base_urls(effective_gsv_url, gsv_lane_count)
+    server_managers: list[ManagedGPTSoVITSServer] = []
+    if not mock:
+        for lane_index, base_url in enumerate(gsv_base_urls):
+            log_name = "api_v2.log" if gsv_lane_count == 1 else f"api_v2_lane_{lane_index + 1:02d}.log"
+            server_managers.append(
+                ManagedGPTSoVITSServer(
+                    enabled=should_auto_start_server,
+                    base_url=base_url,
+                    command=gsv_server_command if gsv_server_command is not None else cfg.gsv_server_command,
+                    cwd=cfg.gsv_server_cwd,
+                    log_path=project_dir / "work" / "gpt_sovits" / log_name,
+                    startup_timeout_sec=cfg.gsv_server_startup_timeout_sec,
+                    shutdown_timeout_sec=cfg.gsv_server_shutdown_timeout_sec,
+                )
+            )
+    model_switch: dict[str, Any] = {}
+    try:
+        for server_manager in server_managers:
+            server_manager.start()
+        clients: list[GPTSoVITSClient] = []
+        if not mock:
+            clients = [
+                GPTSoVITSClient(base_url, cfg.gsv_timeout_sec, cfg.gsv_retries)
+                for base_url in gsv_base_urls
+            ]
+        if clients:
+            gpt_weights = _resolve_gpt_weights_for_tts(
+                project_dir,
+                manifest,
+                cfg,
+                gpt_weights_path,
+                model_switch,
+            )
+            sovits_weights = (
+                sovits_weights_path
+                or cfg.gsv_sovits_weights_path
+                or (
+                    manifest.artifacts.get(FEW_SHOT_ARTIFACT_SOVITS)
+                    if cfg.gsv_sovits_weights_policy != "unchanged"
+                    else None
+                )
+            )
+            if gpt_weights:
+                model_switch["gpt_weights_path"] = gpt_weights
+            if sovits_weights:
+                model_switch["sovits_weights_path"] = sovits_weights
+                model_switch["sovits_weights_mode"] = (
+                    "explicit"
+                    if sovits_weights_path or cfg.gsv_sovits_weights_path
+                    else "few_shot_source_voice"
+                )
+            model_switch["instances"] = []
+            for lane_index, client in enumerate(clients):
+                lane_switch: dict[str, Any] = {
+                    "lane_index": lane_index,
+                    "gsv_url": gsv_base_urls[lane_index],
+                }
+                if gpt_weights:
+                    lane_switch["gpt_response"] = client.set_gpt_weights(gpt_weights)
+                if sovits_weights:
+                    lane_switch["sovits_response"] = client.set_sovits_weights(sovits_weights)
+                model_switch["instances"].append(lane_switch)
+            if len(model_switch["instances"]) == 1:
+                instance = model_switch["instances"][0]
+                if "gpt_response" in instance:
+                    model_switch["gpt_response"] = instance["gpt_response"]
+                if "sovits_response" in instance:
+                    model_switch["sovits_response"] = instance["sovits_response"]
+        started_at = monotonic()
+        last_logged_at = started_at
+        lane_locks = [Lock() for _ in range(gsv_lane_count)]
+
+        def postprocess_tts_candidate(candidate_path: Path, payload: dict[str, Any]) -> None:
+            if not cfg.gsv_trim_edge_silence:
+                return
+            trim = trim_edge_silence(
+                candidate_path,
+                threshold_db=cfg.gsv_trim_silence_threshold_db,
+                keep_sec=cfg.gsv_trim_silence_keep_sec,
+            )
+            payload.setdefault("postprocess", {})["edge_silence_trim"] = trim
+
+        def synthesize_segment_locked(
+            index: int,
+            segment: Segment,
+            lane_index: int,
+        ) -> tuple[int, Segment]:
+            if segment.status in SKIP_STATUSES:
+                return index, segment
+            if not segment.script:
+                segment.status = "needs_manual_review"
+                segment.errors.append("Cannot synthesize without script metadata.")
+                return index, segment
+            target_language = _canonical_language(cfg.target_language)
+            source_language = _canonical_language(cfg.source_language)
+            if target_language == "ko":
+                preflight = preflight_tts_text(
+                    segment.script,
+                    target_language=target_language,
+                    source_text=segment.source_script.text if segment.source_script else "",
+                    min_hangul_ratio=cfg.gsv_ko_text_min_hangul_ratio,
+                )
+                segment.analysis["pre_synth_text_qc"] = preflight.as_payload()
+                if preflight.blocked:
+                    segment.status = "needs_manual_review"
+                    segment.errors.append(
+                        "Korean TTS preflight blocked synthesis: " + ", ".join(preflight.issues)
+                    )
+                    return index, segment
+            requested_ref_style = segment.script.ref_style
+            resolved_ref_style = requested_ref_style if requested_ref_style in refs else "whisper_close"
+            ref = resolve_ref(refs, requested_ref_style)
+            synthesis_ref = _ref_for_tts_language(ref, segment.script.tts_language)
+            fallback_used = resolved_ref_style != requested_ref_style
+            candidates: list[TTSCandidate] = []
+            expected = segment.script.expected_tts_duration_sec or segment.duration
+            speed = suggest_speed_factor(expected, segment.duration)
+            has_repetition_or_omission_signal = bool(
+                segment.qc and (segment.qc.repetition_detected or segment.qc.omission_detected)
+            )
+            can_rewrite_for_duration = _can_rewrite_script_for_duration(segment.script)
+            for candidate_index in range(cfg.candidate_count):
+                seed = cfg.base_seed + index * 100 + candidate_index
+                options = GPTSoVITSTTSOptions(
+                    seed=seed,
+                    speed_factor=speed,
+                    text_lang=target_language if target_language == "ko" else segment.script.tts_language,
+                )
+                attempt_signals: list[GPTSoVITSRetrySignal] = []
+                if has_repetition_or_omission_signal:
+                    options = adjust_for_repetition_or_omission(options, seed_step=10_000 + index)
+                    attempt_signals.extend(
+                        [
+                            GPTSoVITSRetrySignal.REPETITION_OR_OMISSION,
+                            GPTSoVITSRetrySignal.SEED_CHANGED,
+                            GPTSoVITSRetrySignal.REPETITION_PENALTY_INCREASED,
+                        ]
+                    )
+                attempt_text = segment.script.tts_text
+                for attempt in range(3):
+                    candidate_path = _tts_candidate_path(project_dir, segment.id, candidate_index, attempt)
+                    payload: dict[str, Any] = {
+                        "requested_ref_style": requested_ref_style,
+                        "resolved_ref_style": resolved_ref_style,
+                        "fallback_used": fallback_used,
+                        "ref_audio_path": ref.ref_audio_path,
+                        "aux_ref_audio_paths": ref.aux_ref_audio_paths,
+                        "prompt_text_policy": "use_source_reference_prompt",
+                        "source_language": source_language,
+                        "target_language": target_language,
+                        "cross_lingual_voice_transfer": source_language != target_language,
+                        "expected_tts_duration_sec": expected,
+                        "target_duration_sec": segment.duration,
+                        "lane_index": lane_index,
+                        "gsv_url": None if mock else gsv_base_urls[lane_index],
+                        "retry": {
+                            "attempt": attempt,
+                            "max_attempts": 3,
+                            "signals": retry_signal_values(attempt_signals),
+                        },
+                    }
+                    if mock:
+                        mock_duration = max(0.05, expected / max(options.speed_factor, 0.01))
+                        _mock_synthesize(candidate_path, mock_duration, options.seed, cfg.mix_sample_rate)
+                        postprocess_tts_candidate(candidate_path, payload)
+                        duration = duration_sec(candidate_path)
+                        payload.update(
+                            {
+                                "mock": True,
+                                "text": attempt_text,
+                                "text_lang": normalize_api_language_code(options.text_lang),
+                                "prompt_text": synthesis_ref.prompt_text,
+                                "prompt_lang": normalize_api_language_code(synthesis_ref.prompt_lang),
+                                "seed": options.seed,
+                                "speed_factor": options.speed_factor,
+                                "repetition_penalty": options.repetition_penalty,
+                            }
+                        )
+                        candidate_backend_name = "mock"
+                    else:
+                        client = clients[lane_index]
+                        try:
+                            request = client.build_payload(attempt_text, synthesis_ref, options)
+                            payload.update(request.as_payload())
+                            client.synthesize_to_file(request, candidate_path)
+                            postprocess_tts_candidate(candidate_path, payload)
+                            duration = duration_sec(candidate_path)
+                        except GPTSoVITSError as exc:
+                            candidates.append(
+                                TTSCandidate(
+                                    candidate_index=candidate_index,
+                                    seed=options.seed,
+                                    payload=payload,
+                                    output_path=str(candidate_path),
+                                    backend="gpt-sovits",
+                                    error=str(exc),
+                                )
+                            )
+                            break
+                        candidate_backend_name = "gpt-sovits"
+                    too_long = duration_too_long(duration, segment.duration, cfg.duration_tolerance)
+                    too_short = duration_too_short(duration, segment.duration, cfg.duration_tolerance)
+                    candidate_ratio = duration_ratio(duration, segment.duration)
+                    duration_gate = "too_long" if too_long else "too_short" if too_short else "pass"
+                    payload["duration_ratio"] = candidate_ratio
+                    payload["duration_gate"] = duration_gate
+                    language_contract_ok = True
+                    if target_language == "ko":
+                        language_contract_ok = (
+                            payload.get("text") == attempt_text
+                            and payload.get("text_lang") == "all_ko"
+                            and payload.get("prompt_lang") == "all_ja"
+                        )
+                    acceptable_for_mix = duration_gate == "pass" and language_contract_ok
+                    selection_score = max(0.0, 1.0 - min(abs(candidate_ratio - 1.0), 1.0))
+                    if too_long and attempt < 2:
+                        if attempt == 0:
+                            payload["retry"]["next_action"] = GPTSoVITSRetrySignal.SPEED_FACTOR_ADJUSTED.value
+                        elif can_rewrite_for_duration:
+                            payload["retry"]["next_action"] = (
+                                GPTSoVITSRetrySignal.SCRIPT_SHORTENING_REQUESTED.value
+                            )
+                    elif too_short and attempt < 2:
+                        payload["retry"]["next_action"] = GPTSoVITSRetrySignal.SPEED_FACTOR_ADJUSTED.value
+                    candidates.append(
+                        TTSCandidate(
+                            candidate_index=candidate_index,
+                            seed=options.seed,
+                            payload=payload,
+                            output_path=str(candidate_path),
+                            duration_sec=duration,
+                            backend=candidate_backend_name,
+                            duration_ratio=candidate_ratio,
+                            duration_gate=duration_gate,
+                            acceptable_for_mix=acceptable_for_mix,
+                            selection_score=selection_score,
+                            selection_reason=(
+                                "duration_and_language_contract_pass"
+                                if acceptable_for_mix
+                                else "duration_or_language_contract_failed"
+                            ),
+                            retry_summary=payload["retry"],
+                        )
+                    )
+                    if not (too_long or too_short):
+                        break
+                    if attempt >= 2:
+                        break
+                    if attempt == 0:
+                        options = (
+                            adjust_speed_for_duration(options, duration, segment.duration)
+                            if too_long
+                            else adjust_speed_for_short_duration(options, duration, segment.duration)
+                        )
+                        attempt_signals = [
+                            GPTSoVITSRetrySignal.DURATION_TOO_LONG
+                            if too_long
+                            else GPTSoVITSRetrySignal.DURATION_TOO_SHORT,
+                            GPTSoVITSRetrySignal.SPEED_FACTOR_ADJUSTED,
+                        ]
+                        continue
+                    if not can_rewrite_for_duration:
+                        options = options.model_copy(
+                            update={
+                                "seed": options.seed + 20_000 + index + attempt
+                                if options.seed >= 0
+                                else 20_000 + index + attempt
+                            }
+                        )
+                        attempt_signals = [
+                            GPTSoVITSRetrySignal.DURATION_TOO_LONG
+                            if too_long
+                            else GPTSoVITSRetrySignal.DURATION_TOO_SHORT,
+                            GPTSoVITSRetrySignal.SEED_CHANGED,
+                        ]
+                        continue
+                    rewritten = rewrite_for_duration(segment.script, segment.duration, cfg.duration_tolerance)
+                    if rewritten.tts_text != segment.script.tts_text:
+                        segment.script = rewritten
+                        attempt_text = rewritten.tts_text
+                        expected = rewritten.expected_tts_duration_sec or expected
+                    attempt_signals = [
+                        GPTSoVITSRetrySignal.DURATION_TOO_LONG,
+                        GPTSoVITSRetrySignal.SCRIPT_SHORTENING_REQUESTED,
+                    ]
+            successful = [
+                candidate for candidate in candidates if not candidate.error and candidate.duration_sec is not None
+            ]
+            if not successful:
+                segment.tts = TTSMetadata(
+                    backend="mock" if mock else "gpt-sovits",
+                    ref_style=resolved_ref_style,
+                    speed_factor=speed,
+                    candidate_count=cfg.candidate_count,
+                    candidates=candidates,
+                    source_language=source_language,
+                    target_language=target_language,
+                    cross_lingual_voice_transfer=source_language != target_language,
+                )
+                segment.status = "failed"
+                segment.errors.append("All TTS candidates failed.")
+                return index, segment
+            acceptable = [candidate for candidate in successful if candidate.acceptable_for_mix]
+            selected_pool = acceptable or successful
+            selected = min(selected_pool, key=lambda c: abs((c.duration_sec or 0.0) - segment.duration))
+            selected.selected = True
+            final_path = project_dir / "work" / "tts" / f"{segment.id}_final.wav"
+            ensure_not_same_path(Path(selected.output_path), final_path)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(selected.output_path, final_path)
+            segment.tts = TTSMetadata(
+                backend="mock" if mock else "gpt-sovits",
+                ref_style=resolved_ref_style,
+                speed_factor=float(selected.payload.get("speed_factor", speed)),
+                candidate_count=cfg.candidate_count,
+                selected_candidate_path=str(final_path),
+                candidates=candidates,
+                source_language=source_language,
+                target_language=target_language,
+                cross_lingual_voice_transfer=source_language != target_language,
+                retry_summary={
+                    "selected_duration_gate": selected.duration_gate,
+                    "selected_acceptable_for_mix": selected.acceptable_for_mix,
+                    "selected_duration_ratio": selected.duration_ratio,
+                },
+            )
+            segment.status = "synthesized"
+            return index, segment
+
+        def synthesize_segment(index: int, segment: Segment, lane_index: int) -> tuple[int, Segment]:
+            if mock or segment.status in SKIP_STATUSES or not segment.script:
+                return synthesize_segment_locked(index, segment, lane_index)
+            with lane_locks[lane_index]:
+                return synthesize_segment_locked(index, segment, lane_index)
+
+        segment_jobs = [
+            (index, segment, _segment_lane_index(segment, index - 1, gsv_lane_count))
+            for index, segment in enumerate(manifest.segments, start=1)
+        ]
+        if not mock and gsv_lane_count > 1 and len(segment_jobs) > 1:
+            with ThreadPoolExecutor(max_workers=gsv_lane_count) as executor:
+                futures = [
+                    executor.submit(synthesize_segment, index, segment, lane_index)
+                    for index, segment, lane_index in segment_jobs
+                ]
+                for future in as_completed(futures):
+                    index, segment = future.result()
+                    save_manifest(project_dir, manifest)
+                    last_logged_at = _log_segment_progress(
+                        "synth", index, total, segment, manifest, started_at, last_logged_at
+                    )
+        else:
+            for index, segment, lane_index in segment_jobs:
+                index, segment = synthesize_segment(index, segment, lane_index)
+                save_manifest(project_dir, manifest)
+                last_logged_at = _log_segment_progress(
+                    "synth", index, total, segment, manifest, started_at, last_logged_at
+                )
+        gsv_instances = [
+            {
+                "base_url": manager.base_url,
+                "started": manager.started,
+                "reused_existing": manager.reused_existing,
+                "log_path": str(manager.log_path) if manager.log_path else None,
+            }
+            for manager in server_managers
+        ]
+        gsv_server_metadata = {
+            "auto_start": should_auto_start_server,
+            "concurrency": gsv_lane_count,
+            "base_urls": [] if mock else gsv_base_urls,
+            "instances": gsv_instances,
+        }
+        if len(gsv_instances) == 1:
+            gsv_server_metadata.update(
+                started=gsv_instances[0]["started"],
+                reused_existing=gsv_instances[0]["reused_existing"],
+                log_path=gsv_instances[0]["log_path"],
+            )
+        failed_synth_segments = [segment.id for segment in manifest.segments if segment.status == "failed"]
+        if not mock and failed_synth_segments:
+            mark_stage(
+                manifest,
+                "synth",
+                "failed",
+                backend="gpt-sovits",
+                gsv_url=effective_gsv_url,
+                gsv_urls=gsv_base_urls,
+                gsv_server=gsv_server_metadata,
+                failed_segments=failed_synth_segments,
+                segment_counts=_segment_counts(manifest),
+            )
+            save_manifest(project_dir, manifest)
+            raise GPTSoVITSError(
+                "GPT-SoVITS synthesis failed for segments: "
+                + ", ".join(failed_synth_segments[:20])
+                + (" ..." if len(failed_synth_segments) > 20 else "")
+            )
+        mark_stage(
+            manifest,
+            "synth",
+            "completed",
+            backend="mock" if mock else "gpt-sovits",
+            gsv_url=None if mock else effective_gsv_url,
+            gsv_urls=[] if mock else gsv_base_urls,
+            gsv_server=gsv_server_metadata,
+            concurrency=gsv_lane_count,
+            model_switch=model_switch,
+            segment_counts=_segment_counts(manifest),
+        )
+        save_manifest(project_dir, manifest)
+        _log_stage_complete("synth", manifest, f"backend={synth_backend_name}")
+        return manifest
+    finally:
+        for server_manager in reversed(server_managers):
+            server_manager.stop()
+
+
+def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    total = len(manifest.segments)
+    _log_stage_start("qc", f"backend={backend_kind}, segments={total}")
+    _require_audio_stage_rights(manifest, "qc", confirm_rights, metadata={"backend": backend_kind})
+    cfg = manifest.project_config
+    backend = create_gemma_backend(backend_kind, _gemma_backend_config(cfg))
+    context = _gemma_context(manifest)
+    started_at = monotonic()
+    last_logged_at = started_at
+    for index, segment in enumerate(manifest.segments, start=1):
+        if segment.status in {"needs_manual_review", "failed"}:
+            last_logged_at = _log_segment_progress(
+                "qc", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
+        if not segment.tts or not segment.tts.selected_candidate_path or not segment.script:
+            segment.status = "needs_manual_review"
+            segment.errors.append("Cannot QC without selected TTS and script.")
+            last_logged_at = _log_segment_progress(
+                "qc", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
+        audio_path = Path(segment.tts.selected_candidate_path)
+        audio_metrics = measure_audio_qc(audio_path, segment.duration)
+        try:
+            gemma_result = validate_gemma_task_response(
+                "qc",
+                backend.qc_audio(audio_path, segment.script.tts_text, segment, context),
+            )
+        except Exception as exc:
+            gemma_result = {"recommendation": "manual_review", "issues": [str(exc)]}
+        qc = score_qc(audio_metrics, gemma_result)
+        segment.qc = qc
+        segment.status = qc.status
+        last_logged_at = _log_segment_progress(
+            "qc", index, total, segment, manifest, started_at, last_logged_at
+        )
+    out_path = project_dir / "work" / "qc" / "qc_manifest.json"
+    write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
+    manifest.artifacts["qc"] = str(out_path)
+    mark_stage(manifest, "qc", "completed", backend=backend_kind, segment_counts=_segment_counts(manifest))
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("qc", manifest, f"backend={backend_kind}")
+    return manifest
+
+
+def _mix_config_metadata(manifest: PipelineManifest) -> dict[str, Any]:
+    cfg = manifest.project_config
+    return {
+        "profile": cfg.mix_profile,
+        "sample_rate": cfg.mix_sample_rate,
+        "background_bed": cfg.mix_background_bed,
+        "background_gain_db": cfg.background_gain_db,
+        "background_speech_suppression": cfg.background_speech_suppression,
+        "background_speech_suppression_db": cfg.background_speech_suppression_db,
+        "background_speech_suppression_pad_sec": cfg.background_speech_suppression_pad_sec,
+        "background_speech_suppression_fade_ms": cfg.background_speech_suppression_fade_ms,
+        "dialogue_gain_db": cfg.mix_dialogue_gain_db,
+        "dialogue_fade_ms": cfg.mix_dialogue_fade_ms,
+        "loudness_strategy": cfg.mix_loudness_strategy,
+        "peak_limit_dbfs": cfg.mix_peak_limit_dbfs
+        if cfg.mix_loudness_strategy == "peak_guard_only"
+        else None,
+        "loudness_normalization": "disabled",
+    }
+
+
+def _include_segment_in_mix(segment: Segment, *, allow_korean_timing_draft: bool) -> bool:
+    selected_candidate = None
+    if segment.tts:
+        selected_candidate = next((candidate for candidate in segment.tts.candidates if candidate.selected), None)
+    selected_candidate_ok = selected_candidate.acceptable_for_mix if selected_candidate else True
+    if (
+        segment.status == "ok"
+        and segment.qc is not None
+        and segment.qc.recommendation == "pass"
+        and selected_candidate_ok
+    ):
+        return True
+    if not allow_korean_timing_draft:
+        return False
+    if (
+        segment.status != "needs_regeneration"
+        or not segment.script
+        or segment.script.tts_language != "ko"
+        or not segment.tts
+        or not segment.tts.selected_candidate_path
+        or segment.qc is None
+    ):
+        return False
+    if selected_candidate is not None and not selected_candidate.acceptable_for_mix:
+        return False
+    if (
+        segment.qc.unsafe_or_rights_issue
+        or segment.qc.repetition_detected
+        or segment.qc.omission_detected
+    ):
+        return False
+    return not (set(segment.qc.issues) - KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES)
+
+
+def mix_step(project_dir: Path, confirm_rights: bool) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    total = len(manifest.segments)
+    _log_stage_start("mix", f"segments={total}")
+    source_path = Path(manifest.source_info.path) if manifest.source_info else None
+    audit = require_confirmed_rights(confirm_rights, "mix", source_path)
+    manifest.rights_audit = merge_rights_audit(manifest.rights_audit, audit)
+    if manifest.stage_state.get("qc", {}).get("status") != "completed":
+        raise ValueError("Mix requires a completed QC stage.")
+    allow_korean_timing_draft = (
+        cfg.mix_allow_korean_timing_draft
+        and _canonical_language(cfg.target_language) == "ko"
+        and manifest.stage_state.get("korean-script", {}).get("status") == "completed"
+    )
+    duration = manifest.source_info.duration_sec if manifest.source_info else 0.0
+    if duration <= 0 and manifest.segments:
+        duration = max(segment.end for segment in manifest.segments)
+    dialogue = ensure_inside_project(project_dir, project_dir / "work" / "mix" / "dialogue_stem.wav")
+    final_audio = ensure_inside_project(project_dir, project_dir / "work" / "mix" / "final_audio.wav")
+    peak_limit_dbfs = cfg.mix_peak_limit_dbfs if cfg.mix_loudness_strategy == "peak_guard_only" else None
+    started_at = monotonic()
+    last_logged_at = started_at
+
+    def log_mix_progress(index: int, progress_total: int, segment: Segment) -> None:
+        nonlocal last_logged_at
+        last_logged_at = _log_segment_progress(
+            "mix dialogue",
+            index,
+            progress_total,
+            segment,
+            manifest,
+            started_at,
+            last_logged_at,
+        )
+
+    console.print("[cyan]mix[/cyan] building dialogue stem")
+    build_dialogue_stem(
+        manifest.segments,
+        dialogue,
+        duration,
+        cfg.mix_sample_rate,
+        dialogue_gain_db=cfg.mix_dialogue_gain_db,
+        dialogue_fade_ms=cfg.mix_dialogue_fade_ms,
+        peak_limit_dbfs=peak_limit_dbfs,
+        progress_callback=log_mix_progress,
+        include_segment=lambda segment: _include_segment_in_mix(
+            segment,
+            allow_korean_timing_draft=allow_korean_timing_draft,
+        ),
+    )
+    console.print(f"[cyan]mix[/cyan] dialogue stem written: {dialogue}")
+    separated_background = manifest.artifacts.get("background_only_48k")
+    original_background = manifest.artifacts.get("original_stereo_48k")
+    background_source = None
+    background_kind = None
+    if cfg.mix_background_bed == "preserve_original":
+        if separated_background:
+            background_source = Path(separated_background)
+            background_kind = "source_separated"
+        elif original_background:
+            background_source = Path(original_background)
+            background_kind = "original"
+    background_available = background_source is not None
+    background = background_source
+    background_suppressed_path: Path | None = None
+    if background_source and cfg.background_speech_suppression:
+        background_suppressed_path = ensure_inside_project(
+            project_dir,
+            project_dir / "work" / "mix" / "source_suppressed_background.wav",
+        )
+        console.print("[cyan]mix[/cyan] suppressing source speech in background bed")
+        build_source_suppressed_background(
+            background_source,
+            background_suppressed_path,
+            manifest.segments,
+            sample_rate=cfg.mix_sample_rate,
+            attenuation_db=cfg.background_speech_suppression_db,
+            pad_sec=cfg.background_speech_suppression_pad_sec,
+            fade_ms=cfg.background_speech_suppression_fade_ms,
+            reduce_center_bleed=background_kind != "source_separated",
+            peak_limit_dbfs=peak_limit_dbfs,
+        )
+        manifest.artifacts["source_suppressed_background"] = str(background_suppressed_path)
+        background = background_suppressed_path
+    console.print("[cyan]mix[/cyan] combining dialogue with background")
+    mix_with_background(
+        dialogue,
+        final_audio,
+        background,
+        cfg.background_gain_db,
+        cfg.mix_sample_rate,
+        peak_limit_dbfs=peak_limit_dbfs,
+        suppress_background_speech=False,
+    )
+    console.print(f"[cyan]mix[/cyan] final audio written: {final_audio}")
+    manifest.artifacts["dialogue_stem"] = str(dialogue)
+    manifest.artifacts["final_audio"] = str(final_audio)
+    mix_config = _mix_config_metadata(manifest)
+    background_metadata = {
+        "available": background_available,
+        "used": background is not None,
+        "path": str(background) if background else None,
+        "source_path": str(background_source) if background_source else None,
+        "source_kind": background_kind,
+        "policy": cfg.mix_background_bed,
+        "gain_db": cfg.background_gain_db if background else None,
+        "speech_suppression": {
+            "enabled": bool(background_suppressed_path),
+            "path": str(background_suppressed_path) if background_suppressed_path else None,
+            "attenuation_db": cfg.background_speech_suppression_db
+            if background_suppressed_path
+            else None,
+            "pad_sec": cfg.background_speech_suppression_pad_sec
+            if background_suppressed_path
+            else None,
+            "fade_ms": cfg.background_speech_suppression_fade_ms
+            if background_suppressed_path
+            else None,
+            "center_bleed_reduction": bool(
+                background_suppressed_path and background_kind != "source_separated"
+            ),
+        },
+    }
+    skipped = [
+        s.id
+        for s in manifest.segments
+        if not _include_segment_in_mix(s, allow_korean_timing_draft=allow_korean_timing_draft)
+    ]
+    draft_included = [
+        s.id
+        for s in manifest.segments
+        if s.status != "ok"
+        and _include_segment_in_mix(s, allow_korean_timing_draft=allow_korean_timing_draft)
+    ]
+    for segment in manifest.segments:
+        included = _include_segment_in_mix(
+            segment,
+            allow_korean_timing_draft=allow_korean_timing_draft,
+        )
+        segment.mix = {
+            **segment.mix,
+            "included": included,
+            "reason": "qc_pass"
+            if included and segment.status == "ok"
+            else "korean_timing_draft"
+            if included
+            else f"status_{segment.status}",
+            "selected_candidate_path": segment.tts.selected_candidate_path if segment.tts else None,
+            "start": segment.start,
+            "estimated_pan": segment.estimated_pan,
+            "dialogue_gain_db": cfg.mix_dialogue_gain_db if included else None,
+            "dialogue_fade_ms": cfg.mix_dialogue_fade_ms if included else None,
+            "qc_recommendation": segment.qc.recommendation if segment.qc else None,
+        }
+    if draft_included:
+        manifest.warnings.append(
+            "Included Korean draft segments with timing-only QC regeneration flags during mix: "
+            + ", ".join(draft_included)
+        )
+    if skipped:
+        manifest.warnings.append(f"Skipped non-passing segments during mix: {', '.join(skipped)}")
+    mix_manifest = project_dir / "work" / "mix" / "mix_manifest.json"
+    write_json_atomic(
+        mix_manifest,
+        {
+            "dialogue_stem": str(dialogue),
+            "final_audio": str(final_audio),
+            "config": mix_config,
+            "background": background_metadata,
+            "segments": [{"id": segment.id, "mix": segment.mix} for segment in manifest.segments],
+        },
+    )
+    manifest.artifacts["mix_manifest"] = str(mix_manifest)
+    mark_stage(
+        manifest,
+        "mix",
+        "completed",
+        skipped_segments=skipped,
+        draft_included_segments=draft_included,
+        mix_config=mix_config,
+        background=background_metadata,
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("mix", manifest, f"skipped={len(skipped)}")
+    return manifest
+
+
+def export_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> PipelineManifest:
+    _log_stage_start("export", f"input={input_path}")
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    audit = require_confirmed_rights(confirm_rights, "export", input_path)
+    manifest.rights_audit = merge_rights_audit(manifest.rights_audit, audit)
+    final_audio = Path(manifest.artifacts.get("final_audio", project_dir / "work/mix/final_audio.wav"))
+    suffix = ".mp4" if manifest.source_info and manifest.source_info.has_video else ".wav"
+    output = ensure_inside_project(project_dir, project_dir / "output" / f"{input_path.stem}_dub{suffix}")
+    ensure_not_same_path(input_path, output)
+    try:
+        console.print(f"[cyan]export[/cyan] muxing output: {output}")
+        ffmpeg.mux_audio(input_path, final_audio, output)
+    except ffmpeg.FFmpegError:
+        if suffix == ".wav":
+            shutil.copy2(final_audio, output)
+        else:
+            raise
+    manifest.artifacts["export"] = str(output)
+    export_manifest = project_dir / "work" / "export" / "export_manifest.json"
+    write_json_atomic(
+        export_manifest,
+        {
+            "input": str(input_path),
+            "final_audio": str(final_audio),
+            "output": str(output),
+            "has_video": bool(manifest.source_info and manifest.source_info.has_video),
+        },
+    )
+    manifest.artifacts["export_manifest"] = str(export_manifest)
+    mark_stage(manifest, "export", "completed", output=str(output), export_manifest=str(export_manifest))
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("export", manifest, f"output={output}")
+    return manifest

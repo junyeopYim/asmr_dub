@@ -1,0 +1,64 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+.venvs/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+
+# Project-generated media, manifests, and model caches
+/.cache/
+/runs/
+/audio/
+/work/
+/outputs/
+/artifacts/
+
+# Heavy model/checkpoint artifacts
+models/
+checkpoints/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.bin
+
+# Generated media files
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.flac
+*.aac
+*.ogg
+*.webm
+
+# Logs and local editor/OS files
+*.log
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "asmr-dub-pipeline"
+version = "0.1.0"
+description = "Local-first Japanese ASMR dubbing pipeline with Gemma, GPT-SoVITS, and ffmpeg/DSP utilities."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "asmr-dub-pipeline contributors" }]
+dependencies = [
+  "pydantic>=2",
+  "typer>=0.9",
+  "rich>=13",
+  "httpx>=0.25",
+  "numpy>=1.24",
+  "soundfile>=0.12",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+asr = ["faster-whisper", "ctranslate2"]
+hf = ["transformers>=4.56", "torch", "accelerate"]
+separation = ["demucs"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+asmr-dub = "asmr_dub_pipeline.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["asmr_dub_pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".cache", "audio", "runs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "B008"]

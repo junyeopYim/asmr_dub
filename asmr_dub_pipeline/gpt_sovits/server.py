@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import shlex
+import socket
+import subprocess
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from urllib.parse import urlparse
+
+import yaml
+
+from .client import GPTSoVITSError
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+SHIM_DIR = Path(__file__).resolve().parent / "shims"
+
+
+def _host_port(base_url: str) -> tuple[str, int]:
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        raise GPTSoVITSError(f"GPT-SoVITS URL must include a host: {base_url}")
+    if parsed.scheme not in {"http", "https"}:
+        raise GPTSoVITSError(f"GPT-SoVITS URL must be http or https: {base_url}")
+    default_port = 443 if parsed.scheme == "https" else 80
+    return parsed.hostname, parsed.port or default_port
+
+
+def is_local_gsv_url(base_url: str) -> bool:
+    host, _ = _host_port(base_url)
+    return host.lower() in LOCAL_HOSTS
+
+
+def is_tcp_open(base_url: str, timeout_sec: float = 0.3) -> bool:
+    host, port = _host_port(base_url)
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True
+    except OSError:
+        return False
+
+
+def _default_gsv_command(base_url: str) -> list[str]:
+    host, port = _host_port(base_url)
+    candidates = [
+        REPO_ROOT / ".cache/third_party/GPT-SoVITS/api_v2.py",
+        REPO_ROOT / ".cache/third_party/GPT_SoVITS/api_v2.py",
+        REPO_ROOT / ".cache/gpt_sovits/GPT_SoVITS/api_v2.py",
+        REPO_ROOT / ".cache/gpt_sovits/GPT-SoVITS/api_v2.py",
+        Path.cwd() / "GPT_SoVITS/api_v2.py",
+        Path.cwd() / "GPT-SoVITS/api_v2.py",
+    ]
+    api_path = next((path for path in candidates if path.exists()), None)
+    if api_path is None:
+        return []
+    command = ["python", str(api_path), "-a", host, "-p", str(port)]
+    _repair_pretrained_model_links(api_path.parent)
+    config_path = _local_tts_config(api_path.parent) or api_path.parent / "GPT_SoVITS/configs/tts_infer.yaml"
+    if config_path.exists():
+        command.extend(["-c", str(config_path)])
+    return command
+
+
+def _repair_pretrained_model_links(install_dir: Path) -> None:
+    source = REPO_ROOT / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models"
+    target = install_dir / "GPT_SoVITS" / "pretrained_models"
+    if not source.exists() or not target.exists():
+        return
+    for name in (
+        "chinese-hubert-base",
+        "chinese-roberta-wwm-ext-large",
+        "fast_langdetect",
+        "s1v3.ckpt",
+        "sv",
+        "v2Pro",
+    ):
+        source_path = source / name
+        if name == "fast_langdetect":
+            source_path.mkdir(parents=True, exist_ok=True)
+        target_path = target / name
+        if not source_path.exists():
+            continue
+        if target_path.is_symlink() and not target_path.exists():
+            target_path.unlink()
+        if not target_path.exists():
+            target_path.symlink_to(source_path.resolve())
+
+
+def _local_tts_config(install_dir: Path) -> Path | None:
+    pretrained = REPO_ROOT / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models"
+    required = {
+        "t2s_weights_path": pretrained / "s1v3.ckpt",
+        "vits_weights_path": pretrained / "v2Pro" / "s2Gv2ProPlus.pth",
+        "bert_base_path": pretrained / "chinese-roberta-wwm-ext-large",
+        "cnhuhbert_base_path": pretrained / "chinese-hubert-base",
+    }
+    if not all(path.exists() for path in required.values()):
+        return None
+    config_path = REPO_ROOT / ".cache" / "gpt_sovits" / "tts_infer.local.yaml"
+    custom = {
+        "device": "cuda",
+        "is_half": True,
+        "version": "v2ProPlus",
+        **{key: str(path.resolve()) for key, path in required.items()},
+    }
+    payload = {"custom": custom}
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=True), "utf-8")
+    return config_path
+
+
+def _infer_gsv_cwd(command: Sequence[str]) -> Path | None:
+    for part in command:
+        path = Path(part).expanduser()
+        if path.name == "api_v2.py" and path.exists():
+            return path.resolve().parent
+    return None
+
+
+def _normalize_command(command: Sequence[str] | str | None, base_url: str) -> list[str]:
+    host, port = _host_port(base_url)
+
+    def format_part(part: object) -> str:
+        text = str(part)
+        return (
+            text.replace("{base_url}", base_url)
+            .replace("{host}", host)
+            .replace("{port}", str(port))
+        )
+
+    if isinstance(command, str):
+        return [format_part(part) for part in shlex.split(command)]
+    if command:
+        return [format_part(part) for part in command]
+    return _default_gsv_command(base_url)
+
+
+def _gsv_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if importlib.util.find_spec("mecab") is None and SHIM_DIR.exists():
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            str(SHIM_DIR) if not existing else os.pathsep.join((str(SHIM_DIR), existing))
+        )
+    return env
+
+
+def _tail(path: Path, max_chars: int = 2000) -> str:
+    try:
+        text = path.read_text("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:]
+
+
+class ManagedGPTSoVITSServer:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        base_url: str,
+        command: Sequence[str] | str | None = None,
+        cwd: str | Path | None = None,
+        log_path: Path | None = None,
+        startup_timeout_sec: float = 120.0,
+        shutdown_timeout_sec: float = 10.0,
+    ) -> None:
+        self.enabled = enabled
+        self.base_url = base_url
+        self.command = _normalize_command(command, base_url)
+        self.cwd = Path(cwd).expanduser().resolve() if cwd else _infer_gsv_cwd(self.command)
+        self.log_path = log_path
+        self.startup_timeout_sec = startup_timeout_sec
+        self.shutdown_timeout_sec = shutdown_timeout_sec
+        self.process: subprocess.Popen[str] | None = None
+        self.started = False
+        self.reused_existing = False
+        self._log_file = None
+
+    def start(self) -> ManagedGPTSoVITSServer:
+        if not self.enabled:
+            return self
+        if is_tcp_open(self.base_url):
+            self.reused_existing = True
+            return self
+        if not is_local_gsv_url(self.base_url):
+            raise GPTSoVITSError(
+                f"GPT-SoVITS auto-start only supports local URLs; got {self.base_url}"
+            )
+        if not self.command:
+            raise GPTSoVITSError(
+                "GPT-SoVITS auto-start requested, but no api_v2.py was found. "
+                "Install GPT-SoVITS or set gsv_server_command / --gsv-server-command."
+            )
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = self.log_path.open("a", encoding="utf-8")
+            stdout = self._log_file
+            stderr = subprocess.STDOUT
+        else:
+            stdout = subprocess.DEVNULL
+            stderr = subprocess.DEVNULL
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                cwd=str(self.cwd) if self.cwd else None,
+                env=_gsv_subprocess_env(),
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+            )
+        except OSError as exc:
+            self._close_log()
+            raise GPTSoVITSError(f"Could not start GPT-SoVITS server: {exc}") from exc
+        self.started = True
+        deadline = time.monotonic() + self.startup_timeout_sec
+        while time.monotonic() < deadline:
+            if is_tcp_open(self.base_url):
+                return self
+            if self.process.poll() is not None:
+                details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
+                self._close_log()
+                raise GPTSoVITSError(
+                    f"GPT-SoVITS server exited before becoming ready with code "
+                    f"{self.process.returncode}.{details}"
+                )
+            time.sleep(0.5)
+        details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
+        self.stop()
+        raise GPTSoVITSError(
+            f"GPT-SoVITS server did not open {self.base_url} within "
+            f"{self.startup_timeout_sec:g}s.{details}"
+        )
+
+    def stop(self) -> None:
+        if self.process is None:
+            self._close_log()
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=self.shutdown_timeout_sec)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        self._close_log()
+
+    def _close_log(self) -> None:
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+
+    def __enter__(self) -> ManagedGPTSoVITSServer:
+        return self.start()
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.stop()

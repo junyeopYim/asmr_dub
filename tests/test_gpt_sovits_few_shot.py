@@ -1,0 +1,589 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+from conftest import write_tiny_wav
+
+from asmr_dub_pipeline.config import save_project_config
+from asmr_dub_pipeline.gpt_sovits.client import build_tts_request
+from asmr_dub_pipeline.gpt_sovits.few_shot import (
+    build_training_dataset,
+    discover_install,
+    train_few_shot,
+)
+from asmr_dub_pipeline.pipeline import steps
+from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
+from asmr_dub_pipeline.pipeline.steps import init_project, synth_step
+from asmr_dub_pipeline.schemas import (
+    JapaneseScript,
+    PipelineManifest,
+    ProjectConfig,
+    Segment,
+    SourceScript,
+)
+
+
+def _segment(project_dir: Path, segment_id: str, start: float, duration: float, text: str) -> Segment:
+    audio = project_dir / "work" / "segments" / "audio" / f"{segment_id}_mix.wav"
+    write_tiny_wav(audio, duration=duration)
+    return Segment(
+        id=segment_id,
+        start=start,
+        end=start + duration,
+        duration=duration,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(project_dir)),
+        source_script=SourceScript(
+            text=text,
+            language="ja",
+            backend="mock",
+            start=start,
+            end=start + duration,
+        ),
+    )
+
+
+def _manifest_with_segments(project_dir: Path, durations: list[float]) -> PipelineManifest:
+    segments = [
+        _segment(project_dir, f"seg_{index:04d}", index * 10.0, duration, f"台詞 {index}")
+        for index, duration in enumerate(durations, start=1)
+    ]
+    return PipelineManifest(segments=segments)
+
+
+def _fake_gsv_install(root: Path) -> Path:
+    api = root / "api_v2.py"
+    configs = root / "GPT_SoVITS" / "configs"
+    pretrained = root / "GPT_SoVITS" / "pretrained_models"
+    configs.mkdir(parents=True)
+    pretrained.mkdir(parents=True)
+    api.write_text("", "utf-8")
+    (pretrained / "s1v3.ckpt").write_bytes(b"gpt-base")
+    (pretrained / "s2Gv4.pth").write_bytes(b"sovits-base")
+    (pretrained / "bert").mkdir()
+    (pretrained / "hubert").mkdir()
+    (configs / "tts_infer.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "custom": {
+                    "version": "v4",
+                    "bert_base_path": "GPT_SoVITS/pretrained_models/bert",
+                    "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/hubert",
+                    "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+                    "vits_weights_path": "GPT_SoVITS/pretrained_models/s2Gv4.pth",
+                }
+            },
+            sort_keys=True,
+        ),
+        "utf-8",
+    )
+    (configs / "s1longer-v2.yaml").write_text(
+        yaml.safe_dump({"train": {}, "data": {}, "model": {}}, sort_keys=True),
+        "utf-8",
+    )
+    (configs / "s2.json").write_text(
+        json.dumps({"train": {}, "data": {}, "model": {}}, sort_keys=True),
+        "utf-8",
+    )
+    return api
+
+
+def test_discover_install_uses_tts_config_from_server_command(tmp_project_dir: Path) -> None:
+    api = _fake_gsv_install(tmp_project_dir / "gsv")
+    default_config = api.parent / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
+    default_payload = yaml.safe_load(default_config.read_text("utf-8"))
+    default_payload["custom"]["vits_weights_path"] = "GPT_SoVITS/pretrained_models/missing.pth"
+    default_config.write_text(yaml.safe_dump(default_payload, sort_keys=True), "utf-8")
+    command_config = tmp_project_dir / "tts_infer.local.yaml"
+    command_config.write_text(
+        yaml.safe_dump(
+            {
+                "custom": {
+                    "version": "v4",
+                    "bert_base_path": "GPT_SoVITS/pretrained_models/bert",
+                    "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/hubert",
+                    "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+                    "vits_weights_path": "GPT_SoVITS/pretrained_models/s2Gv4.pth",
+                }
+            },
+            sort_keys=True,
+        ),
+        "utf-8",
+    )
+    command = ["python", str(api), "-c", str(command_config)]
+
+    install = discover_install(
+        ProjectConfig(project_name="test", gsv_server_command=command),
+        command=command,
+    )
+
+    assert install.tts_config_path == command_config.resolve()
+    assert install.pretrained_sovits_path.name == "s2Gv4.pth"
+
+
+def test_few_shot_dataset_selects_source_segments(tmp_project_dir: Path) -> None:
+    init_project(tmp_project_dir)
+    manifest = _manifest_with_segments(tmp_project_dir, [1.0, 0.5, 1.4])
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_few_shot_target_sec=2.0,
+        gsv_few_shot_min_clip_sec=1.0,
+        gsv_few_shot_max_clip_sec=10.0,
+    )
+
+    dataset = build_training_dataset(tmp_project_dir, manifest, cfg)
+
+    assert [item.segment_id for item in dataset.items] == ["seg_0001", "seg_0003"]
+    assert dataset.total_duration_sec == pytest.approx(2.4)
+    lines = dataset.list_path.read_text("utf-8").splitlines()
+    assert lines == [
+        "seg_0001.wav|source_voice|ja|台詞 1",
+        "seg_0003.wav|source_voice|ja|台詞 3",
+    ]
+    assert (dataset.wav_dir / "seg_0001.wav").exists()
+    qc = json.loads((tmp_project_dir / "work/gpt_sovits/few_shot/source_clip_qc.json").read_text("utf-8"))
+    assert qc["clips"][0]["source_language"] == "ja"
+    assert qc["clips"][0]["target_language"] == "ko"
+    assert qc["clips"][0]["quality_score"] > 0
+
+
+def test_few_shot_dataset_rejects_too_little_source_voice(tmp_project_dir: Path) -> None:
+    init_project(tmp_project_dir)
+    manifest = _manifest_with_segments(tmp_project_dir, [1.0])
+    cfg = ProjectConfig(project_name="test", gsv_few_shot_target_sec=2.0)
+
+    with pytest.raises(Exception, match="Not enough source voice data"):
+        build_training_dataset(tmp_project_dir, manifest, cfg)
+
+
+def test_few_shot_training_runs_commands_and_reuses_matching_weights(tmp_project_dir: Path) -> None:
+    init_project(tmp_project_dir)
+    api = _fake_gsv_install(tmp_project_dir / "gsv")
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_url="http://127.0.0.1:9880",
+        gsv_server_command=["python", str(api)],
+        gsv_few_shot_target_sec=2.0,
+    )
+    manifest = _manifest_with_segments(tmp_project_dir, [1.0, 1.2])
+    commands: list[list[str]] = []
+
+    def runner(command, **kwargs):
+        commands.append(list(command))
+        env_paths = kwargs["env"]["PYTHONPATH"].split(":")
+        assert str(api.parent) in env_paths
+        assert str(api.parent / "GPT_SoVITS") in env_paths
+        if any("s2_train_v3_lora.py" in part for part in command):
+            weights = tmp_project_dir / "work/gpt_sovits/few_shot/weights/sovits/final.pth"
+            weights.write_bytes(b"sovits-trained")
+        if any("s1_train.py" in part for part in command):
+            weights = tmp_project_dir / "work/gpt_sovits/few_shot/weights/gpt/final.ckpt"
+            weights.write_bytes(b"gpt-trained")
+        return subprocess.CompletedProcess(command, 0)
+
+    first = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner)
+    second = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner)
+    forced = train_few_shot(tmp_project_dir, manifest, cfg, force=True, runner=runner)
+
+    assert first.status == "completed"
+    assert second.status == "skipped"
+    assert second.reused_existing is True
+    assert forced.status == "completed"
+    assert [Path(command[2]).name for command in commands[:4]] == [
+        "1-get-text.py",
+        "2-get-hubert-wav32k.py",
+        "3-get-semantic.py",
+        "s2_train_v3_lora.py",
+    ]
+    assert sum(any("s1_train.py" in part for part in command) for command in commands) == 2
+
+
+def test_few_shot_fingerprint_changes_when_training_audio_changes(tmp_project_dir: Path) -> None:
+    init_project(tmp_project_dir)
+    api = _fake_gsv_install(tmp_project_dir / "gsv")
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_url="http://127.0.0.1:9880",
+        gsv_server_command=["python", str(api)],
+        gsv_few_shot_target_sec=2.0,
+    )
+    manifest = _manifest_with_segments(tmp_project_dir, [1.0, 1.2])
+
+    def runner(command, **_kwargs):
+        if any("s2_train_v3_lora.py" in part for part in command):
+            weights = tmp_project_dir / "work/gpt_sovits/few_shot/weights/sovits/final.pth"
+            weights.write_bytes(b"sovits-trained")
+        if any("s1_train.py" in part for part in command):
+            weights = tmp_project_dir / "work/gpt_sovits/few_shot/weights/gpt/final.ckpt"
+            weights.write_bytes(b"gpt-trained")
+        return subprocess.CompletedProcess(command, 0)
+
+    first = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner)
+    changed_audio = tmp_project_dir / manifest.segments[0].audio_for_mix
+    write_tiny_wav(changed_audio, duration=1.0, sample_rate=44_100)
+    second = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner)
+
+    assert first.fingerprint != second.fingerprint
+    assert second.reused_existing is False
+
+
+def test_synth_loads_few_shot_weights_from_manifest(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(project_name="test", gsv_gpt_weights_policy="few_shot")
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    gpt = tmp_project_dir / "work" / "gpt_sovits" / "few_shot" / "weights" / "gpt" / "final.ckpt"
+    sovits = tmp_project_dir / "work" / "gpt_sovits" / "few_shot" / "weights" / "sovits" / "final.pth"
+    gpt.parent.mkdir(parents=True, exist_ok=True)
+    sovits.parent.mkdir(parents=True, exist_ok=True)
+    gpt.write_bytes(b"gpt")
+    sovits.write_bytes(b"sovits")
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.2,
+        duration=1.2,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio),
+        source_script=SourceScript(text="テスト", language="ja", backend="mock", start=0.0, end=1.2),
+        script=JapaneseScript(
+            literal_ja="テスト",
+            ja_text="テスト",
+            tts_text="안녕하세요",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+        ),
+    )
+    manifest = PipelineManifest(
+        segments=[segment],
+        artifacts={
+            "gsv_few_shot_gpt_weights": str(gpt),
+            "gsv_few_shot_sovits_weights": str(sovits),
+        },
+    )
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[tuple[str, str]] = []
+    prompt_texts: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            calls.append(("gpt", path))
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            calls.append(("sovits", path))
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            prompt_texts.append(ref.prompt_text)
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            write_tiny_wav(output_path)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://gsv.local",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    assert calls[:2] == [("gpt", str(gpt)), ("sovits", str(sovits))]
+    assert prompt_texts and prompt_texts[0]
+
+
+def test_synth_keeps_base_gpt_for_korean_few_shot_voice(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(project_name="test")
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    base_gpt = tmp_project_dir / "gsv" / "GPT_SoVITS" / "pretrained_models" / "s1v3.ckpt"
+    gpt = tmp_project_dir / "work" / "gpt_sovits" / "few_shot" / "weights" / "gpt" / "final.ckpt"
+    sovits = tmp_project_dir / "work" / "gpt_sovits" / "few_shot" / "weights" / "sovits" / "final.pth"
+    training_manifest = tmp_project_dir / "work" / "gpt_sovits" / "few_shot" / "training_manifest.json"
+    for path, payload in (
+        (base_gpt, b"base-gpt"),
+        (gpt, b"few-shot-gpt"),
+        (sovits, b"few-shot-sovits"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    training_manifest.parent.mkdir(parents=True, exist_ok=True)
+    training_manifest.write_text(
+        json.dumps(
+            {
+                "fingerprint_payload": {
+                    "gpt_sovits": {
+                        "pretrained_gpt_path": str(base_gpt),
+                    }
+                }
+            },
+            sort_keys=True,
+        ),
+        "utf-8",
+    )
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.2,
+        duration=1.2,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio),
+        source_script=SourceScript(text="こんにちは", language="ja", backend="mock", start=0.0, end=1.2),
+        script=JapaneseScript(
+            literal_ja="こんにちは",
+            ja_text="こんにちは",
+            tts_text="안녕하세요",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+        ),
+    )
+    manifest = PipelineManifest(
+        segments=[segment],
+        artifacts={
+            "gsv_few_shot_gpt_weights": str(gpt),
+            "gsv_few_shot_sovits_weights": str(sovits),
+            "gsv_few_shot_manifest": str(training_manifest),
+        },
+    )
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[tuple[str, str]] = []
+    payloads: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            calls.append(("gpt", path))
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            calls.append(("sovits", path))
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            request = build_tts_request(text, ref, options)
+            payloads.append(request.as_payload())
+            return request
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            write_tiny_wav(output_path)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://gsv.local",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    assert calls[:2] == [("gpt", str(base_gpt)), ("sovits", str(sovits))]
+    assert payloads[0]["text"] == "안녕하세요"
+    assert payloads[0]["text_lang"] == "all_ko"
+    assert payloads[0]["prompt_lang"] == "all_ja"
+    assert payloads[0]["prompt_text"]
+
+
+def test_synth_does_not_apply_japanese_duration_rewrite_to_korean(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    save_project_config(ProjectConfig(project_name="test"), tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=0.2,
+        duration=0.2,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio),
+        script=JapaneseScript(ja_text="수고하셨습니다", tts_text="수고하셨습니다", tts_language="ko"),
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    payload_texts: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            request = build_tts_request(text, ref, options)
+            payload_texts.append(request.text)
+            return request
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            write_tiny_wav(output_path, duration=1.2)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    def fail_rewrite(*args, **kwargs):
+        raise AssertionError("Korean TTS must not use Japanese duration rewrite")
+
+    monkeypatch.setattr(steps, "rewrite_for_duration", fail_rewrite)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://gsv.local",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].script is not None
+    assert manifest.segments[0].script.tts_text == "수고하셨습니다"
+    assert payload_texts == ["수고하셨습니다", "수고하셨습니다", "수고하셨습니다"]
+
+
+def test_synth_uses_three_gsv_lanes_by_segment_id(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(project_name="test", gsv_concurrency=3)
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    segments: list[Segment] = []
+    for index in range(1, 7):
+        audio = tmp_project_dir / "work" / "segments" / "audio" / f"seg_{index:04d}_mix.wav"
+        write_tiny_wav(audio)
+        source_text = f"テスト {index}"
+        tts_text = f"테스트 {index}"
+        segments.append(
+            Segment(
+                id=f"seg_{index:04d}",
+                start=(index - 1) * 1.2,
+                end=index * 1.2,
+                duration=1.2,
+                audio_for_gemma=str(audio),
+                audio_for_mix=str(audio),
+                source_script=SourceScript(
+                    text=source_text,
+                    language="ja",
+                    backend="mock",
+                    start=(index - 1) * 1.2,
+                    end=index * 1.2,
+                ),
+                script=JapaneseScript(
+                    literal_ja=source_text,
+                    ja_text=source_text,
+                    tts_text=tts_text,
+                    tts_language="ko",
+                    source_language="ja",
+                    target_language="ko",
+                ),
+            )
+        )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=segments))
+    calls: list[tuple[str, str]] = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, *args: object, **kwargs: object) -> None:
+            self.base_url = base_url
+
+        def set_gpt_weights(self, path: str) -> str:
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            calls.append((request.text, self.base_url))
+            write_tiny_wav(output_path)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://127.0.0.1:9880",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    by_text = dict(calls)
+    assert by_text["테스트 1"] == "http://127.0.0.1:9880"
+    assert by_text["테스트 2"] == "http://127.0.0.1:9881"
+    assert by_text["테스트 3"] == "http://127.0.0.1:9882"
+    assert by_text["테스트 4"] == "http://127.0.0.1:9880"
+    assert by_text["테스트 5"] == "http://127.0.0.1:9881"
+    assert by_text["테스트 6"] == "http://127.0.0.1:9882"
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["synth"]["concurrency"] == 3
+
+
+def test_semantic_parts_merge_with_upstream_header(tmp_project_dir: Path) -> None:
+    dataset_dir = tmp_project_dir / "dataset"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "6-name2semantic-0.tsv").write_text("seg_0001\t1 2 3\n", "utf-8")
+    (dataset_dir / "6-name2semantic-1.tsv").write_text("seg_0002\t4 5 6\n", "utf-8")
+
+    from asmr_dub_pipeline.gpt_sovits import few_shot
+
+    few_shot._merge_dataset_part_outputs(dataset_dir)
+
+    assert (dataset_dir / "6-name2semantic.tsv").read_text("utf-8").splitlines() == [
+        "item_name\tsemantic_audio",
+        "seg_0001\t1 2 3",
+        "seg_0002\t4 5 6",
+    ]
+
+
+def test_pandas_shim_default_header_matches_gpt_sovits_semantics(tmp_project_dir: Path) -> None:
+    from asmr_dub_pipeline.gpt_sovits.shims import pandas
+
+    tmp_project_dir.mkdir(parents=True)
+    csv_path = tmp_project_dir / "semantic.tsv"
+    csv_path.write_text("item_name\tsemantic_audio\nseg_0001\t1 2 3\n", "utf-8")
+
+    default_frame = pandas.read_csv(csv_path, delimiter="\t")
+    raw_frame = pandas.read_csv(csv_path, delimiter="\t", header=None)
+
+    assert len(default_frame) == 1
+    assert default_frame.iloc[0, 0] == "seg_0001"
+    assert len(raw_frame) == 2
