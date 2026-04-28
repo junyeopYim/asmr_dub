@@ -10,6 +10,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import yaml
@@ -27,11 +28,21 @@ from asmr_dub_pipeline.rights import (
 from asmr_dub_pipeline.schemas import PipelineManifest, ProjectConfig, Segment
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+FEW_SHOT_PROGRESS_LOG_SECONDS = 10.0
 
 FEW_SHOT_STAGE = "gsv-few-shot"
 FEW_SHOT_ARTIFACT_GPT = "gsv_few_shot_gpt_weights"
 FEW_SHOT_ARTIFACT_SOVITS = "gsv_few_shot_sovits_weights"
 SUPPORTED_VERSIONS = {"v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"}
+TRAINING_IMPORTANT_MARKERS = (
+    "error",
+    "exception",
+    "save",
+    "saved",
+    "saving",
+    "traceback",
+    "warning",
+)
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,19 @@ class FewShotTrainingResult:
     sovits_weights_sha256: str
     reused_existing: bool
     log_path: Path
+
+
+@dataclass(frozen=True)
+class FewShotTrainingProgress:
+    phase: str
+    status: str
+    index: int
+    total: int
+    detail: str | None = None
+    log_path: Path | None = None
+
+
+FewShotProgressCallback = Callable[[FewShotTrainingProgress], None]
 
 
 def _project_path(project_dir: Path, *parts: str) -> Path:
@@ -569,14 +593,142 @@ def _run_logged(
     cwd: Path,
     env: dict[str, str],
     log_path: Path,
+    phase: str,
+    index: int,
+    total: int,
+    progress_callback: FewShotProgressCallback | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    if progress_callback:
+        progress_callback(
+            FewShotTrainingProgress(
+                phase=phase,
+                status="started",
+                index=index,
+                total=total,
+                detail=" ".join(shlex.quote(part) for part in command),
+                log_path=log_path,
+            )
+        )
     with log_path.open("a", encoding="utf-8") as log:
         log.write("$ " + " ".join(shlex.quote(part) for part in command) + "\n")
         try:
-            runner(command, cwd=str(cwd), env=env, stdout=log, stderr=subprocess.STDOUT, text=True, check=True)
+            if runner is subprocess.run:
+                _run_logged_streaming(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    log=log,
+                    log_path=log_path,
+                    phase=phase,
+                    index=index,
+                    total=total,
+                    progress_callback=progress_callback,
+                )
+            else:
+                runner(
+                    command,
+                    cwd=str(cwd),
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=True,
+                )
         except subprocess.CalledProcessError as exc:
             raise GPTSoVITSError(f"GPT-SoVITS few-shot command failed: {' '.join(command)}") from exc
+    if progress_callback:
+        progress_callback(
+            FewShotTrainingProgress(
+                phase=phase,
+                status="completed",
+                index=index,
+                total=total,
+                log_path=log_path,
+            )
+        )
+
+
+def _run_logged_streaming(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    log: Any,
+    log_path: Path,
+    phase: str,
+    index: int,
+    total: int,
+    progress_callback: FewShotProgressCallback | None,
+) -> None:
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise GPTSoVITSError(f"GPT-SoVITS few-shot command failed to start: {' '.join(command)}") from exc
+    last_progress_at = 0.0
+    last_detail = ""
+    pending_output: list[str] = []
+
+    def maybe_emit_progress(raw_line: str) -> None:
+        nonlocal last_detail, last_progress_at
+        detail = _progress_detail(raw_line)
+        if not detail or not progress_callback:
+            return
+        now = monotonic()
+        if detail != last_detail and (
+            _is_important_progress_line(detail)
+            or last_progress_at == 0.0
+            or now - last_progress_at >= FEW_SHOT_PROGRESS_LOG_SECONDS
+        ):
+            progress_callback(
+                FewShotTrainingProgress(
+                    phase=phase,
+                    status="output",
+                    index=index,
+                    total=total,
+                    detail=detail,
+                    log_path=log_path,
+                )
+            )
+            last_progress_at = now
+            last_detail = detail
+
+    if process.stdout is not None:
+        while True:
+            char = process.stdout.read(1)
+            if char == "":
+                break
+            log.write(char)
+            if char in {"\n", "\r"}:
+                log.flush()
+                maybe_emit_progress("".join(pending_output))
+                pending_output = []
+            else:
+                pending_output.append(char)
+        log.flush()
+        if pending_output:
+            maybe_emit_progress("".join(pending_output))
+    returncode = process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+
+
+def _progress_detail(raw_line: str) -> str:
+    parts = raw_line.replace("\r", "\n").splitlines()
+    return (parts[-1] if parts else raw_line).strip()
+
+
+def _is_important_progress_line(line: str) -> bool:
+    lowered = line.lower()
+    return any(marker in lowered for marker in TRAINING_IMPORTANT_MARKERS)
 
 
 def _merge_part_files(dataset_dir: Path, prefix: str, suffix: str, header: str | None = None) -> None:
@@ -628,6 +780,7 @@ def _base_env(
             "cnhubert_base_dir": str(install.cnhubert_base_path),
             "pretrained_s2G": str(install.pretrained_sovits_path),
             "s2config_path": str(s2_config_path),
+            "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": os.pathsep.join(python_paths),
         }
     )
@@ -644,6 +797,7 @@ def train_few_shot(
     force: bool | None = None,
     command: Sequence[str] | str | None = None,
     runner: CommandRunner = subprocess.run,
+    progress_callback: FewShotProgressCallback | None = None,
 ) -> FewShotTrainingResult:
     project_dir = project_dir.expanduser().resolve()
     dataset = build_training_dataset(project_dir, manifest, cfg)
@@ -663,6 +817,17 @@ def train_few_shot(
     if not should_force:
         reusable = _load_reusable_result(metadata_path, fingerprint, dataset, install, log_path)
         if reusable is not None:
+            if progress_callback:
+                progress_callback(
+                    FewShotTrainingProgress(
+                        phase="reuse",
+                        status="skipped",
+                        index=0,
+                        total=0,
+                        detail="matching few-shot weights already exist",
+                        log_path=log_path,
+                    )
+                )
             return reusable
     if should_force or _metadata_fingerprint(metadata_path) != fingerprint:
         _clean_training_outputs(base_dir, install, weights_gpt_dir, weights_sovits_dir)
@@ -679,23 +844,65 @@ def train_few_shot(
     semantic_env = dict(env)
     semantic_env["s2config_path"] = str(semantic_s2_config_path)
     py = sys.executable or "python"
-    prep_commands: list[tuple[list[str], dict[str, str]]] = [
-        ([py, "-s", "GPT_SoVITS/prepare_datasets/1-get-text.py"], env),
-        ([py, "-s", "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py"], env),
+    prep_commands: list[tuple[str, list[str], dict[str, str]]] = [
+        ("prepare-text", [py, "-s", "GPT_SoVITS/prepare_datasets/1-get-text.py"], env),
+        ("prepare-hubert", [py, "-s", "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py"], env),
     ]
     if install.needs_sv_features:
-        prep_commands.append(([py, "-s", "GPT_SoVITS/prepare_datasets/2-get-sv.py"], env))
-    prep_commands.append(([py, "-s", "GPT_SoVITS/prepare_datasets/3-get-semantic.py"], semantic_env))
-    for training_command, command_env in prep_commands:
-        _run_logged(runner, training_command, cwd=install.root, env=command_env, log_path=log_path)
+        prep_commands.append(("prepare-sv", [py, "-s", "GPT_SoVITS/prepare_datasets/2-get-sv.py"], env))
+    prep_commands.append(
+        (
+            "prepare-semantic",
+            [py, "-s", "GPT_SoVITS/prepare_datasets/3-get-semantic.py"],
+            semantic_env,
+        )
+    )
+    train_commands: list[tuple[str, list[str], dict[str, str]]] = [
+        ("fine-tune-sovits", [py, "-s", install.s2_train_script, "--config", str(s2_config_path)], env),
+        ("fine-tune-gpt", [py, "-s", "GPT_SoVITS/s1_train.py", "--config_file", str(s1_config_path)], env),
+    ]
+    total_commands = len(prep_commands) + len(train_commands)
+    if progress_callback:
+        progress_callback(
+            FewShotTrainingProgress(
+                phase="dataset",
+                status="completed",
+                index=0,
+                total=total_commands,
+                detail=f"selected={len(dataset.items)} duration={dataset.total_duration_sec:.2f}s",
+                log_path=log_path,
+            )
+        )
+    for command_index, (phase, training_command, command_env) in enumerate(prep_commands, start=1):
+        _run_logged(
+            runner,
+            training_command,
+            cwd=install.root,
+            env=command_env,
+            log_path=log_path,
+            phase=phase,
+            index=command_index,
+            total=total_commands,
+            progress_callback=progress_callback,
+        )
     _merge_dataset_part_outputs(dataset.list_path.parent / "dataset")
 
-    train_commands: list[tuple[list[str], dict[str, str]]] = [
-        ([py, "-s", install.s2_train_script, "--config", str(s2_config_path)], env),
-        ([py, "-s", "GPT_SoVITS/s1_train.py", "--config_file", str(s1_config_path)], env),
-    ]
-    for training_command, command_env in train_commands:
-        _run_logged(runner, training_command, cwd=install.root, env=command_env, log_path=log_path)
+    first_train_index = len(prep_commands) + 1
+    for command_index, (phase, training_command, command_env) in enumerate(
+        train_commands,
+        start=first_train_index,
+    ):
+        _run_logged(
+            runner,
+            training_command,
+            cwd=install.root,
+            env=command_env,
+            log_path=log_path,
+            phase=phase,
+            index=command_index,
+            total=total_commands,
+            progress_callback=progress_callback,
+        )
 
     gpt_weights = _latest_weight(weights_gpt_dir, ".ckpt")
     sovits_weights = _latest_weight(weights_sovits_dir, ".pth")

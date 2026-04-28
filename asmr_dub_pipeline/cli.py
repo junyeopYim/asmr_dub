@@ -47,7 +47,7 @@ TRAINED_GPT_HELP = (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
-    "candidate_count": 8,
+    "candidate_count": 3,
     "duration_tolerance": 0.15,
     "gemma_llama_cpp_ctx_size": 16384,
     "gemma_llama_cpp_n_predict": 2048,
@@ -59,7 +59,7 @@ FULL_REAL_QUALITY_PRESET = {
     "gemma_text_server_startup_timeout_sec": 900.0,
     "gsv_timeout_sec": 240.0,
     "gsv_retries": 3,
-    "gsv_concurrency": 1,
+    "gsv_concurrency": 3,
     "gsv_few_shot_target_sec": 180.0,
     "gsv_few_shot_min_clip_sec": 2.0,
     "gsv_few_shot_max_clip_sec": 8.0,

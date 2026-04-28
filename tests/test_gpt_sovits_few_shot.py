@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ import yaml
 from conftest import write_tiny_wav
 
 from asmr_dub_pipeline.config import save_project_config
+from asmr_dub_pipeline.gpt_sovits import few_shot
 from asmr_dub_pipeline.gpt_sovits.client import build_tts_request
 from asmr_dub_pipeline.gpt_sovits.few_shot import (
     build_training_dataset,
@@ -171,6 +174,7 @@ def test_few_shot_training_runs_commands_and_reuses_matching_weights(tmp_project
     )
     manifest = _manifest_with_segments(tmp_project_dir, [1.0, 1.2])
     commands: list[list[str]] = []
+    progress_events: list[tuple[str, str, int, int, str | None]] = []
 
     def runner(command, **kwargs):
         commands.append(list(command))
@@ -185,9 +189,19 @@ def test_few_shot_training_runs_commands_and_reuses_matching_weights(tmp_project
             weights.write_bytes(b"gpt-trained")
         return subprocess.CompletedProcess(command, 0)
 
-    first = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner)
-    second = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner)
-    forced = train_few_shot(tmp_project_dir, manifest, cfg, force=True, runner=runner)
+    def record_progress(event) -> None:
+        progress_events.append((event.phase, event.status, event.index, event.total, event.detail))
+
+    first = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner, progress_callback=record_progress)
+    second = train_few_shot(tmp_project_dir, manifest, cfg, runner=runner, progress_callback=record_progress)
+    forced = train_few_shot(
+        tmp_project_dir,
+        manifest,
+        cfg,
+        force=True,
+        runner=runner,
+        progress_callback=record_progress,
+    )
 
     assert first.status == "completed"
     assert second.status == "skipped"
@@ -200,6 +214,38 @@ def test_few_shot_training_runs_commands_and_reuses_matching_weights(tmp_project
         "s2_train_v3_lora.py",
     ]
     assert sum(any("s1_train.py" in part for part in command) for command in commands) == 2
+    assert ("dataset", "completed", 0, 5, "selected=2 duration=2.20s") in progress_events
+    assert any(event[:4] == ("fine-tune-sovits", "started", 4, 5) for event in progress_events)
+    assert any(event[:4] == ("fine-tune-gpt", "completed", 5, 5) for event in progress_events)
+    assert any(event[:2] == ("reuse", "skipped") for event in progress_events)
+
+
+def test_run_logged_streams_training_output(tmp_path: Path) -> None:
+    log_path = tmp_path / "train.log"
+    events = []
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('epoch 1\\r'); sys.stdout.flush(); "
+        "sys.stdout.write('saving final\\n'); sys.stdout.flush()",
+    ]
+
+    few_shot._run_logged(
+        subprocess.run,
+        command,
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        log_path=log_path,
+        phase="fine-tune-gpt",
+        index=1,
+        total=1,
+        progress_callback=events.append,
+    )
+
+    output_events = [event.detail for event in events if event.status == "output"]
+    assert "epoch 1" in output_events
+    assert "saving final" in output_events
+    assert "saving final" in log_path.read_text("utf-8")
 
 
 def test_few_shot_fingerprint_changes_when_training_audio_changes(tmp_project_dir: Path) -> None:

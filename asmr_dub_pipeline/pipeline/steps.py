@@ -59,6 +59,7 @@ from asmr_dub_pipeline.gpt_sovits.few_shot import (
     FEW_SHOT_ARTIFACT_GPT,
     FEW_SHOT_ARTIFACT_SOVITS,
     FEW_SHOT_STAGE,
+    FewShotTrainingProgress,
     train_few_shot,
 )
 from asmr_dub_pipeline.gpt_sovits.refs import load_refs, resolve_ref, resolve_refs_json_path
@@ -1689,6 +1690,37 @@ def gsv_few_shot_step(
     cfg = manifest.project_config
     training_cfg = cfg.model_copy(update={"gsv_url": gsv_url or cfg.gsv_url})
     _log_stage_start(FEW_SHOT_STAGE, f"target={cfg.gsv_few_shot_target_sec:g}s")
+    started_at = monotonic()
+
+    def log_training_progress(event: FewShotTrainingProgress) -> None:
+        elapsed = _format_elapsed(monotonic() - started_at)
+        if event.status == "output":
+            detail = escape(_log_text_snippet(event.detail, max_chars=220))
+            label = "fine-tune log" if event.phase.startswith("fine-tune") else "prep log"
+            console.print(
+                f"[dim]{FEW_SHOT_STAGE} {label} - phase={event.phase} "
+                f"elapsed={elapsed} {detail}[/dim]"
+            )
+            return
+        if event.phase == "dataset":
+            console.print(
+                f"[dim]{FEW_SHOT_STAGE}: dataset ready - elapsed={elapsed} "
+                f"{escape(event.detail or '')} log={escape(str(event.log_path or ''))}[/dim]"
+            )
+            return
+        if event.phase == "reuse":
+            console.print(
+                f"[dim]{FEW_SHOT_STAGE}: reused cached weights - elapsed={elapsed} "
+                f"log={escape(str(event.log_path or ''))}[/dim]"
+            )
+            return
+        percent = (event.index / event.total * 100.0) if event.total else 100.0
+        console.print(
+            f"[dim]{FEW_SHOT_STAGE}: {event.index}/{event.total} ({percent:.1f}%) "
+            f"elapsed={elapsed} phase={event.phase} status={event.status} "
+            f"log={escape(str(event.log_path or ''))}[/dim]"
+        )
+
     manifest.rights_audit = require_existing_or_confirmed_rights(
         manifest.rights_audit,
         confirm_rights,
@@ -1702,6 +1734,7 @@ def gsv_few_shot_step(
         training_cfg,
         force=force,
         command=gsv_server_command if gsv_server_command is not None else cfg.gsv_server_command,
+        progress_callback=log_training_progress,
     )
     manifest.artifacts[FEW_SHOT_ARTIFACT_GPT] = str(result.gpt_weights_path)
     manifest.artifacts[FEW_SHOT_ARTIFACT_SOVITS] = str(result.sovits_weights_path)

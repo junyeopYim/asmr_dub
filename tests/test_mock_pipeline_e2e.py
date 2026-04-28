@@ -112,12 +112,12 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert result.exit_code == 0, result.output
     cfg = load_project_config(project)
     assert cfg.target_language == "ko"
-    assert cfg.candidate_count == 8
+    assert cfg.candidate_count == 3
     assert cfg.duration_tolerance == 0.15
     assert cfg.gsv_few_shot_target_sec == 180.0
     assert cfg.gsv_few_shot_min_clip_sec == 2.0
     assert cfg.gsv_few_shot_max_clip_sec == 8.0
-    assert cfg.gsv_concurrency == 1
+    assert cfg.gsv_concurrency == 3
     assert cfg.gemma_llama_cpp_ctx_size == 16384
     assert cfg.gemma_text_batch_size == 1
     assert cfg.gemma_text_concurrency == 4
