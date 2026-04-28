@@ -310,9 +310,11 @@ def test_synth_loads_few_shot_weights_from_manifest(
     assert prompt_texts and prompt_texts[0]
 
 
-def test_synth_keeps_base_gpt_for_korean_few_shot_voice(
+@pytest.mark.parametrize("use_trained_gpt", [False, True])
+def test_synth_gpt_selection_for_korean_few_shot_voice(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    use_trained_gpt: bool,
 ) -> None:
     init_project(tmp_project_dir)
     cfg = ProjectConfig(project_name="test")
@@ -404,9 +406,11 @@ def test_synth_keeps_base_gpt_for_korean_few_shot_voice(
         refs_path=tmp_project_dir / "refs" / "refs.json",
         mock=False,
         confirm_rights=True,
+        use_trained_gpt=use_trained_gpt,
     )
 
-    assert calls[:2] == [("gpt", str(base_gpt)), ("sovits", str(sovits))]
+    expected_gpt = gpt if use_trained_gpt else base_gpt
+    assert calls[:2] == [("gpt", str(expected_gpt)), ("sovits", str(sovits))]
     assert payloads[0]["text"] == "안녕하세요"
     assert payloads[0]["text_lang"] == "all_ko"
     assert payloads[0]["prompt_lang"] == "all_ja"

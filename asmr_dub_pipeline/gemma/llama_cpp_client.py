@@ -24,7 +24,7 @@ DEFAULT_LLAMA_CPP_DIR = (
     / "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive"
 )
 DEFAULT_LLAMA_CPP_MODEL = (
-    DEFAULT_LLAMA_CPP_DIR / "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+    DEFAULT_LLAMA_CPP_DIR / "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
 )
 DEFAULT_LLAMA_CPP_MMPROJ = (
     DEFAULT_LLAMA_CPP_DIR / "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf"

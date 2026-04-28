@@ -118,7 +118,10 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gsv_few_shot_min_clip_sec == 2.0
     assert cfg.gsv_few_shot_max_clip_sec == 8.0
     assert cfg.gsv_concurrency == 1
-    assert cfg.gemma_text_concurrency == 1
+    assert cfg.gemma_llama_cpp_ctx_size == 16384
+    assert cfg.gemma_text_batch_size == 1
+    assert cfg.gemma_text_concurrency == 4
+    assert cfg.gemma_text_n_predict == 8192
     assert cfg.mix_allow_korean_timing_draft is False
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
@@ -126,6 +129,42 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert kwargs["gemma_backend"] == "llama_cpp"
     assert kwargs["few_shot"] is True
     assert kwargs["gsv_few_shot_force"] is True
+
+
+def test_full_real_use_trained_gpt_flag_passes_to_pipeline(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "full_real_trained_gpt"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--real",
+            "--use-trained-gpt",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["use_trained_gpt"] is True
 
 
 def test_mix_requires_completed_qc(tiny_wav_path: Path, tmp_project_dir: Path) -> None:

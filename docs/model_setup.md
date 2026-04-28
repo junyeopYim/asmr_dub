@@ -30,11 +30,11 @@ The `http` backend is a project-specific JSON endpoint at `/gemma`. It is not a 
 
 The `llama_cpp` backend invokes `llama-mtmd-cli` locally for each Gemma task and
 expects a GGUF model plus the matching multimodal projector. The default paths
-target the repo-local HauhauCS Gemma 4 E4B Q4 cache:
+target the repo-local HauhauCS Gemma 4 E4B Q8 cache:
 
 ```yaml
 gemma_llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli
-gemma_llama_cpp_model_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf
+gemma_llama_cpp_model_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf
 gemma_llama_cpp_mmproj_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf
 ```
 

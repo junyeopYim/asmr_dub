@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 
 import httpx
+import numpy as np
 import pytest
 
 from asmr_dub_pipeline import orchestrator
 from asmr_dub_pipeline.asr.base import ASRChunk, map_chunks_to_segments
+from asmr_dub_pipeline.audio.features import duration_sec, write_audio
 from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.gemma.text_translate import (
@@ -149,9 +151,9 @@ def test_source_script_and_korean_translation_schema_round_trip() -> None:
     assert restored.translation_ko.ko_natural == "조금 더 가까이 갈게요."
 
 
-def test_project_config_defaults_translate_ko_batch_size_to_40() -> None:
-    assert ProjectConfig().gemma_text_batch_size == 40
-    assert ProjectConfig().gemma_text_concurrency == 2
+def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None:
+    assert ProjectConfig().gemma_text_batch_size == 1
+    assert ProjectConfig().gemma_text_concurrency == 4
     assert ProjectConfig().gsv_concurrency == 3
     assert ProjectConfig().source_language == "ja"
     assert ProjectConfig().target_language == "ko"
@@ -159,11 +161,116 @@ def test_project_config_defaults_translate_ko_batch_size_to_40() -> None:
     assert ProjectConfig().asr_resegment_from_chunks is True
     assert ProjectConfig().asr_resegment_min_sec == pytest.approx(0.8)
     assert ProjectConfig().gsv_trim_edge_silence is True
+    assert ProjectConfig().gsv_ref_min_sec == pytest.approx(3.0)
+    assert ProjectConfig().gsv_ref_max_sec == pytest.approx(10.0)
+
+
+def test_source_voice_ref_selection_extends_short_candidate_to_duration_window(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(project_name=tmp_project_dir.name),
+        segments=[
+            Segment(
+                id="seg_short",
+                start=0.0,
+                end=1.0,
+                duration=1.0,
+                audio_for_gemma="work/segments/audio/seg_short_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_short_mix.wav",
+                source_script=SourceScript(
+                    text="短すぎます。",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=1.0,
+                ),
+            ),
+            Segment(
+                id="seg_valid",
+                start=1.0,
+                end=5.0,
+                duration=4.0,
+                audio_for_gemma="work/segments/audio/seg_valid_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_valid_mix.wav",
+                source_script=SourceScript(
+                    text="参照音声に使える長さです。",
+                    language="ja",
+                    backend="mock",
+                    start=1.0,
+                    end=5.0,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(tmp_project_dir, manifest, manifest.project_config)
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [
+        ["seg_short", "seg_valid"]
+    ]
+    assert selected[0].duration == pytest.approx(5.0)
+
+
+def test_prepare_source_voice_refs_writes_combined_short_reference_span(
+    tmp_project_dir: Path,
+) -> None:
+    save_project_config(ProjectConfig(project_name=tmp_project_dir.name), tmp_project_dir / "pipeline.yaml")
+    sample_rate = 48_000
+    segments = []
+    for segment_id, start, end, text, frequency in [
+        ("seg_short", 0.0, 1.0, "短いです。", 440.0),
+        ("seg_next", 1.0, 3.2, "続きです。", 660.0),
+    ]:
+        t = np.arange(int(sample_rate * (end - start)), dtype=np.float32) / sample_rate
+        tone = 0.1 * np.sin(2 * np.pi * frequency * t)
+        audio = np.stack([tone, tone * 0.8], axis=1)
+        mix_path = tmp_project_dir / "work" / "segments" / "audio" / f"{segment_id}_mix.wav"
+        gemma_path = tmp_project_dir / "work" / "segments" / "audio" / f"{segment_id}_gemma.wav"
+        write_audio(mix_path, audio, sample_rate)
+        write_audio(gemma_path, audio[:, :1], sample_rate)
+        segments.append(
+            Segment(
+                id=segment_id,
+                start=start,
+                end=end,
+                duration=end - start,
+                audio_for_gemma=str(gemma_path),
+                audio_for_mix=str(mix_path),
+                source_script=SourceScript(
+                    text=text,
+                    language="ja",
+                    backend="mock",
+                    start=start,
+                    end=end,
+                ),
+            )
+        )
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            project_config=ProjectConfig(project_name=tmp_project_dir.name),
+            segments=segments,
+        ),
+    )
+
+    manifest = prepare_source_voice_refs_step(tmp_project_dir, confirm_rights=True)
+
+    refs = json.loads((tmp_project_dir / "refs" / "refs.json").read_text("utf-8"))
+    ref_path = tmp_project_dir / refs["whisper_close"]["ref_audio_path"]
+    assert duration_sec(ref_path) == pytest.approx(3.2)
+    assert refs["whisper_close"]["prompt_text"] == "短いです。 続きです。"
+    ref_qc = json.loads(Path(manifest.artifacts["source_voice_ref_qc"]).read_text("utf-8"))
+    assert ref_qc["refs"][0]["selected_segment_ids"] == ["seg_short", "seg_next"]
 
 
 def _force_single_translation_lane(project_dir: Path) -> None:
     save_project_config(
-        ProjectConfig(project_name=project_dir.name, gemma_text_concurrency=1),
+        ProjectConfig(
+            project_name=project_dir.name,
+            gemma_text_batch_size=40,
+            gemma_text_concurrency=1,
+        ),
         project_dir / "pipeline.yaml",
     )
 
@@ -284,6 +391,22 @@ def test_translation_parser_accepts_label_confidence_and_string_notes() -> None:
     assert parsed["seg_0001"].notes == ["tone preserved"]
     assert parsed["seg_0002"].confidence == pytest.approx(0.87)
     assert parsed["seg_0002"].notes == []
+
+
+def test_translation_parser_accepts_minimal_model_output() -> None:
+    parsed = parse_translation_response(
+        json.dumps([{"segment_id": "seg_0001", "ko_natural": "안녕하세요."}]),
+        batch_id="batch_0001",
+        model="gemma4",
+    )
+
+    translation = parsed["seg_0001"]
+    assert translation.ko_natural == "안녕하세요."
+    assert translation.ko_literal == "안녕하세요."
+    assert translation.notes == []
+    assert translation.confidence is None
+    assert translation.model == "gemma4"
+    assert translation.batch_id == "batch_0001"
 
 
 def test_llama_server_translation_client_repairs_low_quality_translation() -> None:
@@ -407,6 +530,10 @@ def test_transcribe_and_translate_mock_steps_write_artifacts(
     transcribe_step(tmp_project_dir, asr_backend="mock")
     translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
     korean_script_step(tmp_project_dir, confirm_rights=True)
+    save_project_config(
+        ProjectConfig(project_name=tmp_project_dir.name, gsv_ref_min_sec=0.1),
+        tmp_project_dir / "pipeline.yaml",
+    )
     prepare_source_voice_refs_step(tmp_project_dir)
 
     manifest = load_manifest(tmp_project_dir)
@@ -667,6 +794,51 @@ def test_translate_ko_falls_back_to_single_segments_when_batch_fails(
     assert {tuple(ids) for _, ids in calls[1:]} == {("seg_0001",), ("seg_0002",)}
 
 
+def test_translate_ko_fails_fast_when_llama_server_connection_is_refused(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    _force_single_translation_lane(tmp_project_dir)
+    state = {"stopped": False}
+
+    class FakeServer:
+        started = True
+        reused_existing = False
+        log_path = None
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            state["stopped"] = True
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            raise RuntimeError("Gemma text translation failed: [Errno 111] Connection refused")
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="Connection refused"):
+        translate_ko_step(tmp_project_dir, gemma_text_backend="llama_server")
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].translation_ko is None
+    assert state["stopped"] is True
+    assert not (tmp_project_dir / "work" / "translate_ko" / "translation_bundles.jsonl").exists()
+
+
 def test_translate_ko_splits_failed_batches_before_single_retries(
     monkeypatch,
     tiny_wav_path: Path,
@@ -747,7 +919,7 @@ def test_translate_ko_splits_failed_batches_before_single_retries(
     assert [len(ids) for _, ids in calls[1:]] == [2, 2]
 
 
-def test_translate_ko_uses_two_llama_server_lanes_by_segment_id(
+def test_translate_ko_uses_single_llama_server_slot_workers(
     monkeypatch,
     tiny_wav_path: Path,
     tmp_project_dir: Path,
@@ -755,6 +927,14 @@ def test_translate_ko_uses_two_llama_server_lanes_by_segment_id(
     extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
     segment_step(tmp_project_dir)
     transcribe_step(tmp_project_dir, asr_backend="mock")
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_batch_size=1,
+            gemma_text_concurrency=2,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
     manifest = load_manifest(tmp_project_dir)
     base = manifest.segments[0]
     for index in range(2, 5):
@@ -824,10 +1004,19 @@ def test_translate_ko_uses_two_llama_server_lanes_by_segment_id(
 
     translate_ko_step(tmp_project_dir, gemma_text_backend="llama_server")
 
-    assert server_base_urls == ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]
-    by_url = {base_url: ids for _, base_url, ids in calls}
-    assert by_url["http://127.0.0.1:8080"] == ["seg_0001", "seg_0003"]
-    assert by_url["http://127.0.0.1:8081"] == ["seg_0002", "seg_0004"]
+    assert server_base_urls == ["http://127.0.0.1:8080"]
+    assert {base_url for _, base_url, _ in calls} == {"http://127.0.0.1:8080"}
+    calls_by_batch = {batch_id: ids for batch_id, _, ids in calls}
+    assert calls_by_batch == {
+        "batch_0001": ["seg_0001"],
+        "batch_0002": ["seg_0002"],
+        "batch_0003": ["seg_0003"],
+        "batch_0004": ["seg_0004"],
+    }
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["translate-ko"]["concurrency"] == 2
+    assert manifest.stage_state["translate-ko"]["server"]["server_count"] == 1
+    assert manifest.stage_state["translate-ko"]["server"]["mode"] == "single_server_slots"
 
 
 def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_path: Path) -> None:

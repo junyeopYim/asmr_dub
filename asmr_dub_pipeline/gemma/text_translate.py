@@ -137,9 +137,10 @@ def parse_translation_response(
         segment_id = str(item.get("segment_id") or "").strip()
         if not segment_id:
             raise GemmaTextTranslationError("Translation item missing segment_id.")
+        natural = str(item.get("ko_natural") or "")
         parsed[segment_id] = KoreanTranslation(
-            ko_literal=str(item.get("ko_literal") or ""),
-            ko_natural=str(item.get("ko_natural") or ""),
+            ko_literal=str(item.get("ko_literal") or natural),
+            ko_natural=natural,
             notes=_coerce_notes(item.get("notes")),
             confidence=_coerce_confidence(item.get("confidence")),
             model=str(item.get("model") or model),
@@ -210,15 +211,13 @@ def _translation_quality_error_map(
 def build_translate_ko_prompt(segments: Sequence[Segment], batch_id: str) -> str:
     payload = _translation_prompt_payload(segments, batch_id)
     return (
-        "Return exactly one valid JSON array and no markdown. Translate Japanese ASMR "
-        "source text into Korean. Keep tone gentle and natural. Each array item must "
-        "contain segment_id, ko_literal, ko_natural, notes, confidence, model, and batch_id. "
-        "confidence must be a JSON number from 0.0 to 1.0, not a label like High. "
-        "Use empty notes when no note is needed. ko_natural must be Korean Hangul prose; "
-        "do not leave Japanese kana or untranslated Japanese particles in ko_natural. "
-        "Do not include explanations, reasoning, analysis, or any text outside the JSON array. "
-        "For pure counts or non-speech tokens, preserving digits is allowed. Translate the full "
-        "source text without summarizing or dropping clauses.\n"
+        "Return exactly one valid JSON array and no markdown. Translate Japanese ASMR source "
+        "text into Korean. Keep tone gentle and natural. Each array item must contain only "
+        "segment_id and ko_natural. ko_natural must be Korean Hangul prose; do not leave "
+        "Japanese kana or untranslated Japanese particles in ko_natural. Do not include "
+        "explanations, reasoning, analysis, notes, confidence, model, batch_id, or any text "
+        "outside the JSON array. For pure counts or non-speech tokens, preserving digits is "
+        "allowed. Translate the full source text without summarizing or dropping clauses.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -237,10 +236,9 @@ def build_repair_prompt(
         )
     return (
         "Repair the previous response into exactly one valid JSON array. Each item must contain "
-        "segment_id, ko_literal, ko_natural, notes, confidence, model, and batch_id. "
-        "confidence must be a JSON number from 0.0 to 1.0, not a label like High. "
-        "ko_natural must be Korean Hangul prose with no Japanese kana unless the source is only "
-        "numbers or non-speech tokens. Translate the full source text without summarizing. "
+        "only segment_id and ko_natural. ko_natural must be Korean Hangul prose with no Japanese "
+        "kana unless the source is only numbers or non-speech tokens. Translate the full source "
+        "text without summarizing. "
         f"Batch id: {batch_id}. Validation error: {error}{input_text}\nPrevious response:\n"
         f"{bad_response[:6000]}"
     )

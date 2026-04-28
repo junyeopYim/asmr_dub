@@ -40,18 +40,23 @@ RIGHTS_HELP = (
     "Confirm you own or have permission/consent for the source content, voice "
     "references, and distribution."
 )
+TRAINED_GPT_HELP = (
+    "Use the few-shot trained GPT .ckpt during synthesis instead of the auto "
+    "base-GPT fallback; explicit --gpt-weights still wins."
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
     "candidate_count": 8,
     "duration_tolerance": 0.15,
-    "gemma_llama_cpp_ctx_size": 8192,
+    "gemma_llama_cpp_ctx_size": 16384,
     "gemma_llama_cpp_n_predict": 2048,
-    "gemma_text_batch_size": 24,
-    "gemma_text_concurrency": 1,
-    "gemma_text_n_predict": 4096,
+    "gemma_text_batch_size": 1,
+    "gemma_text_concurrency": 4,
+    "gemma_text_n_predict": 8192,
     "gemma_text_retries": 2,
-    "gemma_text_timeout_sec": 300.0,
+    "gemma_text_timeout_sec": 900.0,
+    "gemma_text_server_startup_timeout_sec": 900.0,
     "gsv_timeout_sec": 240.0,
     "gsv_retries": 3,
     "gsv_concurrency": 1,
@@ -286,6 +291,7 @@ def synth(
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
     gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
     sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
     auto_gsv_server: bool = typer.Option(
         False,
         "--auto-gsv-server/--no-auto-gsv-server",
@@ -307,6 +313,7 @@ def synth(
             confirm_rights=confirm_rights,
             gpt_weights_path=gpt_weights,
             sovits_weights_path=sovits_weights,
+            use_trained_gpt=use_trained_gpt,
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
         )
@@ -402,6 +409,7 @@ def run(
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
     gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
     sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
     auto_gsv_server: bool = typer.Option(
         False,
         "--auto-gsv-server/--no-auto-gsv-server",
@@ -442,6 +450,7 @@ def run(
             sovits_weights_path=sovits_weights,
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
+            use_trained_gpt=use_trained_gpt if not mock else False,
             few_shot=few_shot if not mock else False,
             gsv_few_shot_force=gsv_few_shot_force,
         )
@@ -475,6 +484,7 @@ def full(
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
     gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
     sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
     auto_gsv_server: bool = typer.Option(
         True,
         "--auto-gsv-server/--no-auto-gsv-server",
@@ -523,6 +533,7 @@ def full(
             sovits_weights_path=sovits_weights,
             auto_gsv_server=auto_gsv_server if real else False,
             gsv_server_command=gsv_server_command,
+            use_trained_gpt=use_trained_gpt if real else False,
             few_shot=few_shot if real else False,
             gsv_few_shot_force=gsv_few_shot_force,
         )

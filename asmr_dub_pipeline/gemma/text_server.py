@@ -99,6 +99,7 @@ def default_llama_server_command(
         "off",
         "--reasoning-budget",
         "0",
+        "--no-warmup",
         "-c",
         str(ctx_size),
         "-ngl",

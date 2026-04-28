@@ -37,6 +37,7 @@ def run_pipeline(
     gsv_server_command: str | list[str] | None = None,
     few_shot: bool | None = None,
     gsv_few_shot_force: bool | None = None,
+    use_trained_gpt: bool = False,
     target_language: str | None = None,
 ) -> PipelineManifest:
     if mock:
@@ -57,7 +58,8 @@ def run_pipeline(
         transcribe_step(project_dir)
         translate_ko_step(project_dir, "mock" if mock else "llama_server")
         korean_script_step(project_dir)
-        prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
+        if not mock:
+            prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
     else:
         if use_few_shot:
             transcribe_step(project_dir)
@@ -83,6 +85,7 @@ def run_pipeline(
         sovits_weights_path=sovits_weights_path,
         auto_gsv_server=auto_gsv_server,
         gsv_server_command=gsv_server_command,
+        use_trained_gpt=use_trained_gpt,
     )
     qc_step(project_dir, "mock" if use_korean_text_lane else gemma_backend)
     mix_step(project_dir, confirm_rights)

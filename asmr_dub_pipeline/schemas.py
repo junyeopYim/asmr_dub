@@ -68,7 +68,7 @@ class ProjectConfig(StrictBaseModel):
     )
     gemma_llama_cpp_model_path: str = (
         ".cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/"
-        "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf"
+        "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
     )
     gemma_llama_cpp_mmproj_path: str = (
         ".cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/"
@@ -94,8 +94,8 @@ class ProjectConfig(StrictBaseModel):
     gemma_text_server_url: str = "http://127.0.0.1:8080"
     gemma_text_server_auto_start: bool = True
     gemma_text_server_command: list[str] = Field(default_factory=list)
-    gemma_text_batch_size: int = Field(default=40, ge=1, le=200)
-    gemma_text_concurrency: int = Field(default=2, ge=1, le=8)
+    gemma_text_batch_size: int = Field(default=1, ge=1, le=200)
+    gemma_text_concurrency: int = Field(default=4, ge=1, le=8)
     gemma_text_n_predict: int = Field(default=2048, ge=64)
     gemma_text_timeout_sec: float = Field(default=180.0, gt=0)
     gemma_text_retries: int = Field(default=1, ge=0, le=5)
@@ -122,6 +122,8 @@ class ProjectConfig(StrictBaseModel):
     gsv_few_shot_min_clip_sec: float = Field(default=1.0, gt=0)
     gsv_few_shot_max_clip_sec: float = Field(default=10.0, gt=0)
     gsv_few_shot_min_quality_score: float = Field(default=0.20, ge=0.0, le=1.0)
+    gsv_ref_min_sec: float = Field(default=3.0, gt=0)
+    gsv_ref_max_sec: float = Field(default=10.0, gt=0)
     gsv_ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
     gsv_ko_text_min_hangul_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     gsv_few_shot_force: bool = False
@@ -153,6 +155,12 @@ class ProjectConfig(StrictBaseModel):
         if normalized in {"kr", "kor", "korean"}:
             return "ko"
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_duration_contracts(self) -> ProjectConfig:
+        if self.gsv_ref_max_sec <= self.gsv_ref_min_sec:
+            raise ValueError("gsv_ref_max_sec must be greater than gsv_ref_min_sec")
+        return self
 
 
 class RightsAudit(StrictBaseModel):

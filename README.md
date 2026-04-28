@@ -53,16 +53,16 @@ asmr-dub full ./audio/RJ01012948.mp4 --confirm-rights
 
 Use `--real --gemma-backend hf` only after installing the optional HF dependencies.
 Use `--real --gemma-backend llama_cpp` to run the repo-local GGUF HauhauCS Gemma
-4 E4B Q4 cache through `llama-mtmd-cli`. Real GPT-SoVITS synthesis needs
+4 E4B Q8 cache through `llama-mtmd-cli`. Real GPT-SoVITS synthesis needs
 project-local voice references you have rights/consent to use; `full --real`
 now defaults to GPT-SoVITS few-shot training from source segments before
 synthesis and can auto-start repo-local GPT-SoVITS installs such as
 `.cache/third_party/GPT-SoVITS/api_v2.py`. Use `--zero-shot` to skip training
 and use the reference-audio-only inference path.
-The real llama.cpp Korean lane defaults to two `llama-server` instances on
-incrementing ports, and real GPT-SoVITS synthesis defaults to three `api_v2`
-instances on incrementing ports. Tune `gemma_text_concurrency` and
-`gsv_concurrency` in `pipeline.yaml` to match available GPU memory. Real
+The real llama.cpp Korean lane defaults to one `llama-server` and sends
+concurrent text requests to its slots, while real GPT-SoVITS synthesis defaults
+to three `api_v2` instances on incrementing ports. Tune `gemma_text_concurrency`
+and `gsv_concurrency` in `pipeline.yaml` to match available GPU memory. Real
 faster-whisper transcription also defaults to rebuilding TTS segments from ASR
 chunks (`asr_resegment_from_chunks: true`) so long ASR sentences are not copied
 onto many tiny energy segments.
@@ -136,8 +136,9 @@ The HF Gemma backend is lazy and defaults to `local_files_only=True` to avoid hi
 `transcribe` creates segment-level source scripts from `work/audio/gemma_mono_16k.wav`
 using local ASR. `translate-ko` then sends only text to Gemma4 through
 `llama-server`; it never uses the unsupported `llama-mtmd-cli --audio` path.
-By default it starts two text model lanes and assigns odd/even segment IDs to
-separate ports such as `8080` and `8081`.
+By default it starts one text model server and uses `gemma_text_concurrency`
+slot workers against the same endpoint instead of duplicating the model across
+ports.
 For real GPT-SoVITS Korean output, the client sends pure-language api_v2 codes
 (`all_ko` text with `all_ja` reference prompts), preserves the Japanese
 reference prompt text, and trims generated edge silence by default

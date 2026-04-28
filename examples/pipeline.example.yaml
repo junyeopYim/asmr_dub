@@ -14,7 +14,7 @@ gemma_llama_cpp_ctx_size: 4096
 gemma_llama_cpp_extra_args: []
 gemma_llama_cpp_gpu_layers: 999
 gemma_llama_cpp_mmproj_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf
-gemma_llama_cpp_model_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf
+gemma_llama_cpp_model_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf
 gemma_llama_cpp_n_predict: 1024
 gemma_llama_cpp_seed: 12345
 gemma_llama_cpp_temperature: 0.0

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from time import monotonic
@@ -16,7 +17,12 @@ from rich.markup import escape
 from asmr_dub_pipeline.asr import ASRChunk, create_asr_backend, map_chunks_to_segments
 from asmr_dub_pipeline.audio import ffmpeg
 from asmr_dub_pipeline.audio.duration import duration_ratio, suggest_speed_factor
-from asmr_dub_pipeline.audio.features import duration_sec, trim_edge_silence, write_audio
+from asmr_dub_pipeline.audio.features import (
+    duration_sec,
+    load_audio,
+    trim_edge_silence,
+    write_audio,
+)
 from asmr_dub_pipeline.audio.mixing import (
     build_dialogue_stem,
     build_source_suppressed_background,
@@ -95,10 +101,22 @@ from asmr_dub_pipeline.script.normalizer import normalize_korean_tts_text, norma
 from asmr_dub_pipeline.script.text_qc import preflight_tts_text
 
 SKIP_STATUSES = {"needs_manual_review", "failed"}
+GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
+    "Connection refused",
+    "Connection reset",
+    "Server disconnected",
+    "All connection attempts failed",
+)
 KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES = {"duration_ratio_out_of_range", "too_much_silence"}
 PROGRESS_LOG_SECONDS = 30.0
 JAPANESE_TTS_LANGUAGES = {"ja", "jp", "jpn", "japanese"}
 KOREAN_TTS_LANGUAGES = {"ko", "kr", "kor", "korean"}
+
+
+@dataclass(frozen=True)
+class _VoiceRefSpan:
+    segments: tuple[Segment, ...]
+    duration: float
 
 
 def _canonical_language(value: str | None) -> str:
@@ -401,6 +419,11 @@ def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> Path:
     )
     tmp.replace(path)
     return path
+
+
+def _is_gemma_text_server_unavailable(exc: Exception) -> bool:
+    message = str(exc)
+    return any(marker in message for marker in GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS)
 
 
 def _log_stage_start(stage: str, detail: str | None = None) -> None:
@@ -1050,22 +1073,17 @@ def translate_ko_step(
                 }
             )
 
-    translation_lane_count = (
+    translation_worker_count = (
         _effective_lane_count(cfg.gemma_text_concurrency, len(translatable))
         if backend_kind == "llama_server" and translatable
         else 1
     )
-    translation_base_urls = (
-        _parallel_base_urls(cfg.gemma_text_server_url, translation_lane_count)
-        if backend_kind == "llama_server"
-        else [cfg.gemma_text_server_url]
-    )
-    translation_locks = [Lock() for _ in range(translation_lane_count)]
+    translation_base_urls = [cfg.gemma_text_server_url.rstrip("/")]
 
-    def create_translation_client(lane_index: int = 0) -> Any:
+    def create_translation_client(_worker_index: int = 0) -> Any:
         if backend_kind == "llama_server":
             return LlamaServerTranslationClient(
-                translation_base_urls[lane_index],
+                translation_base_urls[0],
                 timeout_sec=cfg.gemma_text_timeout_sec,
                 retries=cfg.gemma_text_retries,
                 n_predict=cfg.gemma_text_n_predict,
@@ -1081,11 +1099,7 @@ def translate_ko_step(
                 if cfg.gemma_text_server_auto_start
                 else []
             )
-            log_name = (
-                "llama_server.log"
-                if translation_lane_count == 1
-                else f"llama_server_lane_{lane_index + 1:02d}.log"
-            )
+            log_name = "llama_server.log"
             server_managers.append(
                 ManagedGemmaTextServer(
                     enabled=cfg.gemma_text_server_auto_start,
@@ -1112,7 +1126,7 @@ def translate_ko_step(
                 "segments": total,
                 "translated": translated,
                 "needs_manual_review": needs_manual_review,
-                "concurrency": translation_lane_count,
+                "concurrency": translation_worker_count,
                 "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
                 "partial": True,
             },
@@ -1124,61 +1138,62 @@ def translate_ko_step(
     def translate_batch_with_retries(
         batch: list[Segment],
         batch_id: str,
-        lane_index: int,
+        worker_index: int,
     ) -> tuple[list[Segment], str, dict[str, Any], dict[str, list[str]]]:
-        with translation_locks[lane_index]:
-            client = create_translation_client(lane_index)
-            translation_failures: dict[str, list[str]] = {}
-            translations: dict[str, Any] = {}
+        client = create_translation_client(worker_index)
+        translation_failures: dict[str, list[str]] = {}
+        translations: dict[str, Any] = {}
 
-            def record_failure(segment: Segment, message: str) -> None:
-                translation_failures.setdefault(segment.id, []).append(message)
+        def record_failure(segment: Segment, message: str) -> None:
+            translation_failures.setdefault(segment.id, []).append(message)
 
-            def retry_single(missing_segment: Segment, retry_batch_id: str) -> None:
-                try:
-                    translations.update(client.translate_batch([missing_segment], retry_batch_id))
-                except Exception as exc:
-                    message = f"Korean translation retry failed for {retry_batch_id}: {exc}"
-                    record_failure(missing_segment, message)
-                    return
-                if missing_segment.id not in translations:
-                    record_failure(
-                        missing_segment,
-                        f"Korean translation retry failed for {retry_batch_id}: missing model response",
-                    )
+        def retry_single(missing_segment: Segment, retry_batch_id: str) -> None:
+            try:
+                translations.update(client.translate_batch([missing_segment], retry_batch_id))
+            except Exception as exc:
+                message = f"Korean translation retry failed for {retry_batch_id}: {exc}"
+                record_failure(missing_segment, message)
+                return
+            if missing_segment.id not in translations:
+                record_failure(
+                    missing_segment,
+                    f"Korean translation retry failed for {retry_batch_id}: missing model response",
+                )
 
-            def translate_group(group: list[Segment], group_batch_id: str) -> None:
-                if not group:
-                    return
-                try:
-                    group_translations = client.translate_batch(group, group_batch_id)
-                except Exception as exc:
-                    message = f"Korean translation batch failed for {group_batch_id}: {exc}"
-                    if len(group) == 1:
-                        record_failure(group[0], message)
-                        return
-                    for segment in group:
-                        record_failure(segment, message)
-                    midpoint = max(1, len(group) // 2)
-                    translate_group(group[:midpoint], f"{group_batch_id}_split_01")
-                    translate_group(group[midpoint:], f"{group_batch_id}_split_02")
-                    return
-                translations.update(group_translations)
-                missing_after_group = [segment for segment in group if segment.id not in translations]
-                if not missing_after_group:
-                    return
+        def translate_group(group: list[Segment], group_batch_id: str) -> None:
+            if not group:
+                return
+            try:
+                group_translations = client.translate_batch(group, group_batch_id)
+            except Exception as exc:
+                if backend_kind == "llama_server" and _is_gemma_text_server_unavailable(exc):
+                    raise
+                message = f"Korean translation batch failed for {group_batch_id}: {exc}"
                 if len(group) == 1:
-                    retry_single(group[0], f"{group_batch_id}_single_01")
+                    record_failure(group[0], message)
                     return
-                if len(missing_after_group) == 1:
-                    retry_single(missing_after_group[0], f"{group_batch_id}_single_01")
-                    return
-                midpoint = max(1, len(missing_after_group) // 2)
-                translate_group(missing_after_group[:midpoint], f"{group_batch_id}_missing_01")
-                translate_group(missing_after_group[midpoint:], f"{group_batch_id}_missing_02")
+                for segment in group:
+                    record_failure(segment, message)
+                midpoint = max(1, len(group) // 2)
+                translate_group(group[:midpoint], f"{group_batch_id}_split_01")
+                translate_group(group[midpoint:], f"{group_batch_id}_split_02")
+                return
+            translations.update(group_translations)
+            missing_after_group = [segment for segment in group if segment.id not in translations]
+            if not missing_after_group:
+                return
+            if len(group) == 1:
+                retry_single(group[0], f"{group_batch_id}_single_01")
+                return
+            if len(missing_after_group) == 1:
+                retry_single(missing_after_group[0], f"{group_batch_id}_single_01")
+                return
+            midpoint = max(1, len(missing_after_group) // 2)
+            translate_group(missing_after_group[:midpoint], f"{group_batch_id}_missing_01")
+            translate_group(missing_after_group[midpoint:], f"{group_batch_id}_missing_02")
 
-            translate_group(batch, batch_id)
-            return batch, batch_id, translations, translation_failures
+        translate_group(batch, batch_id)
+        return batch, batch_id, translations, translation_failures
 
     def apply_batch_result(
         batch: list[Segment],
@@ -1254,37 +1269,24 @@ def translate_ko_step(
         batch_jobs = []
         effective_batch_size = cfg.gemma_text_batch_size
         if backend_kind == "llama_server":
-            effective_batch_size = min(effective_batch_size, 10)
-        segment_positions = {id(segment): index for index, segment in enumerate(manifest.segments)}
-        lane_segments: list[list[Segment]] = [[] for _ in range(translation_lane_count)]
-        for segment in translatable:
-            fallback_index = segment_positions.get(id(segment), len(lane_segments[0]))
-            lane_index = _segment_lane_index(segment, fallback_index, translation_lane_count)
-            lane_segments[lane_index].append(segment)
-        raw_jobs: list[tuple[int, int, list[Segment]]] = []
-        for lane_index, segments_for_lane in enumerate(lane_segments):
-            for batch_start in range(0, len(segments_for_lane), effective_batch_size):
-                batch = segments_for_lane[batch_start : batch_start + effective_batch_size]
-                first_position = min(segment_positions[id(segment)] for segment in batch)
-                raw_jobs.append((first_position, lane_index, batch))
-        for job_index, (_, lane_index, batch) in enumerate(sorted(raw_jobs, key=lambda item: item[0])):
-            if translation_lane_count == 1:
-                batch_id = f"batch_{job_index + 1:04d}"
-            else:
-                batch_id = f"batch_{job_index + 1:04d}_lane_{lane_index + 1:02d}"
-            batch_jobs.append((job_index, batch, batch_id, lane_index))
-        if translation_lane_count > 1 and len(batch_jobs) > 1:
+            effective_batch_size = min(effective_batch_size, 64)
+        for job_index, batch_start in enumerate(range(0, len(translatable), effective_batch_size)):
+            batch = translatable[batch_start : batch_start + effective_batch_size]
+            batch_id = f"batch_{job_index + 1:04d}"
+            worker_index = job_index % translation_worker_count
+            batch_jobs.append((job_index, batch, batch_id, worker_index))
+        if translation_worker_count > 1 and len(batch_jobs) > 1:
             pending: dict[int, tuple[list[Segment], str, dict[str, Any], dict[str, list[str]]]] = {}
             next_to_apply = 0
-            with ThreadPoolExecutor(max_workers=translation_lane_count) as executor:
+            with ThreadPoolExecutor(max_workers=translation_worker_count) as executor:
                 futures = {
                     executor.submit(
                         translate_batch_with_retries,
                         batch,
                         batch_id,
-                        lane_index,
+                        worker_index,
                     ): job_index
-                    for job_index, batch, batch_id, lane_index in batch_jobs
+                    for job_index, batch, batch_id, worker_index in batch_jobs
                 }
                 for future in as_completed(futures):
                     job_index = futures[future]
@@ -1294,8 +1296,8 @@ def translate_ko_step(
                         persist_partial()
                         next_to_apply += 1
         else:
-            for _, batch, batch_id, lane_index in batch_jobs:
-                apply_batch_result(*translate_batch_with_retries(batch, batch_id, lane_index))
+            for _, batch, batch_id, worker_index in batch_jobs:
+                apply_batch_result(*translate_batch_with_retries(batch, batch_id, worker_index))
                 persist_partial()
     finally:
         for server_manager in reversed(server_managers):
@@ -1308,7 +1310,7 @@ def translate_ko_step(
         "segments": total,
         "translated": translated,
         "needs_manual_review": needs_manual_review,
-        "concurrency": translation_lane_count,
+        "concurrency": translation_worker_count,
         "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
     }
     write_json_atomic(summary_path, summary)
@@ -1327,7 +1329,9 @@ def translate_ko_step(
         ]
         server_metadata = {
             "auto_start": cfg.gemma_text_server_auto_start,
-            "concurrency": translation_lane_count,
+            "concurrency": translation_worker_count,
+            "server_count": len(server_managers),
+            "mode": "single_server_slots",
             "base_urls": translation_base_urls,
             "instances": instances,
         }
@@ -1345,7 +1349,7 @@ def translate_ko_step(
         model=model_name,
         translated=translated,
         needs_manual_review=needs_manual_review,
-        concurrency=translation_lane_count,
+        concurrency=translation_worker_count,
         server=server_metadata,
     )
     save_manifest(project_dir, manifest)
@@ -1438,8 +1442,8 @@ def korean_script_step(project_dir: Path, confirm_rights: bool = False) -> Pipel
 
 
 def _select_voice_ref_segment(manifest: PipelineManifest) -> Segment | None:
-    selected = _select_voice_ref_segments(Path("."), manifest, manifest.project_config, max_refs=1)
-    return selected[0] if selected else None
+    selected = _select_voice_ref_spans(Path("."), manifest, manifest.project_config, max_refs=1)
+    return selected[0].segments[0] if selected else None
 
 
 def _select_voice_ref_segments(
@@ -1448,16 +1452,30 @@ def _select_voice_ref_segments(
     cfg: Any,
     max_refs: int = 5,
 ) -> list[Segment]:
+    return [
+        span.segments[0]
+        for span in _select_voice_ref_spans(project_dir, manifest, cfg, max_refs=max_refs)
+    ]
+
+
+def _select_voice_ref_spans(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: Any,
+    max_refs: int = 5,
+) -> list[_VoiceRefSpan]:
     source_language = _canonical_language(getattr(cfg, "source_language", "ja"))
-    scored: list[tuple[tuple[float, ...], Segment, AudioQualityMetrics | None]] = []
-    for segment in manifest.segments:
-        if (
-            not segment.source_script
-            or not segment.source_script.text.strip()
-            or not segment.audio_for_mix
-            or segment.duration <= 0
-            or _canonical_language(segment.source_script.language) != source_language
-        ):
+    ref_min_sec = float(getattr(cfg, "gsv_ref_min_sec", 3.0))
+    ref_max_sec = float(getattr(cfg, "gsv_ref_max_sec", 10.0))
+    candidates = [
+        segment
+        for segment in sorted(manifest.segments, key=lambda item: (item.start, item.end, item.id))
+        if _segment_can_seed_voice_ref(segment, source_language)
+    ]
+    scored: list[tuple[tuple[float, ...], _VoiceRefSpan, AudioQualityMetrics | None]] = []
+    for index, segment in enumerate(candidates):
+        span = _build_voice_ref_span(candidates, index, ref_min_sec, ref_max_sec)
+        if span is None:
             continue
         metrics = None
         try:
@@ -1465,30 +1483,94 @@ def _select_voice_ref_segments(
             metrics = measure_source_voice_quality(source_audio)
         except Exception:
             pass
-        scored.append((_voice_ref_segment_score(segment, metrics), segment, metrics))
+        scored.append((_voice_ref_span_score(span, metrics), span, metrics))
     selected = [
-        (score, segment, metrics)
-        for score, segment, metrics in sorted(scored, key=lambda item: item[0], reverse=True)
+        (score, span, metrics)
+        for score, span, metrics in sorted(scored, key=lambda item: item[0], reverse=True)
         if metrics is None or metrics.score >= getattr(cfg, "gsv_ref_min_quality_score", 0.25)
     ]
     if not selected:
         selected = sorted(scored, key=lambda item: item[0], reverse=True)
-    return [segment for _, segment, _ in selected[:max_refs]]
+    spans: list[_VoiceRefSpan] = []
+    used_segment_ids: set[str] = set()
+    for _, span, _ in selected:
+        if any(segment.id in used_segment_ids for segment in span.segments):
+            continue
+        spans.append(span)
+        used_segment_ids.update(segment.id for segment in span.segments)
+        if len(spans) >= max_refs:
+            break
+    return spans
 
 
-def _voice_ref_segment_score(
-    segment: Segment,
+def _segment_can_seed_voice_ref(segment: Segment, source_language: str) -> bool:
+    return bool(
+        segment.source_script
+        and segment.source_script.text.strip()
+        and segment.audio_for_mix
+        and segment.duration > 0
+        and _canonical_language(segment.source_script.language) == source_language
+    )
+
+
+def _build_voice_ref_span(
+    candidates: list[Segment],
+    start_index: int,
+    min_sec: float,
+    max_sec: float,
+) -> _VoiceRefSpan | None:
+    segments: list[Segment] = []
+    duration = 0.0
+    for segment in candidates[start_index:]:
+        next_duration = duration + segment.duration
+        if next_duration > max_sec:
+            return None if duration < min_sec else _VoiceRefSpan(tuple(segments), duration)
+        segments.append(segment)
+        duration = next_duration
+        if duration >= min_sec:
+            return _VoiceRefSpan(tuple(segments), duration)
+    return None
+
+
+def _voice_ref_span_score(
+    span: _VoiceRefSpan,
     metrics: AudioQualityMetrics | None = None,
-) -> tuple[float, float, float, float, float]:
-    text_len = len(segment.source_script.text.strip()) if segment.source_script else 0
+) -> tuple[float, float, float, float]:
+    first = span.segments[0]
+    text_len = sum(len(segment.source_script.text.strip()) for segment in span.segments if segment.source_script)
     quality = metrics.score if metrics is not None else 0.5
     return (
         quality,
-        3.0 <= segment.duration <= 10.0,
-        min(segment.duration, 10.0),
+        span.duration,
         min(text_len / 80.0, 1.0),
-        -segment.start,
+        -first.start,
     )
+
+
+def _voice_ref_span_prompt_text(span: _VoiceRefSpan) -> str:
+    return " ".join(
+        segment.source_script.text.strip()
+        for segment in span.segments
+        if segment.source_script and segment.source_script.text.strip()
+    )
+
+
+def _write_voice_ref_span(project_dir: Path, span: _VoiceRefSpan, output_path: Path) -> None:
+    clips: list[np.ndarray] = []
+    sample_rate: int | None = None
+    channels: int | None = None
+    for segment in span.segments:
+        source = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+        data, clip_sample_rate = load_audio(source)
+        if sample_rate is None:
+            sample_rate = clip_sample_rate
+            channels = data.shape[1]
+        elif clip_sample_rate != sample_rate or data.shape[1] != channels:
+            raise ValueError("Cannot concatenate voice refs with different audio formats.")
+        clips.append(data)
+    if not clips or sample_rate is None:
+        raise ValueError("Cannot write an empty voice reference span.")
+    write_audio(output_path, np.concatenate(clips, axis=0), sample_rate)
 
 
 def prepare_source_voice_refs_step(
@@ -1507,18 +1589,22 @@ def prepare_source_voice_refs_step(
         metadata={"source_derived_voice_refs": True},
     )
     cfg = manifest.project_config
-    selected_refs = _select_voice_ref_segments(project_dir, manifest, cfg)
-    selected = selected_refs[0] if selected_refs else None
-    if selected is None or selected.source_script is None:
-        raise ValueError("Cannot prepare source voice refs without a transcribed segment.")
+    selected_spans = _select_voice_ref_spans(project_dir, manifest, cfg)
+    selected_span = selected_spans[0] if selected_spans else None
+    if selected_span is None or not selected_span.segments[0].source_script:
+        raise ValueError(
+            "Cannot prepare source voice refs without a transcribed audio span "
+            f"within {cfg.gsv_ref_min_sec:.2f}-{cfg.gsv_ref_max_sec:.2f} seconds."
+        )
+    selected = selected_span.segments[0]
 
     actual_refs_path = resolve_refs_json_path(refs_path or Path("refs/refs.json"), project_dir)
     data = json.loads(actual_refs_path.read_text("utf-8")) if actual_refs_path.exists() else {}
     if not isinstance(data, dict):
         raise ValueError(f"refs JSON must be an object keyed by style name: {actual_refs_path}")
 
-    source_audio = _resolve_project_read_path(project_dir, selected.audio_for_mix, "audio_for_mix")
-    aux_segments = [segment for segment in selected_refs[1:] if segment.audio_for_mix]
+    aux_spans = selected_spans[1:]
+    prompt_text = _voice_ref_span_prompt_text(selected_span)
     prepared: dict[str, str] = {}
     ref_qc_rows: list[dict[str, Any]] = []
     for style in ("whisper_close", "sleepy"):
@@ -1530,20 +1616,19 @@ def prepare_source_voice_refs_step(
         ).resolve()
         resolved_ref_path = ensure_inside_project(project_dir, resolved_ref_path)
         resolved_ref_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_audio, resolved_ref_path)
+        _write_voice_ref_span(project_dir, selected_span, resolved_ref_path)
         selected_metrics = measure_source_voice_quality(resolved_ref_path)
         aux_ref_audio_paths: list[str] = []
-        for aux_index, aux_segment in enumerate(aux_segments, start=1):
+        for aux_index, aux_span in enumerate(aux_spans, start=1):
             aux_raw_path = f"refs/{style}_aux_{aux_index}.wav"
             aux_path = ensure_inside_project(project_dir, (project_dir / aux_raw_path).resolve())
-            aux_source = _resolve_project_read_path(project_dir, aux_segment.audio_for_mix, "audio_for_mix")
             aux_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(aux_source, aux_path)
+            _write_voice_ref_span(project_dir, aux_span, aux_path)
             aux_ref_audio_paths.append(aux_raw_path)
         data[style] = {
             **entry,
             "ref_audio_path": raw_ref_path,
-            "prompt_text": selected.source_script.text,
+            "prompt_text": prompt_text,
             "prompt_lang": selected.source_script.language or cfg.source_language,
             "aux_ref_audio_paths": aux_ref_audio_paths,
             "source_language": cfg.source_language,
@@ -1559,7 +1644,14 @@ def prepare_source_voice_refs_step(
                 "target_language": cfg.target_language,
                 "prompt_lang": selected.source_script.language or cfg.source_language,
                 "metrics": selected_metrics.as_payload(),
-                "selected_aux_segment_ids": [segment.id for segment in aux_segments],
+                "selected_segment_ids": [segment.id for segment in selected_span.segments],
+                "selected_span_start_sec": selected_span.segments[0].start,
+                "selected_span_end_sec": selected_span.segments[-1].end,
+                "selected_span_duration_sec": round(selected_span.duration, 6),
+                "selected_aux_segment_ids": [span.segments[0].id for span in aux_spans],
+                "selected_aux_span_segment_ids": [
+                    [segment.id for segment in span.segments] for span in aux_spans
+                ],
             }
         )
 
@@ -1573,6 +1665,7 @@ def prepare_source_voice_refs_step(
         "prepare-refs",
         "completed",
         segment_id=selected.id,
+        selected_segment_ids=[segment.id for segment in selected_span.segments],
         refs=prepared,
         source_language=cfg.source_language,
         target_language=cfg.target_language,
@@ -1704,10 +1797,14 @@ def synth_step(
     sovits_weights_path: str | None = None,
     auto_gsv_server: bool | None = None,
     gsv_server_command: list[str] | str | None = None,
+    use_trained_gpt: bool = False,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
     cfg = manifest.project_config
+    if use_trained_gpt:
+        cfg = cfg.model_copy(update={"gsv_gpt_weights_policy": "few_shot"})
+        manifest.project_config = cfg
     total = len(manifest.segments)
     synth_backend_name = "mock" if mock else "gpt-sovits"
     _log_stage_start("synth", f"backend={synth_backend_name}, segments={total}")
