@@ -4,7 +4,9 @@ import pytest
 from conftest import sha256
 
 from asmr_dub_pipeline.cli import app
-from asmr_dub_pipeline.pipeline.manifest_io import load_manifest
+from asmr_dub_pipeline.config import save_project_config
+from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
+from asmr_dub_pipeline.pipeline.state import mark_stage
 from asmr_dub_pipeline.pipeline.steps import (
     analyze_step,
     init_project,
@@ -14,6 +16,46 @@ from asmr_dub_pipeline.pipeline.steps import (
     synth_step,
 )
 from asmr_dub_pipeline.rights import RightsError
+from asmr_dub_pipeline.schemas import PipelineManifest, ProjectConfig, Segment, TTSMetadata
+
+
+def _write_valid_rvc_project(tmp_project_dir, tiny_wav_path) -> None:
+    model = tmp_project_dir / "models" / "voice.pth"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_bytes(b"model")
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            rvc_backend="command",
+            rvc_command=["rvc", "{input}", "{output}", "{model}"],
+            rvc_model_path=str(model),
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+    tts = tmp_project_dir / "work" / "tts" / "seg_0001_final.wav"
+    tts.parent.mkdir(parents=True, exist_ok=True)
+    tts.write_bytes(tiny_wav_path.read_bytes())
+    manifest = PipelineManifest(
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0,
+                end=1,
+                duration=1,
+                audio_for_gemma="a.wav",
+                audio_for_mix="b.wav",
+                status="synthesized",
+                tts=TTSMetadata(selected_candidate_path=str(tts)),
+            )
+        ]
+    )
+    mark_stage(manifest, "synth", "completed")
+    index = tmp_project_dir / "models" / "voice.index"
+    index.write_bytes(b"index")
+    manifest.artifacts["rvc_model_path"] = str(model)
+    manifest.artifacts["rvc_index_path"] = str(index)
+    mark_stage(manifest, "train-rvc", "completed", model_path=str(model), index_path=str(index))
+    save_manifest(tmp_project_dir, manifest)
 
 
 def test_run_requires_confirm_rights(cli_runner, tiny_wav_path, tmp_project_dir) -> None:
@@ -74,6 +116,23 @@ def test_real_synth_requires_fresh_confirm_rights(tmp_project_dir, tiny_wav_path
     extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
     with pytest.raises(RightsError, match="GPT-SoVITS"):
         synth_step(tmp_project_dir, None, refs_path=tmp_project_dir / "refs/refs.json", mock=False)
+
+
+def test_rvc_cli_requires_confirm_rights(cli_runner, tiny_wav_path, tmp_project_dir) -> None:
+    _write_valid_rvc_project(tmp_project_dir, tiny_wav_path)
+    result = cli_runner.invoke(app, ["rvc", "--project", str(tmp_project_dir)])
+    assert result.exit_code != 0
+    assert "rights" in result.output.lower() or "permission" in result.output.lower()
+
+
+def test_train_rvc_cli_requires_confirm_rights(cli_runner, tiny_wav_path, tmp_project_dir) -> None:
+    _write_valid_rvc_project(tmp_project_dir, tiny_wav_path)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.stage_state.pop("train-rvc", None)
+    save_manifest(tmp_project_dir, manifest)
+    result = cli_runner.invoke(app, ["train-rvc", "--project", str(tmp_project_dir)])
+    assert result.exit_code != 0
+    assert "rights" in result.output.lower() or "permission" in result.output.lower()
 
 
 def test_manual_segment_path_traversal_rejected(tmp_project_dir) -> None:

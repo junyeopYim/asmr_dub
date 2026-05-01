@@ -43,6 +43,17 @@ TRAINING_IMPORTANT_MARKERS = (
     "traceback",
     "warning",
 )
+GSV_TRAINING_REQUIRED_MODULES = (
+    "transformers",
+    "torch",
+    "librosa",
+    "scipy",
+    "numpy",
+    "pytorch_lightning",
+    "peft",
+    "torchaudio",
+    "tqdm",
+)
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,110 @@ def _find_api_path_from_parts(parts: Sequence[str]) -> Path:
 
 def _find_api_path(command: Sequence[str] | str | None, base_url: str) -> Path:
     return _find_api_path_from_parts(_command_parts_or_default(command, base_url))
+
+
+def _is_python_executable(part: str) -> bool:
+    name = Path(part).name.lower()
+    return name in {"python", "python3", "python.exe"} or (
+        name.startswith("python") and name[6:7].isdigit()
+    )
+
+
+def _command_python(parts: Sequence[str]) -> str | None:
+    if parts and _is_python_executable(parts[0]):
+        return str(parts[0])
+    return None
+
+
+def _dedupe_text(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _candidate_training_pythons(
+    cfg: ProjectConfig,
+    install: GPTSoVITSInstall,
+    command: Sequence[str] | str | None,
+) -> list[str]:
+    parts = _command_parts_or_default(command or cfg.gsv_server_command, cfg.gsv_url)
+    candidates: list[str] = []
+    if os.environ.get("ASMR_DUB_GSV_PYTHON"):
+        candidates.append(os.environ["ASMR_DUB_GSV_PYTHON"])
+    command_python = _command_python(parts)
+    if command_python:
+        candidates.append(command_python)
+    for candidate in (
+        install.root / ".venv" / "bin" / "python",
+        install.root / "venv" / "bin" / "python",
+        install.root / "runtime" / "bin" / "python",
+    ):
+        if candidate.exists():
+            candidates.append(str(candidate))
+    base_prefix = Path(getattr(sys, "base_prefix", "") or "")
+    if base_prefix:
+        candidates.append(str(base_prefix / "bin" / "python"))
+    for name in ("python", "python3"):
+        resolved = shutil.which(name)
+        if resolved:
+            candidates.append(resolved)
+    candidates.append(sys.executable or "python")
+    return _dedupe_text(candidates)
+
+
+def _python_missing_imports(python: str, modules: Sequence[str]) -> list[str] | None:
+    code = (
+        "import importlib.util, sys; "
+        f"mods={list(modules)!r}; "
+        "missing=[m for m in mods if importlib.util.find_spec(m) is None]; "
+        "print('\\n'.join(missing)); "
+        "raise SystemExit(1 if missing else 0)"
+    )
+    try:
+        result = subprocess.run(
+            [python, "-s", "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode == 0:
+        return []
+    missing = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return missing or list(modules)
+
+
+def _select_training_python(
+    cfg: ProjectConfig,
+    install: GPTSoVITSInstall,
+    command: Sequence[str] | str | None,
+    *,
+    require_modules: bool,
+) -> str:
+    candidates = _candidate_training_pythons(cfg, install, command)
+    if not require_modules:
+        return candidates[0] if candidates else sys.executable or "python"
+    failures: list[str] = []
+    for candidate in candidates:
+        missing = _python_missing_imports(candidate, GSV_TRAINING_REQUIRED_MODULES)
+        if missing == []:
+            return candidate
+        if missing is None:
+            failures.append(f"{candidate}: could not execute")
+        else:
+            failures.append(f"{candidate}: missing {', '.join(missing[:8])}")
+    detail = "; ".join(failures)
+    raise GPTSoVITSError(
+        "Could not find a Python environment with GPT-SoVITS training dependencies. "
+        "Install the GPT-SoVITS requirements in the selected environment or set "
+        f"ASMR_DUB_GSV_PYTHON=/path/to/python. Checked: {detail}"
+    )
 
 
 def _resolve_command_path(root: Path, raw_path: str) -> Path | None:
@@ -843,7 +958,12 @@ def train_few_shot(
     )
     semantic_env = dict(env)
     semantic_env["s2config_path"] = str(semantic_s2_config_path)
-    py = sys.executable or "python"
+    py = _select_training_python(
+        cfg,
+        install,
+        command,
+        require_modules=runner is subprocess.run,
+    )
     prep_commands: list[tuple[str, list[str], dict[str, str]]] = [
         ("prepare-text", [py, "-s", "GPT_SoVITS/prepare_datasets/1-get-text.py"], env),
         ("prepare-hubert", [py, "-s", "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py"], env),

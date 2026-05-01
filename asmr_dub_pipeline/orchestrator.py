@@ -5,21 +5,27 @@ from pathlib import Path
 from .config import load_project_config, save_project_config
 from .pipeline.steps import (
     analyze_step,
+    assign_speakers_step,
     export_step,
     extract_step,
     gsv_few_shot_step,
+    import_voice_bank_source_separation_cache_step,
     init_project,
     korean_script_step,
     mix_step,
     prepare_source_voice_refs_step,
     qc_step,
+    rvc_step,
+    rvc_train_step,
     script_step,
     segment_step,
+    skip_rvc_train_for_voice_bank_step,
     source_separation_step,
     synth_step,
     transcribe_step,
     translate_ko_step,
 )
+from .rvc import validate_rvc_config, validate_rvc_training_config
 from .schemas import PipelineManifest
 
 
@@ -39,6 +45,9 @@ def run_pipeline(
     gsv_few_shot_force: bool | None = None,
     use_trained_gpt: bool = False,
     target_language: str | None = None,
+    voice_bank_path: Path | None = None,
+    require_voice_bank: bool = False,
+    source_separation_cache_project: Path | None = None,
 ) -> PipelineManifest:
     if mock:
         gemma_backend = "mock"
@@ -49,16 +58,38 @@ def run_pipeline(
     if target_language is not None:
         cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "target_language": target_language})
         save_project_config(cfg, project_dir / "pipeline.yaml")
+    if mock and cfg.rvc_backend != "mock":
+        cfg = type(cfg).model_validate(
+            {**cfg.model_dump(mode="json"), "rvc_backend": "mock", "rvc_train_backend": "mock"}
+        )
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    use_voice_bank = require_voice_bank or voice_bank_path is not None
+    if not mock and not use_voice_bank:
+        validate_rvc_training_config(project_dir, cfg, real=True)
+        validate_rvc_config(project_dir, cfg, real=True, allow_trained_artifact=True)
     use_korean_text_lane = cfg.target_language == "ko"
-    use_few_shot = False if mock else cfg.gsv_few_shot_enabled if few_shot is None else few_shot
+    use_few_shot = False if mock or use_voice_bank else cfg.gsv_few_shot_enabled if few_shot is None else few_shot
     extract_step(input_path, project_dir, confirm_rights)
+    if source_separation_cache_project is not None:
+        import_voice_bank_source_separation_cache_step(
+            project_dir,
+            input_path,
+            source_separation_cache_project,
+        )
     source_separation_step(project_dir, confirm_rights)
     segment_step(project_dir)
+    if use_voice_bank:
+        assign_speakers_step(
+            project_dir,
+            voice_bank_path=voice_bank_path,
+            backend_kind=None,
+            require_all=True,
+        )
     if use_korean_text_lane:
         transcribe_step(project_dir)
         translate_ko_step(project_dir, "mock" if mock else "llama_server")
         korean_script_step(project_dir)
-        if not mock:
+        if not mock and not use_voice_bank:
             prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
     else:
         if use_few_shot:
@@ -87,6 +118,11 @@ def run_pipeline(
         gsv_server_command=gsv_server_command,
         use_trained_gpt=use_trained_gpt,
     )
+    if use_voice_bank:
+        skip_rvc_train_for_voice_bank_step(project_dir)
+    else:
+        rvc_train_step(project_dir, confirm_rights=confirm_rights, mock=mock)
+    rvc_step(project_dir, confirm_rights=confirm_rights, mock=mock)
     qc_step(project_dir, "mock" if use_korean_text_lane else gemma_backend)
     mix_step(project_dir, confirm_rights)
     return export_step(input_path, project_dir, confirm_rights)

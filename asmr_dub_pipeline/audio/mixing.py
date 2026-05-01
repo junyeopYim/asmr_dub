@@ -528,7 +528,9 @@ def build_dialogue_stem(
             if progress_callback:
                 progress_callback(index, total, segment)
             continue
-        selected = segment.tts.selected_candidate_path if segment.tts else None
+        selected = segment.rvc.output_path if segment.rvc and segment.rvc.output_path else None
+        if selected is None:
+            selected = segment.tts.selected_candidate_path if segment.tts else None
         if not selected:
             if progress_callback:
                 progress_callback(index, total, segment)

@@ -24,6 +24,7 @@ dependencies = [
 asr = ["faster-whisper", "ctranslate2"]
 hf = ["transformers>=4.56", "torch", "accelerate"]
 separation = ["demucs"]
+diarization = ["pyannote.audio>=4,<5"]
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]

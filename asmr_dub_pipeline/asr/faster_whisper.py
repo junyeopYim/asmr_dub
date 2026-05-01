@@ -10,10 +10,32 @@ from .base import ASRBackend, ASRChunk, ASRUnavailableError
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _snapshot_from_cache_root(root: Path) -> Path | None:
+    snapshots = root / "snapshots"
+    if not snapshots.exists():
+        return None
+    ref = root / "refs" / "main"
+    if ref.exists():
+        candidate = snapshots / ref.read_text("utf-8").strip()
+        if (candidate / "model.bin").exists():
+            return candidate.resolve()
+    candidates = sorted(
+        (path for path in snapshots.iterdir() if (path / "model.bin").exists()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0].resolve()
+    return None
+
+
 def _ctranslate2_snapshot_for_model(model_id: str) -> Path | None:
     raw = Path(model_id).expanduser()
     if raw.exists():
-        return raw.resolve()
+        resolved = raw.resolve()
+        if (resolved / "model.bin").exists():
+            return resolved
+        return _snapshot_from_cache_root(resolved) or resolved
     if "/" not in model_id:
         return None
     cache_name = "models--" + model_id.replace("/", "--")
@@ -22,21 +44,9 @@ def _ctranslate2_snapshot_for_model(model_id: str) -> Path | None:
         REPO_ROOT / ".cache" / "ctranslate2" / cache_name,
     ]
     for root in roots:
-        snapshots = root / "snapshots"
-        if not snapshots.exists():
-            continue
-        ref = root / "refs" / "main"
-        if ref.exists():
-            candidate = snapshots / ref.read_text("utf-8").strip()
-            if (candidate / "model.bin").exists():
-                return candidate.resolve()
-        candidates = sorted(
-            (path for path in snapshots.iterdir() if (path / "model.bin").exists()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            return candidates[0].resolve()
+        candidate = _snapshot_from_cache_root(root)
+        if candidate is not None:
+            return candidate
     return None
 
 

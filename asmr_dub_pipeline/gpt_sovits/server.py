@@ -3,8 +3,10 @@ from __future__ import annotations
 import importlib.util
 import os
 import shlex
+import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -17,6 +19,7 @@ from .client import GPTSoVITSError
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SHIM_DIR = Path(__file__).resolve().parent / "shims"
+GSV_SERVER_REQUIRED_MODULES = ("transformers", "torch", "librosa", "fastapi", "uvicorn")
 
 
 def _host_port(base_url: str) -> tuple[str, int]:
@@ -43,6 +46,53 @@ def is_tcp_open(base_url: str, timeout_sec: float = 0.3) -> bool:
         return False
 
 
+def _dedupe_text(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _python_has_modules(python: str, modules: Sequence[str]) -> bool:
+    code = (
+        "import importlib.util, sys; "
+        f"mods={list(modules)!r}; "
+        "raise SystemExit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)"
+    )
+    try:
+        completed = subprocess.run(
+            [python, "-s", "-c", code],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def _default_gsv_python() -> str:
+    candidates: list[str] = []
+    if os.environ.get("ASMR_DUB_GSV_PYTHON"):
+        candidates.append(os.environ["ASMR_DUB_GSV_PYTHON"])
+    base_prefix = Path(getattr(sys, "base_prefix", "") or "")
+    if base_prefix:
+        candidates.append(str(base_prefix / "bin" / "python"))
+    for name in ("python", "python3"):
+        resolved = shutil.which(name)
+        if resolved:
+            candidates.append(resolved)
+    candidates.append(sys.executable or "python")
+    for candidate in _dedupe_text(candidates):
+        if _python_has_modules(candidate, GSV_SERVER_REQUIRED_MODULES):
+            return candidate
+    return candidates[0] if candidates else "python"
+
+
 def _default_gsv_command(base_url: str) -> list[str]:
     host, port = _host_port(base_url)
     candidates = [
@@ -56,7 +106,7 @@ def _default_gsv_command(base_url: str) -> list[str]:
     api_path = next((path for path in candidates if path.exists()), None)
     if api_path is None:
         return []
-    command = ["python", str(api_path), "-a", host, "-p", str(port)]
+    command = [_default_gsv_python(), str(api_path), "-a", host, "-p", str(port)]
     _repair_pretrained_model_links(api_path.parent)
     config_path = _local_tts_config(api_path.parent) or api_path.parent / "GPT_SoVITS/configs/tts_infer.yaml"
     if config_path.exists():

@@ -163,6 +163,8 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().gsv_trim_edge_silence is True
     assert ProjectConfig().gsv_ref_min_sec == pytest.approx(3.0)
     assert ProjectConfig().gsv_ref_max_sec == pytest.approx(10.0)
+    assert ProjectConfig().gsv_tts_min_speed_factor == pytest.approx(0.85)
+    assert ProjectConfig().gsv_tts_max_speed_factor == pytest.approx(1.12)
 
 
 def test_source_voice_ref_selection_extends_short_candidate_to_duration_window(
@@ -1041,9 +1043,13 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     monkeypatch.setattr(orchestrator, "prepare_source_voice_refs_step", step("prepare-refs"))
     monkeypatch.setattr(orchestrator, "gsv_few_shot_step", step("gsv-few-shot"))
     monkeypatch.setattr(orchestrator, "synth_step", step("synth"))
+    monkeypatch.setattr(orchestrator, "rvc_train_step", step("train-rvc"))
+    monkeypatch.setattr(orchestrator, "rvc_step", step("rvc"))
     monkeypatch.setattr(orchestrator, "qc_step", step("qc"))
     monkeypatch.setattr(orchestrator, "mix_step", step("mix"))
     monkeypatch.setattr(orchestrator, "export_step", step("export"))
+    monkeypatch.setattr(orchestrator, "validate_rvc_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "validate_rvc_training_config", lambda *args, **kwargs: None)
 
     orchestrator.run_pipeline(
         tmp_path / "input.wav",
@@ -1065,10 +1071,14 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "prepare-refs",
         "gsv-few-shot",
         "synth",
+        "train-rvc",
+        "rvc",
         "qc",
         "mix",
         "export",
     ]
     assert calls[5][1][1] == "llama_server"
     assert calls[9][2]["mock"] is False
-    assert calls[10][1][1] == "mock"
+    assert calls[10][2]["mock"] is False
+    assert calls[11][2]["mock"] is False
+    assert calls[12][1][1] == "mock"

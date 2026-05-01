@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +28,8 @@ from .pipeline.steps import (
     inspect_input,
     mix_step,
     qc_step,
+    rvc_step,
+    rvc_train_step,
     script_step,
     segment_step,
     source_separation_step,
@@ -35,6 +38,8 @@ from .pipeline.steps import (
     translate_ko_step,
 )
 from .rights import RIGHTS_MESSAGE, RightsError, require_confirmed_rights
+from .rvc import validate_rvc_config, validate_rvc_training_config
+from .voice_bank import build_voice_bank
 
 RIGHTS_HELP = (
     "Confirm you own or have permission/consent for the source content, voice "
@@ -45,6 +50,8 @@ TRAINED_GPT_HELP = (
     "base-GPT fallback; explicit --gpt-weights still wins."
 )
 REPO_ROOT = Path(__file__).resolve().parents[1]
+AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".mp4", ".mkv", ".mov"}
+DEFAULT_VOICE_BANK_PROJECT_NAME = "voice_bank_all"
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
     "candidate_count": 3,
@@ -65,9 +72,24 @@ FULL_REAL_QUALITY_PRESET = {
     "gsv_few_shot_max_clip_sec": 8.0,
     "gsv_few_shot_min_quality_score": 0.35,
     "gsv_ref_min_quality_score": 0.40,
+    "gsv_tts_max_speed_factor": 1.08,
     "gsv_gpt_weights_policy": "auto",
     "gsv_sovits_weights_policy": "auto",
     "mix_allow_korean_timing_draft": False,
+    "rvc_required": True,
+    "rvc_backend": "command",
+    "rvc_train_required": True,
+    "rvc_train_backend": "command",
+    "rvc_train_batch_size": 0,
+    "rvc_train_timeout_sec": 43200.0,
+    "rvc_train_preprocess_processes": 0,
+    "rvc_train_f0_workers": 0,
+    "rvc_train_feature_workers": 0,
+    "rvc_train_save_every_epoch": 50,
+    "rvc_train_reuse_intermediate_cache": True,
+    "rvc_concurrency": 1,
+    "rvc_failure_policy": "retry_then_error",
+    "rvc_allow_pre_rvc_fallback": False,
 }
 
 app = typer.Typer(
@@ -94,18 +116,21 @@ def _default_full_project_dir(input_path: Path) -> Path:
     return REPO_ROOT / "runs" / f"{timestamp}_{_safe_run_name(input_path)}"
 
 
+def _default_voice_bank_project_dir() -> Path:
+    return REPO_ROOT / "runs" / DEFAULT_VOICE_BANK_PROJECT_NAME
+
+
 def _configure_local_model_cache() -> list[str]:
     """Point HF libraries at the repo-local cache when the user has not set one."""
     lines: list[str] = []
     hf_cache = REPO_ROOT / ".cache" / "huggingface"
-    if hf_cache.exists():
-        os.environ.setdefault("HF_HOME", str(hf_cache))
-        os.environ.setdefault("TRANSFORMERS_CACHE", str(hf_cache / "transformers"))
-        lines.append(f"HF cache: {hf_cache}")
-        gemma_cache = hf_cache / "hub" / "models--google--gemma-4-E4B-it"
-        lines.append(f"Gemma cache: {'found' if gemma_cache.exists() else 'missing'}")
-    else:
-        lines.append(f"HF cache: missing ({hf_cache})")
+    hf_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_cache))
+    os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(hf_cache / "transformers"))
+    lines.append(f"HF cache: {hf_cache}")
+    gemma_cache = hf_cache / "hub" / "models--google--gemma-4-E4B-it"
+    lines.append(f"Gemma cache: {'found' if gemma_cache.exists() else 'missing'}")
     gsv_cache = REPO_ROOT / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models"
     lines.append(f"GPT-SoVITS local weights: {'found' if gsv_cache.exists() else 'missing'}")
     gsv_api_candidates = [
@@ -118,6 +143,8 @@ def _configure_local_model_cache() -> list[str]:
         "GPT-SoVITS api_v2: "
         f"{'found' if any(path.exists() for path in gsv_api_candidates) else 'missing'}"
     )
+    rvc_assets = REPO_ROOT / ".cache" / "rvc" / "assets"
+    lines.append(f"RVC local assets: {'found' if rvc_assets.exists() else 'missing'}")
     llama_model = REPO_ROOT / DEFAULT_LLAMA_CPP_MODEL
     llama_mmproj = REPO_ROOT / DEFAULT_LLAMA_CPP_MMPROJ
     llama_cli = REPO_ROOT / DEFAULT_LLAMA_CPP_CLI
@@ -127,11 +154,169 @@ def _configure_local_model_cache() -> list[str]:
     return lines
 
 
-def _apply_full_real_quality_preset(project_dir: Path, target_language: str) -> None:
+def _hf_repo_cache_name(model_id: str) -> str:
+    return "models--" + model_id.replace("/", "--")
+
+
+def _cached_hf_snapshot(model_id: str) -> Path | None:
+    snapshot_root = REPO_ROOT / ".cache" / "huggingface" / "hub" / _hf_repo_cache_name(model_id) / "snapshots"
+    if not snapshot_root.exists():
+        return None
+    snapshots = [path for path in snapshot_root.iterdir() if path.is_dir()]
+    if not snapshots:
+        return None
+    with_config = [path for path in snapshots if (path / "config.yaml").exists()]
+    return max(with_config or snapshots, key=lambda path: path.stat().st_mtime_ns).resolve()
+
+
+def _discover_audio_inputs(audio_dir: Path) -> list[Path]:
+    root = audio_dir.expanduser().resolve()
+    if not root.exists():
+        raise ValueError(f"Audio directory does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Audio path is not a directory: {root}")
+    return sorted(
+        path.resolve()
+        for path in root.iterdir()
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+    )
+
+
+def _apply_personal_voice_bank_defaults(project_dir: Path) -> None:
+    init_project(project_dir)
+    cfg = load_project_config(project_dir)
+    payload = cfg.model_dump(mode="json")
+    payload.update(
+        {
+            "speaker_assignment_backend": "pyannote",
+            "diarization_auto_download": True,
+            "diarization_embedding_match_threshold": 0.78,
+        }
+    )
+    for field_name, candidates in {
+        "diarization_model_id": (
+            "pyannote/speaker-diarization-3.1",
+            "pyannote/speaker-diarization-community-1",
+        ),
+        "diarization_embedding_model_id": (
+            "pyannote/wespeaker-voxceleb-resnet34-LM",
+            "pyannote/embedding",
+        ),
+    }.items():
+        for model_id in candidates:
+            snapshot = _cached_hf_snapshot(model_id)
+            if snapshot is not None:
+                payload[field_name] = str(snapshot)
+                break
+    save_project_config(type(cfg).model_validate(payload), project_dir / "pipeline.yaml")
+
+
+def _rvc_python() -> str:
+    env_python = os.environ.get("ASMR_DUB_RVC_PYTHON")
+    if env_python:
+        return env_python
+    for candidate in (
+        REPO_ROOT / ".cache" / "rvc_venv" / "bin" / "python",
+        REPO_ROOT / ".cache" / "rvc" / ".venv" / "bin" / "python",
+        REPO_ROOT / ".cache" / "third_party" / "Retrieval-based-Voice-Conversion-WebUI" / ".venv" / "bin" / "python",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
+def _rvc_experiment_name(source_path: Path) -> str:
+    return f"asmr-{_safe_run_name(source_path).lower()}-speaker-1"
+
+
+def _local_rvc_webui_defaults(project_dir: Path, source_path: Path | None = None) -> dict[str, object]:
+    rvc_root = REPO_ROOT / ".cache" / "third_party" / "Retrieval-based-Voice-Conversion-WebUI"
+    if not rvc_root.exists():
+        return {}
+    source_for_name = source_path or project_dir
+    python = _rvc_python()
+    train_wrapper = REPO_ROOT / "asmr_dub_pipeline" / "rvc" / "webui_train.py"
+    infer_wrapper = REPO_ROOT / "asmr_dub_pipeline" / "rvc" / "webui_infer.py"
+    return {
+        "rvc_train_experiment_name": _rvc_experiment_name(source_for_name),
+        "rvc_train_command": [
+            python,
+            str(train_wrapper),
+            "--rvc-root",
+            str(rvc_root),
+            "--dataset",
+            "{dataset}",
+            "--experiment-name",
+            "{experiment_name}",
+            "--output-model",
+            "{output_model}",
+            "--output-index",
+            "{output_index}",
+            "--sample-rate",
+            "{sample_rate}",
+            "--device",
+            "{device}",
+            "--epochs",
+            "200",
+            "--save-every-epoch",
+            "{save_every_epoch}",
+            "--batch-size",
+            "{batch_size}",
+            "--processes",
+            "{preprocess_processes}",
+            "--f0-workers",
+            "{f0_workers}",
+            "--feature-workers",
+            "{feature_workers}",
+            "--reuse-intermediate-cache",
+            "{reuse_intermediate_cache}",
+        ],
+        "rvc_command": [
+            python,
+            str(infer_wrapper),
+            "--rvc-root",
+            str(rvc_root),
+            "--input",
+            "{input}",
+            "--output",
+            "{output}",
+            "--model",
+            "{model}",
+            "--index",
+            "{index}",
+            "--device",
+            "{device}",
+            "--f0-up-key",
+            "{f0_up_key}",
+            "--f0-method",
+            "{f0_method}",
+            "--index-rate",
+            "{index_rate}",
+            "--filter-radius",
+            "{filter_radius}",
+            "--resample-sr",
+            "{resample_sr}",
+            "--rms-mix-rate",
+            "{rms_mix_rate}",
+            "--protect",
+            "{protect}",
+        ],
+    }
+
+
+def _apply_full_real_quality_preset(
+    project_dir: Path,
+    target_language: str,
+    source_path: Path | None = None,
+) -> None:
     init_project(project_dir)
     cfg = load_project_config(project_dir)
     payload = cfg.model_dump(mode="json")
     payload.update(FULL_REAL_QUALITY_PRESET)
+    for key, value in _local_rvc_webui_defaults(project_dir, source_path).items():
+        if key in {"rvc_train_command", "rvc_command"} and payload.get(key):
+            continue
+        payload[key] = value
     payload["target_language"] = target_language
     save_project_config(type(cfg).model_validate(payload), project_dir / "pipeline.yaml")
 
@@ -324,6 +509,135 @@ def synth(
     console.print("Synthesis complete.")
 
 
+@app.command(name="train-rvc")
+def train_rvc(
+    project: Path = typer.Option(..., "--project", "-p"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    force: bool = typer.Option(False, "--force", help="Re-run RVC training even if artifacts exist."),
+) -> None:
+    """Train the required RVC voice model from source-derived segment audio."""
+    try:
+        manifest = rvc_train_step(project.expanduser().resolve(), confirm_rights=confirm_rights, force=force)
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"RVC training complete: {manifest.artifacts.get('rvc_train_manifest')}")
+
+
+@app.command()
+def rvc(
+    project: Path = typer.Option(..., "--project", "-p"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    force: bool = typer.Option(False, "--force", help="Re-run RVC even if candidate outputs exist."),
+) -> None:
+    """Run mandatory RVC timbre correction on selected TTS outputs."""
+    try:
+        manifest = rvc_step(project.expanduser().resolve(), confirm_rights=confirm_rights, force=force)
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"RVC complete: {manifest.artifacts.get('rvc_manifest')}")
+
+
+@app.command(name="rvc-validate")
+def rvc_validate(project: Path = typer.Option(..., "--project", "-p")) -> None:
+    """Validate the configured RVC command backend without running conversion."""
+    project_dir = project.expanduser().resolve()
+    try:
+        cfg = load_project_config(project_dir)
+        validate_rvc_training_config(project_dir, cfg, real=cfg.rvc_train_backend == "command")
+        validate_rvc_config(
+            project_dir,
+            cfg,
+            real=cfg.rvc_backend == "command",
+            allow_trained_artifact=cfg.rvc_train_required,
+        )
+    except Exception as exc:
+        _handle_error(exc)
+    console.print("RVC configuration is valid.")
+
+
+@app.command(name="voice-bank-build")
+def voice_bank_build(
+    inputs: list[Path] = typer.Argument(..., help="Input media files used to build speaker voice models."),
+    project: Path = typer.Option(..., "--project", "-p"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    mock: bool = typer.Option(False, "--mock", help="Use mock diarization and placeholder voice model artifacts."),
+    diarization_backend: str | None = typer.Option(
+        None,
+        "--diarization-backend",
+        help="pyannote|mock. Defaults to pyannote unless --mock is set.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Rebuild the project voice_bank directory."),
+) -> None:
+    """Build a project-local voice bank before dubbing runs."""
+    try:
+        for line in _configure_local_model_cache():
+            console.print(f"[dim]{line}[/dim]")
+        project_dir = project.expanduser().resolve()
+        _apply_personal_voice_bank_defaults(project_dir)
+        backend = "mock" if mock else diarization_backend or "pyannote"
+        bank = build_voice_bank(
+            [path.expanduser().resolve() for path in inputs],
+            project_dir,
+            confirm_rights=confirm_rights,
+            backend_kind=backend,
+            mock_training=mock,
+            force=force,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Voice bank complete: {len(bank.speakers)} speaker(s).")
+
+
+@app.command(name="voice-bank-build-audio")
+def voice_bank_build_audio(
+    audio_dir: Path = typer.Option(Path("audio"), "--audio-dir", help="Directory of local media files."),
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Project directory. Defaults to runs/voice_bank_all.",
+    ),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    mock: bool = typer.Option(False, "--mock", help="Use mock diarization and placeholder voice model artifacts."),
+    diarization_backend: str | None = typer.Option(
+        None,
+        "--diarization-backend",
+        help="pyannote|mock. Defaults to pyannote unless --mock is set.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Rebuild the project voice_bank directory."),
+) -> None:
+    """Build a voice bank from every supported media file in ./audio."""
+    try:
+        for line in _configure_local_model_cache():
+            console.print(f"[dim]{line}[/dim]")
+        project_dir = project.expanduser().resolve() if project else _default_voice_bank_project_dir()
+        _apply_personal_voice_bank_defaults(project_dir)
+        inputs = _discover_audio_inputs(audio_dir)
+        if not inputs:
+            raise ValueError(f"No supported audio/video files found in {audio_dir}.")
+        backend = "mock" if mock else diarization_backend or "pyannote"
+        console.print(f"[cyan]voice-bank[/cyan] discovered {len(inputs)} file(s) in {audio_dir}")
+        bank = build_voice_bank(
+            inputs,
+            project_dir,
+            confirm_rights=confirm_rights,
+            backend_kind=backend,
+            mock_training=mock,
+            force=force,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Voice bank complete: {len(bank.speakers)} speaker(s). Project: {project_dir}")
+
+
 @app.command(name="train-gsv")
 def train_gsv(
     project: Path = typer.Option(..., "--project", "-p"),
@@ -430,6 +744,16 @@ def run(
         "--force-few-shot",
         help="Re-run GPT-SoVITS few-shot training even when cached weights match.",
     ),
+    voice_bank: Path | None = typer.Option(
+        None,
+        "--voice-bank",
+        help="Voice bank manifest path. Defaults to project voice_bank/voice_bank_manifest.json when required.",
+    ),
+    require_voice_bank: bool = typer.Option(
+        False,
+        "--require-voice-bank",
+        help="Require speaker assignment and per-speaker SoVITS/RVC models before synthesis.",
+    ),
 ) -> None:
     """Run extract, segment, analyze, script, synth, QC, mix, and export."""
     if not confirm_rights:
@@ -453,6 +777,8 @@ def run(
             use_trained_gpt=use_trained_gpt if not mock else False,
             few_shot=few_shot if not mock else False,
             gsv_few_shot_force=gsv_few_shot_force,
+            voice_bank_path=voice_bank,
+            require_voice_bank=require_voice_bank,
         )
     except Exception as exc:
         _handle_error(exc)
@@ -506,6 +832,29 @@ def full(
         help="Re-run GPT-SoVITS few-shot training for maximum quality, or reuse cached weights.",
     ),
     cache_status: bool = typer.Option(True, "--cache-status/--no-cache-status"),
+    source_separation_cache: Path | None = typer.Option(
+        None,
+        "--source-separation-cache",
+        help=(
+            "Voice-bank project to reuse cached source-separated stems from. "
+            "Defaults to runs/voice_bank_all for --real when it exists."
+        ),
+    ),
+    reuse_source_separation_cache: bool = typer.Option(
+        True,
+        "--reuse-source-separation-cache/--no-source-separation-cache",
+        help="Import matching voice-bank source separation stems before running Demucs.",
+    ),
+    voice_bank: Path | None = typer.Option(
+        None,
+        "--voice-bank",
+        help="Voice bank manifest path. Defaults to project voice_bank/voice_bank_manifest.json when required.",
+    ),
+    require_voice_bank: bool = typer.Option(
+        False,
+        "--require-voice-bank",
+        help="Require speaker assignment and per-speaker SoVITS/RVC models before synthesis.",
+    ),
 ) -> None:
     """Run the full end-to-end pipeline with sensible one-command defaults."""
     if not confirm_rights:
@@ -517,8 +866,16 @@ def full(
         for line in cache_lines:
             console.print(f"[dim]{line}[/dim]")
     if real:
-        _apply_full_real_quality_preset(project_dir, target_language)
+        _apply_full_real_quality_preset(project_dir, target_language, input_path)
         console.print("[dim]Applied full --real high-quality preset to pipeline.yaml[/dim]")
+    source_separation_cache_project = None
+    if reuse_source_separation_cache:
+        if source_separation_cache is not None:
+            source_separation_cache_project = source_separation_cache.expanduser().resolve()
+        elif real:
+            default_cache_project = _default_voice_bank_project_dir()
+            if default_cache_project.exists():
+                source_separation_cache_project = default_cache_project.resolve()
     try:
         manifest = run_pipeline(
             input_path,
@@ -536,6 +893,9 @@ def full(
             use_trained_gpt=use_trained_gpt if real else False,
             few_shot=few_shot if real else False,
             gsv_few_shot_force=gsv_few_shot_force,
+            voice_bank_path=voice_bank,
+            require_voice_bank=require_voice_bank,
+            source_separation_cache_project=source_separation_cache_project,
         )
     except Exception as exc:
         _handle_error(exc)

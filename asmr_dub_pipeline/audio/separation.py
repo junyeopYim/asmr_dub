@@ -121,16 +121,6 @@ def separate_source_audio(
 ) -> SourceSeparationResult | None:
     if backend == "none":
         return None
-    selected_backend = "demucs" if backend == "auto" and demucs_available() else backend
-    if selected_backend == "auto":
-        return None
-    if selected_backend == "demucs" and not demucs_available():
-        raise SourceSeparationUnavailable(
-            "Demucs is not installed. Install the optional separation dependency or set "
-            "source_separation_backend: none."
-        )
-    if selected_backend not in {"demucs", "mock"}:
-        raise SourceSeparationUnavailable(f"Unsupported source separation backend: {selected_backend}")
 
     audio_dir = project_dir / "work" / "audio"
     separation_dir = project_dir / "work" / "source_separation"
@@ -142,8 +132,33 @@ def separate_source_audio(
     outputs_exist = vocals_path.exists() and vocals_mono_path.exists() and background_path.exists()
     command: list[str] = []
     reused_existing = outputs_exist and not force
+    selected_backend = backend
+    selected_model = model
+
+    if reused_existing:
+        if metadata_path.exists():
+            try:
+                previous_metadata = json.loads(metadata_path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                previous_metadata = {}
+            if isinstance(previous_metadata, dict):
+                selected_backend = str(previous_metadata.get("backend") or selected_backend)
+                selected_model = str(previous_metadata.get("model") or selected_model)
+        if selected_backend == "auto":
+            selected_backend = "cached"
 
     if not reused_existing:
+        selected_backend = "demucs" if backend == "auto" and demucs_available() else backend
+        if selected_backend == "auto":
+            return None
+        if selected_backend == "demucs" and not demucs_available():
+            raise SourceSeparationUnavailable(
+                "Demucs is not installed. Install the optional separation dependency or set "
+                "source_separation_backend: none."
+            )
+        if selected_backend not in {"demucs", "mock"}:
+            raise SourceSeparationUnavailable(f"Unsupported source separation backend: {selected_backend}")
+
         if selected_backend == "mock":
             _write_mock_stems(
                 input_audio_path,
@@ -174,7 +189,7 @@ def separate_source_audio(
 
     metadata: dict[str, Any] = {
         "backend": selected_backend,
-        "model": model,
+        "model": selected_model,
         "input_audio_path": str(input_audio_path),
         "vocals_path": str(vocals_path),
         "vocals_mono_path": str(vocals_mono_path),
@@ -186,7 +201,7 @@ def separate_source_audio(
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", "utf-8")
     return SourceSeparationResult(
         backend=selected_backend,
-        model=model,
+        model=selected_model,
         vocals_path=vocals_path,
         vocals_mono_path=vocals_mono_path,
         background_path=background_path,

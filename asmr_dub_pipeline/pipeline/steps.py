@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +21,11 @@ from asmr_dub_pipeline.asr import ASRChunk, create_asr_backend, map_chunks_to_se
 from asmr_dub_pipeline.audio import ffmpeg
 from asmr_dub_pipeline.audio.duration import duration_ratio, suggest_speed_factor
 from asmr_dub_pipeline.audio.features import (
+    clipping_ratio,
     duration_sec,
     load_audio,
+    peak_dbfs,
+    rms_dbfs,
     trim_edge_silence,
     write_audio,
 )
@@ -39,7 +45,11 @@ from asmr_dub_pipeline.audio.separation import (
     SourceSeparationUnavailable,
     separate_source_audio,
 )
-from asmr_dub_pipeline.config import create_project_structure, load_project_config
+from asmr_dub_pipeline.config import (
+    create_project_structure,
+    load_project_config,
+    save_project_config,
+)
 from asmr_dub_pipeline.gemma.base import create_gemma_backend
 from asmr_dub_pipeline.gemma.schemas import validate_gemma_task_response
 from asmr_dub_pipeline.gemma.text_server import (
@@ -89,9 +99,23 @@ from asmr_dub_pipeline.rights import (
     require_existing_or_confirmed_rights,
     sha256_file,
 )
+from asmr_dub_pipeline.rvc import (
+    RVCCommandClient,
+    RVCCommandError,
+    RVCMockClient,
+    RVCTrainCommandClient,
+    RVCTrainMockClient,
+    resolve_config_path,
+    rvc_train_output_paths,
+    validate_rvc_config,
+    validate_rvc_training_config,
+)
 from asmr_dub_pipeline.schemas import (
     JapaneseScript,
     PipelineManifest,
+    ProjectConfig,
+    RVCMetadata,
+    RVCProfile,
     Segment,
     SourceScript,
     TTSCandidate,
@@ -100,6 +124,13 @@ from asmr_dub_pipeline.schemas import (
 from asmr_dub_pipeline.script.duration_rewrite import rewrite_for_duration
 from asmr_dub_pipeline.script.normalizer import normalize_korean_tts_text, normalize_script_payload
 from asmr_dub_pipeline.script.text_qc import preflight_tts_text
+from asmr_dub_pipeline.voice_bank import (
+    apply_voice_bank_to_config,
+    assign_speakers_to_manifest,
+    load_voice_bank,
+    resolve_voice_bank_path,
+    validate_voice_bank_models,
+)
 
 SKIP_STATUSES = {"needs_manual_review", "failed"}
 GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
@@ -112,12 +143,23 @@ KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES = {"duration_ratio_out_of_range", "too_much_s
 PROGRESS_LOG_SECONDS = 30.0
 JAPANESE_TTS_LANGUAGES = {"ja", "jp", "jpn", "japanese"}
 KOREAN_TTS_LANGUAGES = {"ko", "kr", "kor", "korean"}
+RVC_REQUIRED_MESSAGE = (
+    "RVC is required but has not completed. Run `asmr-dub rvc --project ... "
+    "--confirm-rights` or use `asmr-dub full --real ...`."
+)
 
 
 @dataclass(frozen=True)
 class _VoiceRefSpan:
     segments: tuple[Segment, ...]
     duration: float
+
+
+@dataclass(frozen=True)
+class _SourceSeparationCacheCandidate:
+    source_dir: Path
+    matched_by: str
+    paths: dict[str, Path]
 
 
 def _canonical_language(value: str | None) -> str:
@@ -294,13 +336,88 @@ def _resolve_gpt_weights_for_tts(
     return None
 
 
+def _gsv_speaker_cfg(cfg: ProjectConfig, segment: Segment):
+    if not segment.speaker_id:
+        return None
+    return cfg.gsv_speaker_models.get(segment.speaker_id)
+
+
+def _resolve_gsv_speaker_path(project_dir: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    return path.resolve() if path.is_absolute() else (project_dir / path).resolve()
+
+
+def _active_segments_requiring_voice_bank(manifest: PipelineManifest) -> list[Segment]:
+    return [segment for segment in manifest.segments if segment.status not in SKIP_STATUSES]
+
+
+def _validate_gsv_speaker_models(project_dir: Path, manifest: PipelineManifest) -> None:
+    cfg = manifest.project_config
+    if not cfg.gsv_speaker_models:
+        return
+    missing: list[str] = []
+    errors: list[str] = []
+    for segment in _active_segments_requiring_voice_bank(manifest):
+        if not segment.speaker_id or segment.speaker_id not in cfg.gsv_speaker_models:
+            missing.append(segment.id)
+            continue
+        speaker_cfg = cfg.gsv_speaker_models[segment.speaker_id]
+        if not speaker_cfg.gpt_weights_path:
+            errors.append(f"{segment.speaker_id} GPT weights missing: <not configured>")
+        for label, raw_path in (
+            ("GPT weights", speaker_cfg.gpt_weights_path),
+            ("SoVITS weights", speaker_cfg.sovits_weights_path),
+            ("refs", speaker_cfg.refs_path),
+        ):
+            if not raw_path:
+                continue
+            path = _resolve_gsv_speaker_path(project_dir, raw_path)
+            if not path.exists():
+                errors.append(f"{segment.speaker_id} {label} missing: {path}")
+    if missing:
+        errors.append("missing speaker model mapping for segments: " + ", ".join(missing[:20]))
+    if errors:
+        raise ValueError("Invalid GPT-SoVITS voice bank speaker models: " + "; ".join(errors))
+
+
+def assign_speakers_step(
+    project_dir: Path,
+    voice_bank_path: Path | None = None,
+    backend_kind: str | None = None,
+    require_all: bool = True,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    bank = load_voice_bank(project_dir, cfg, voice_bank_path)
+    validate_voice_bank_models(project_dir, bank)
+    next_cfg = apply_voice_bank_to_config(project_dir, cfg, bank)
+    save_project_config(next_cfg, project_dir / "pipeline.yaml")
+    manifest.project_config = next_cfg
+    backend = backend_kind or cfg.speaker_assignment_backend
+    if backend == "none":
+        backend = "mock"
+    assign_speakers_to_manifest(
+        project_dir,
+        manifest,
+        bank,
+        backend_kind=backend,
+        require_all=require_all,
+    )
+    manifest.artifacts["voice_bank"] = str(resolve_voice_bank_path(project_dir, next_cfg, voice_bank_path))
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("speaker-assign", manifest, f"backend={backend}")
+    return manifest
+
+
 def _ref_for_tts_language(ref: GPTSoVITSRef, tts_language: str) -> GPTSoVITSRef:
     _ = tts_language
     return ref
 
 
 def _can_rewrite_script_for_duration(script: JapaneseScript) -> bool:
-    return script.tts_language.strip().lower() in JAPANESE_TTS_LANGUAGES
+    normalized = script.tts_language.strip().lower().replace("-", "_")
+    return normalized in JAPANESE_TTS_LANGUAGES or normalized in KOREAN_TTS_LANGUAGES
 
 
 def _valid_asr_chunks(
@@ -441,6 +558,13 @@ def _log_stage_complete(stage: str, manifest: PipelineManifest, detail: str | No
     console.print(" - ".join(parts))
 
 
+def _format_command_preview(command: list[str], max_chars: int = 360) -> str:
+    rendered = shlex.join(str(part) for part in command)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 3] + "..."
+
+
 def _progress_interval(total: int) -> int:
     if total <= 20:
         return 1
@@ -532,6 +656,159 @@ def _validate_audio_contract(path: Path, sample_rate: int, channels: int, descri
             f"{description} must be {channels} channel(s) at {sample_rate} Hz: "
             f"{path} is {info.channels} channel(s) at {info.samplerate} Hz"
         )
+
+
+def _safe_voice_bank_source_suffix(input_path: Path) -> str:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", input_path.stem).strip("._-")
+    return f"_{safe_stem or 'speaker'}"
+
+
+def _same_audio_fingerprint(left: Path, right: Path) -> bool:
+    try:
+        if not left.exists() or not right.exists():
+            return False
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        return sha256_file(left) == sha256_file(right)
+    except OSError:
+        return False
+
+
+def _voice_bank_source_dirs(cache_project_dir: Path, input_path: Path) -> list[tuple[Path, str]]:
+    sources_root = cache_project_dir / "voice_bank" / "sources"
+    if not sources_root.is_dir():
+        return []
+    source_dirs = sorted(path for path in sources_root.iterdir() if path.is_dir())
+    resolved_input = input_path.expanduser().resolve()
+    candidates: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+
+    def add_candidate(source_dir: Path, matched_by: str) -> None:
+        resolved_source_dir = source_dir.resolve()
+        if resolved_source_dir in seen:
+            return
+        seen.add(resolved_source_dir)
+        candidates.append((source_dir, matched_by))
+
+    manifest_path = cache_project_dir / "voice_bank" / "voice_bank_manifest.json"
+    if manifest_path.exists():
+        try:
+            voice_bank_data = json.loads(manifest_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            voice_bank_data = {}
+        source_paths = voice_bank_data.get("source_paths") if isinstance(voice_bank_data, dict) else None
+        if isinstance(source_paths, list):
+            for source_index, raw_source_path in enumerate(source_paths, start=1):
+                if not isinstance(raw_source_path, str):
+                    continue
+                try:
+                    resolved_source_path = Path(raw_source_path).expanduser().resolve()
+                except OSError:
+                    continue
+                if resolved_source_path != resolved_input:
+                    continue
+                source_prefix = f"src_{source_index:04d}_"
+                for source_dir in source_dirs:
+                    if source_dir.name.startswith(source_prefix):
+                        add_candidate(source_dir, "voice_bank_manifest")
+
+    source_suffix = _safe_voice_bank_source_suffix(input_path)
+    for source_dir in source_dirs:
+        if source_dir.name.endswith(source_suffix):
+            add_candidate(source_dir, "source_stem")
+    return candidates
+
+
+def _voice_bank_source_separation_paths(source_dir: Path) -> dict[str, Path] | None:
+    audio_dir = source_dir / "work" / "audio"
+    paths = {
+        "source_vocals_48k": audio_dir / "source_vocals_48k.wav",
+        "source_vocals_mono_16k": audio_dir / "source_vocals_mono_16k.wav",
+        "background_only_48k": audio_dir / "background_only_48k.wav",
+    }
+    return paths if all(path.exists() for path in paths.values()) else None
+
+
+def _voice_bank_source_separation_candidates(
+    cache_project_dir: Path,
+    input_path: Path,
+    original_audio: Path,
+    cfg: ProjectConfig,
+) -> list[_SourceSeparationCacheCandidate]:
+    candidates: list[_SourceSeparationCacheCandidate] = []
+    for source_dir, matched_by in _voice_bank_source_dirs(cache_project_dir, input_path):
+        source_audio = source_dir / "source_stereo_48k.wav"
+        if not _same_audio_fingerprint(original_audio, source_audio):
+            continue
+        paths = _voice_bank_source_separation_paths(source_dir)
+        if paths is None:
+            continue
+        try:
+            _validate_audio_contract(paths["source_vocals_48k"], cfg.mix_sample_rate, 2, "cached source_vocals_48k")
+            _validate_audio_contract(
+                paths["source_vocals_mono_16k"],
+                cfg.gemma_sample_rate,
+                1,
+                "cached source_vocals_mono_16k",
+            )
+            _validate_audio_contract(paths["background_only_48k"], cfg.mix_sample_rate, 2, "cached background_only_48k")
+        except (OSError, RuntimeError, ValueError):
+            continue
+        candidates.append(_SourceSeparationCacheCandidate(source_dir, matched_by, paths))
+    return candidates
+
+
+def import_voice_bank_source_separation_cache_step(
+    project_dir: Path,
+    input_path: Path,
+    cache_project_dir: Path,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    original_audio = Path(
+        manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav")
+    )
+    if not original_audio.exists():
+        return manifest
+    cache_project_dir = cache_project_dir.expanduser().resolve()
+    candidates = _voice_bank_source_separation_candidates(
+        cache_project_dir,
+        input_path.expanduser().resolve(),
+        original_audio,
+        manifest.project_config,
+    )
+    if not candidates:
+        return manifest
+
+    candidate = candidates[0]
+    audio_dir = ensure_inside_project(project_dir, project_dir / "work" / "audio")
+    separation_dir = ensure_inside_project(project_dir, project_dir / "work" / "source_separation")
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    separation_dir.mkdir(parents=True, exist_ok=True)
+    destination_paths = {
+        "source_vocals_48k": audio_dir / "source_vocals_48k.wav",
+        "source_vocals_mono_16k": audio_dir / "source_vocals_mono_16k.wav",
+        "background_only_48k": audio_dir / "background_only_48k.wav",
+    }
+    for key, source_path in candidate.paths.items():
+        destination_path = ensure_inside_project(project_dir, destination_paths[key])
+        if source_path.resolve() != destination_path.resolve():
+            shutil.copy2(source_path, destination_path)
+
+    import_manifest_path = separation_dir / "source_separation_cache_import.json"
+    import_metadata = {
+        "cache_project_dir": str(cache_project_dir),
+        "source_dir": str(candidate.source_dir.resolve()),
+        "input_path": str(input_path.expanduser().resolve()),
+        "matched_by": candidate.matched_by,
+        "source_paths": {key: str(path.resolve()) for key, path in candidate.paths.items()},
+        "destination_paths": {key: str(path.resolve()) for key, path in destination_paths.items()},
+    }
+    write_json_atomic(import_manifest_path, import_metadata)
+    manifest.artifacts["source_separation_cache_import"] = str(import_manifest_path)
+    save_manifest(project_dir, manifest)
+    console.print(f"[cyan]source-separation[/cyan] imported cached voice-bank stems: {candidate.source_dir}")
+    return manifest
 
 
 def _validate_segment_audio_paths(project_dir: Path, segment: Segment, check_formats: bool = False) -> None:
@@ -1847,9 +2124,20 @@ def synth_step(
         )
     if mock:
         _require_audio_stage_rights(manifest, "synth", confirm_rights, metadata={"backend": "mock"})
-    refs = load_refs(refs_path, project_dir=project_dir)
-    actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
-    refs_metadata = _refs_audit_metadata(actual_refs_path, refs)
+    use_speaker_gsv = bool(cfg.gsv_speaker_models)
+    if use_speaker_gsv:
+        _validate_gsv_speaker_models(project_dir, manifest)
+        refs: dict[str, GPTSoVITSRef] = {}
+        refs_metadata: dict[str, object] = {
+            "speaker_refs": {
+                speaker_id: speaker_cfg.refs_path
+                for speaker_id, speaker_cfg in sorted(cfg.gsv_speaker_models.items())
+            }
+        }
+    else:
+        refs = load_refs(refs_path, project_dir=project_dir)
+        actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
+        refs_metadata = _refs_audit_metadata(actual_refs_path, refs)
     if not mock:
         manifest.rights_audit = require_existing_or_confirmed_rights(
             manifest.rights_audit,
@@ -1889,23 +2177,31 @@ def synth_step(
                 GPTSoVITSClient(base_url, cfg.gsv_timeout_sec, cfg.gsv_retries)
                 for base_url in gsv_base_urls
             ]
+        _validate_gsv_speaker_models(project_dir, manifest)
         if clients:
-            gpt_weights = _resolve_gpt_weights_for_tts(
-                project_dir,
-                manifest,
-                cfg,
-                gpt_weights_path,
-                model_switch,
-            )
-            sovits_weights = (
-                sovits_weights_path
-                or cfg.gsv_sovits_weights_path
-                or (
-                    manifest.artifacts.get(FEW_SHOT_ARTIFACT_SOVITS)
-                    if cfg.gsv_sovits_weights_policy != "unchanged"
-                    else None
+            gpt_weights = None
+            sovits_weights = None
+            if use_speaker_gsv:
+                model_switch["gpt_weights_mode"] = "speaker_voice_bank"
+                model_switch["sovits_weights_mode"] = "speaker_voice_bank"
+                model_switch["speaker_models"] = sorted(cfg.gsv_speaker_models)
+            else:
+                gpt_weights = _resolve_gpt_weights_for_tts(
+                    project_dir,
+                    manifest,
+                    cfg,
+                    gpt_weights_path,
+                    model_switch,
                 )
-            )
+                sovits_weights = (
+                    sovits_weights_path
+                    or cfg.gsv_sovits_weights_path
+                    or (
+                        manifest.artifacts.get(FEW_SHOT_ARTIFACT_SOVITS)
+                        if cfg.gsv_sovits_weights_policy != "unchanged"
+                        else None
+                    )
+                )
             if gpt_weights:
                 model_switch["gpt_weights_path"] = gpt_weights
             if sovits_weights:
@@ -1935,6 +2231,10 @@ def synth_step(
         started_at = monotonic()
         last_logged_at = started_at
         lane_locks = [Lock() for _ in range(gsv_lane_count)]
+        lane_gpt_weights: list[str | None] = [None for _ in range(gsv_lane_count)]
+        lane_sovits_weights: list[str | None] = [None for _ in range(gsv_lane_count)]
+        speaker_refs_cache: dict[str, dict[str, GPTSoVITSRef]] = {}
+        speaker_refs_cache_lock = Lock()
 
         def postprocess_tts_candidate(candidate_path: Path, payload: dict[str, Any]) -> None:
             if not cfg.gsv_trim_edge_silence:
@@ -1973,14 +2273,41 @@ def synth_step(
                         "Korean TTS preflight blocked synthesis: " + ", ".join(preflight.issues)
                     )
                     return index, segment
-            requested_ref_style = segment.script.ref_style
-            resolved_ref_style = requested_ref_style if requested_ref_style in refs else "whisper_close"
-            ref = resolve_ref(refs, requested_ref_style)
+            original_ref_style = segment.script.ref_style
+            requested_ref_style = original_ref_style
+            speaker_cfg = _gsv_speaker_cfg(cfg, segment)
+            segment_refs = refs
+            speaker_gpt_weights: str | None = None
+            speaker_sovits_weights: str | None = None
+            speaker_refs_path: Path | None = None
+            if speaker_cfg is not None:
+                if speaker_cfg.gpt_weights_path:
+                    speaker_gpt_weights = str(
+                        _resolve_gsv_speaker_path(project_dir, speaker_cfg.gpt_weights_path)
+                    )
+                speaker_sovits_weights = str(
+                    _resolve_gsv_speaker_path(project_dir, speaker_cfg.sovits_weights_path)
+                )
+                speaker_refs_path = _resolve_gsv_speaker_path(project_dir, speaker_cfg.refs_path)
+                cache_key = str(speaker_refs_path)
+                with speaker_refs_cache_lock:
+                    if cache_key not in speaker_refs_cache:
+                        speaker_refs_cache[cache_key] = load_refs(speaker_refs_path, project_dir)
+                    segment_refs = speaker_refs_cache[cache_key]
+                if requested_ref_style not in segment_refs:
+                    requested_ref_style = speaker_cfg.default_ref_style
+            resolved_ref_style = requested_ref_style if requested_ref_style in segment_refs else "whisper_close"
+            ref = resolve_ref(segment_refs, requested_ref_style)
             synthesis_ref = _ref_for_tts_language(ref, segment.script.tts_language)
-            fallback_used = resolved_ref_style != requested_ref_style
+            fallback_used = resolved_ref_style != original_ref_style
             candidates: list[TTSCandidate] = []
             expected = segment.script.expected_tts_duration_sec or segment.duration
-            speed = suggest_speed_factor(expected, segment.duration)
+            speed = suggest_speed_factor(
+                expected,
+                segment.duration,
+                minimum=cfg.gsv_tts_min_speed_factor,
+                maximum=cfg.gsv_tts_max_speed_factor,
+            )
             has_repetition_or_omission_signal = bool(
                 segment.qc and (segment.qc.repetition_detected or segment.qc.omission_detected)
             )
@@ -2006,12 +2333,16 @@ def synth_step(
                 for attempt in range(3):
                     candidate_path = _tts_candidate_path(project_dir, segment.id, candidate_index, attempt)
                     payload: dict[str, Any] = {
-                        "requested_ref_style": requested_ref_style,
+                        "speaker_id": segment.speaker_id,
+                        "requested_ref_style": original_ref_style,
                         "resolved_ref_style": resolved_ref_style,
                         "fallback_used": fallback_used,
                         "ref_audio_path": ref.ref_audio_path,
                         "aux_ref_audio_paths": ref.aux_ref_audio_paths,
                         "prompt_text_policy": "use_source_reference_prompt",
+                        "speaker_gpt_weights_path": speaker_gpt_weights,
+                        "speaker_sovits_weights_path": speaker_sovits_weights,
+                        "speaker_refs_path": str(speaker_refs_path) if speaker_refs_path else None,
                         "source_language": source_language,
                         "target_language": target_language,
                         "cross_lingual_voice_transfer": source_language != target_language,
@@ -2046,6 +2377,31 @@ def synth_step(
                     else:
                         client = clients[lane_index]
                         try:
+                            speaker_switch: dict[str, Any] = {}
+                            if speaker_gpt_weights and lane_gpt_weights[lane_index] != speaker_gpt_weights:
+                                response = client.set_gpt_weights(speaker_gpt_weights)
+                                lane_gpt_weights[lane_index] = speaker_gpt_weights
+                                speaker_switch.update(
+                                    {
+                                        "lane_index": lane_index,
+                                        "speaker_id": segment.speaker_id,
+                                        "gpt_weights_path": speaker_gpt_weights,
+                                        "gpt_response": response,
+                                    }
+                                )
+                            if speaker_sovits_weights and lane_sovits_weights[lane_index] != speaker_sovits_weights:
+                                response = client.set_sovits_weights(speaker_sovits_weights)
+                                lane_sovits_weights[lane_index] = speaker_sovits_weights
+                                speaker_switch.update(
+                                    {
+                                        "lane_index": lane_index,
+                                        "speaker_id": segment.speaker_id,
+                                        "sovits_weights_path": speaker_sovits_weights,
+                                        "sovits_response": response,
+                                    }
+                                )
+                            if speaker_switch:
+                                model_switch.setdefault("speaker_switches", []).append(speaker_switch)
                             request = client.build_payload(attempt_text, synthesis_ref, options)
                             payload.update(request.as_payload())
                             client.synthesize_to_file(request, candidate_path)
@@ -2114,9 +2470,19 @@ def synth_step(
                         break
                     if attempt == 0:
                         options = (
-                            adjust_speed_for_duration(options, duration, segment.duration)
+                            adjust_speed_for_duration(
+                                options,
+                                duration,
+                                segment.duration,
+                                maximum=cfg.gsv_tts_max_speed_factor,
+                            )
                             if too_long
-                            else adjust_speed_for_short_duration(options, duration, segment.duration)
+                            else adjust_speed_for_short_duration(
+                                options,
+                                duration,
+                                segment.duration,
+                                minimum=cfg.gsv_tts_min_speed_factor,
+                            )
                         )
                         attempt_signals = [
                             GPTSoVITSRetrySignal.DURATION_TOO_LONG
@@ -2282,12 +2648,619 @@ def synth_step(
             server_manager.stop()
 
 
+def _rvc_profile_for_segment(cfg: ProjectConfig, profile: RVCProfile, segment: Segment) -> RVCProfile:
+    if not segment.speaker_id or segment.speaker_id not in cfg.rvc_speaker_models:
+        return profile
+    speaker_cfg = cfg.rvc_speaker_models[segment.speaker_id]
+    overrides = {
+        key: value
+        for key, value in {
+            "f0_method": speaker_cfg.f0_method,
+            "index_rate": speaker_cfg.index_rate,
+            "f0_up_key": speaker_cfg.f0_up_key,
+            "filter_radius": speaker_cfg.filter_radius,
+            "resample_sr": speaker_cfg.resample_sr,
+            "rms_mix_rate": speaker_cfg.rms_mix_rate,
+            "protect": speaker_cfg.protect,
+        }.items()
+        if value is not None
+    }
+    return profile.model_copy(update=overrides) if overrides else profile
+
+
+def _rvc_model_paths(
+    project_dir: Path,
+    cfg: ProjectConfig,
+    segment: Segment,
+    manifest: PipelineManifest | None = None,
+) -> tuple[Path | None, Path | None]:
+    if segment.speaker_id and segment.speaker_id in cfg.rvc_speaker_models:
+        speaker_cfg = cfg.rvc_speaker_models[segment.speaker_id]
+        return (
+            resolve_config_path(project_dir, speaker_cfg.model_path),
+            resolve_config_path(project_dir, speaker_cfg.index_path),
+        )
+    if manifest and manifest.artifacts.get("rvc_model_path"):
+        return (
+            resolve_config_path(project_dir, manifest.artifacts.get("rvc_model_path")),
+            resolve_config_path(project_dir, manifest.artifacts.get("rvc_index_path")),
+        )
+    return (
+        resolve_config_path(project_dir, cfg.rvc_model_path),
+        resolve_config_path(project_dir, cfg.rvc_index_path),
+    )
+
+
+def _rvc_metrics(input_path: Path, output_path: Path, segment: Segment, cfg: ProjectConfig) -> dict[str, Any]:
+    pre_duration = duration_sec(input_path)
+    post_duration = duration_sec(output_path)
+    ratio = duration_ratio(post_duration, pre_duration)
+    tolerance = cfg.rvc_duration_tolerance if cfg.rvc_duration_tolerance is not None else cfg.duration_tolerance
+    peak = peak_dbfs(output_path)
+    rms = rms_dbfs(output_path)
+    clip = clipping_ratio(output_path)
+    issues: list[str] = []
+    if abs(ratio - 1.0) > tolerance:
+        issues.append("duration_ratio_out_of_range")
+    if peak <= -90.0 or rms <= -90.0:
+        issues.append("silent_or_empty_audio")
+    if clip > 0.001 or peak > -0.05:
+        issues.append("clipping_detected")
+    return {
+        "pre_duration_sec": pre_duration,
+        "post_duration_sec": post_duration,
+        "duration_ratio": ratio,
+        "target_segment_duration_sec": segment.duration,
+        "peak_dbfs": peak,
+        "rms_dbfs": rms,
+        "clipping_ratio": clip,
+        "duration_tolerance": tolerance,
+        "issues": issues,
+        "accepted": not issues,
+    }
+
+
+def _rvc_attempt_payload(
+    *,
+    profile: RVCProfile,
+    output_path: Path,
+    model_path: Path | None,
+    index_path: Path | None,
+    command: list[str] | None = None,
+    reused_existing: bool = False,
+    returncode: int | None = None,
+    elapsed_sec: float | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    metrics: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "profile_name": profile.name,
+        "output_path": str(output_path),
+        "model_path": str(model_path) if model_path else None,
+        "index_path": str(index_path) if index_path else None,
+        "settings": profile.model_dump(mode="json"),
+        "command": command,
+        "reused_existing": reused_existing,
+        "returncode": returncode,
+        "elapsed_sec": round(elapsed_sec, 6) if elapsed_sec is not None else None,
+        "stdout_tail": stdout.strip()[-1200:] if stdout else "",
+        "stderr_tail": stderr.strip()[-1200:] if stderr else "",
+        "metrics": metrics or {},
+        "accepted": bool(metrics and metrics.get("accepted")),
+        "error": error,
+    }
+
+
+def _rvc_downstream_required(cfg: ProjectConfig) -> bool:
+    return bool(cfg.rvc_required and cfg.rvc_backend == "command")
+
+
+def _require_rvc_ready_for_downstream(project_dir: Path, manifest: PipelineManifest) -> None:
+    cfg = manifest.project_config
+    if not _rvc_downstream_required(cfg):
+        return
+    if manifest.stage_state.get("rvc", {}).get("status") != "completed":
+        raise ValueError(RVC_REQUIRED_MESSAGE)
+    rvc_root = (project_dir / "work" / "rvc").resolve()
+    for segment in manifest.segments:
+        if segment.status in SKIP_STATUSES:
+            continue
+        if not segment.rvc or not segment.rvc.accepted:
+            raise ValueError(f"{RVC_REQUIRED_MESSAGE} Segment {segment.id} has no accepted RVC output.")
+        if not segment.rvc.output_path:
+            raise ValueError(f"{RVC_REQUIRED_MESSAGE} Segment {segment.id} has no RVC output path.")
+        resolved = Path(segment.rvc.output_path).resolve()
+        try:
+            resolved.relative_to(rvc_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"{RVC_REQUIRED_MESSAGE} Segment {segment.id} RVC output is not under work/rvc: {resolved}"
+            ) from exc
+        if not resolved.exists():
+            raise ValueError(f"{RVC_REQUIRED_MESSAGE} Segment {segment.id} RVC output is missing: {resolved}")
+
+
+def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: bool) -> tuple[Path, list[dict[str, str]]]:
+    dataset_dir = project_dir / "work" / "rvc_train" / "dataset"
+    if force and dataset_dir.exists():
+        shutil.rmtree(dataset_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+    for segment in manifest.segments:
+        if segment.status in SKIP_STATUSES:
+            continue
+        source_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+        if not source_path.exists():
+            raise RVCCommandError(f"train-rvc source segment audio is missing: {source_path}")
+        output_path = dataset_dir / f"{segment.id}.wav"
+        source_stat = source_path.stat()
+        if (
+            force
+            or not output_path.exists()
+            or output_path.stat().st_size != source_stat.st_size
+            or output_path.stat().st_mtime_ns != source_stat.st_mtime_ns
+        ):
+            shutil.copy2(source_path, output_path)
+        rows.append({"segment_id": segment.id, "source_path": str(source_path), "dataset_path": str(output_path)})
+    if not rows:
+        raise RVCCommandError("train-rvc requires at least one source segment audio file.")
+    write_json_atomic(dataset_dir / "dataset_manifest.json", {"segments": rows})
+    return dataset_dir, rows
+
+
+def rvc_train_step(
+    project_dir: Path,
+    confirm_rights: bool = False,
+    force: bool = False,
+    mock: bool | None = None,
+    runner: Any | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    backend = "mock" if mock is True else cfg.rvc_train_backend
+    _log_stage_start("train-rvc", f"backend={backend}, segments={len(manifest.segments)}")
+    if manifest.stage_state.get("synth", {}).get("status") != "completed":
+        raise ValueError("train-rvc requires a completed synth stage.")
+    if backend == "command":
+        if not confirm_rights:
+            raise RightsError("Real RVC training requires --confirm-rights for source voice training data.")
+        validate_rvc_training_config(project_dir, cfg, real=True)
+        source_path = Path(manifest.source_info.path) if manifest.source_info else None
+        manifest.rights_audit = merge_rights_audit(
+            manifest.rights_audit,
+            require_confirmed_rights(
+                True,
+                "train-rvc",
+                source_path,
+                metadata={"backend": "command", "experiment_name": cfg.rvc_train_experiment_name},
+            ),
+        )
+        working_dir = resolve_config_path(project_dir, cfg.rvc_train_working_dir)
+        client: Any = RVCTrainCommandClient(
+            cfg.rvc_train_command,
+            working_dir=working_dir,
+            timeout_sec=cfg.rvc_train_timeout_sec,
+            runner=runner or subprocess.run,
+            stream_output=True,
+            log_prefix="train-rvc",
+        )
+    else:
+        validate_rvc_training_config(project_dir, cfg, real=False)
+        _require_audio_stage_rights(manifest, "train-rvc", confirm_rights, metadata={"backend": "mock"})
+        client = RVCTrainMockClient()
+
+    dataset_dir, dataset_rows = _rvc_train_dataset(project_dir, manifest, force)
+    work_dir = project_dir / "work" / "rvc_train"
+    model_path, index_path = rvc_train_output_paths(project_dir, cfg)
+    console.print(
+        f"[cyan]train-rvc[/cyan] dataset ready: {len(dataset_rows)} wav(s) -> {escape(str(dataset_dir))}"
+    )
+    console.print(
+        f"[cyan]train-rvc[/cyan] outputs: model={escape(str(model_path))} index={escape(str(index_path))}"
+    )
+    if isinstance(client, RVCTrainCommandClient):
+        command_preview = client.build_command(
+            project_dir=project_dir,
+            dataset_dir=dataset_dir,
+            work_dir=work_dir,
+            model_path=model_path,
+            index_path=index_path,
+            cfg=cfg,
+        )
+        console.print(f"[dim]train-rvc command: {escape(_format_command_preview(command_preview))}[/dim]")
+    console.print(f"[cyan]train-rvc[/cyan] running backend={backend}")
+    result = client.train(
+        project_dir=project_dir,
+        dataset_dir=dataset_dir,
+        work_dir=work_dir,
+        model_path=model_path,
+        index_path=index_path,
+        cfg=cfg,
+        force=force,
+    )
+    reuse_note = "reused existing artifacts" if result.reused_existing else f"elapsed={result.elapsed_sec:.1f}s"
+    console.print(f"[cyan]train-rvc[/cyan] backend finished: {reuse_note}")
+    train_manifest = project_dir / "work" / "rvc_train" / "rvc_train_manifest.json"
+    write_json_atomic(
+        train_manifest,
+        {
+            "backend": backend,
+            "dataset_dir": str(dataset_dir),
+            "dataset_segments": dataset_rows,
+            "model_path": str(result.model_path),
+            "index_path": str(result.index_path) if result.index_path else None,
+            "command": result.command,
+            "returncode": result.returncode,
+            "elapsed_sec": round(result.elapsed_sec, 6),
+            "reused_existing": result.reused_existing,
+            "stdout_tail": result.stdout.strip()[-1200:] if result.stdout else "",
+            "stderr_tail": result.stderr.strip()[-1200:] if result.stderr else "",
+        },
+    )
+    manifest.artifacts["rvc_train_manifest"] = str(train_manifest)
+    manifest.artifacts["rvc_model_path"] = str(result.model_path)
+    if result.index_path:
+        manifest.artifacts["rvc_index_path"] = str(result.index_path)
+    mark_stage(
+        manifest,
+        "train-rvc",
+        "completed",
+        backend=backend,
+        rvc_train_manifest=str(train_manifest),
+        model_path=str(result.model_path),
+        index_path=str(result.index_path) if result.index_path else None,
+        dataset_segment_count=len(dataset_rows),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("train-rvc", manifest, f"backend={backend}")
+    return manifest
+
+
+def skip_rvc_train_for_voice_bank_step(project_dir: Path) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    if not cfg.rvc_speaker_models:
+        raise ValueError("Cannot skip train-rvc without configured voice-bank RVC speaker models.")
+    mark_stage(
+        manifest,
+        "train-rvc",
+        "skipped_pretrained_voice_bank",
+        backend="voice_bank",
+        speaker_models=sorted(cfg.rvc_speaker_models),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("train-rvc", manifest, "skipped_pretrained_voice_bank")
+    return manifest
+
+
+def _train_rvc_ready_for_rvc(manifest: PipelineManifest) -> bool:
+    status = manifest.stage_state.get("train-rvc", {}).get("status")
+    if status == "completed":
+        return True
+    return status == "skipped_pretrained_voice_bank" and bool(manifest.project_config.rvc_speaker_models)
+
+
+def rvc_step(
+    project_dir: Path,
+    confirm_rights: bool = False,
+    force: bool = False,
+    mock: bool | None = None,
+    runner: Any | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    backend = "mock" if mock is True else cfg.rvc_backend
+    _log_stage_start("rvc", f"backend={backend}, segments={len(manifest.segments)}")
+    if manifest.stage_state.get("synth", {}).get("status") != "completed":
+        raise ValueError("RVC requires a completed synth stage.")
+    if not _train_rvc_ready_for_rvc(manifest):
+        raise ValueError("RVC requires a completed train-rvc stage.")
+    validate_rvc_config(
+        project_dir,
+        cfg,
+        real=backend == "command",
+        segments=manifest.segments,
+        allow_trained_artifact=True,
+    )
+    if backend == "command":
+        if not confirm_rights:
+            raise RightsError("Real RVC conversion requires --confirm-rights for the source and voice model.")
+        source_path = Path(manifest.source_info.path) if manifest.source_info else None
+        manifest.rights_audit = merge_rights_audit(
+            manifest.rights_audit,
+            require_confirmed_rights(
+                True,
+                "rvc",
+                source_path,
+                metadata={
+                    "backend": "command",
+                    "model_path": cfg.rvc_model_path,
+                    "index_path": cfg.rvc_index_path,
+                    "speaker_models": sorted(cfg.rvc_speaker_models),
+                },
+            ),
+        )
+        working_dir = resolve_config_path(project_dir, cfg.rvc_working_dir)
+        client: Any = RVCCommandClient(
+            cfg.rvc_command,
+            working_dir=working_dir,
+            timeout_sec=cfg.rvc_timeout_sec,
+            runner=runner or subprocess.run,
+            stream_output=True,
+            log_prefix="rvc",
+        )
+    else:
+        _require_audio_stage_rights(manifest, "rvc", confirm_rights, metadata={"backend": "mock"})
+        client = RVCMockClient()
+
+    failed_segments: list[str] = []
+    started_at = monotonic()
+    last_logged_at = started_at
+    total = len(manifest.segments)
+    rvc_lane_count = 1 if backend != "command" else _effective_lane_count(cfg.rvc_concurrency, total)
+    console.print(
+        f"[cyan]rvc[/cyan] converting segments with {len(cfg.rvc_auto_profiles)} profile candidate(s); "
+        f"failure_policy={cfg.rvc_failure_policy} concurrency={rvc_lane_count}"
+    )
+
+    def convert_segment(index: int, segment: Segment) -> tuple[int, Segment, str | None]:
+        if segment.status in SKIP_STATUSES:
+            return index, segment, None
+        if not segment.tts or not segment.tts.selected_candidate_path:
+            message = "RVC requires segment.tts.selected_candidate_path from synth."
+            segment.status = "failed"
+            segment.errors.append(message)
+            return index, segment, segment.id
+        raw_tts_path = segment.rvc.input_path if segment.rvc and segment.rvc.input_path else segment.tts.selected_candidate_path
+        input_path = Path(raw_tts_path)
+        if not input_path.exists():
+            message = f"RVC input does not exist: {input_path}"
+            segment.status = "failed"
+            segment.errors.append(message)
+            segment.rvc = RVCMetadata(
+                backend=backend,
+                input_path=str(input_path),
+                error=message,
+            )
+            return index, segment, segment.id
+        model_path, index_path = _rvc_model_paths(project_dir, cfg, segment, manifest)
+        if backend == "command" and (model_path is None or not model_path.exists()):
+            message = "RVC requires the model artifact produced by train-rvc."
+            segment.status = "failed"
+            segment.errors.append(message)
+            segment.rvc = RVCMetadata(backend=backend, input_path=str(input_path), error=message)
+            return index, segment, segment.id
+        attempts: list[dict[str, Any]] = []
+        candidate_paths: list[str] = []
+        accepted_attempt: dict[str, Any] | None = None
+        selected_candidate_path: Path | None = None
+        profiles = cfg.rvc_auto_profiles
+        if cfg.rvc_failure_policy == "error":
+            profiles = profiles[:1]
+        for profile in profiles:
+            effective_profile = _rvc_profile_for_segment(cfg, profile, segment)
+            candidate_path = (
+                project_dir
+                / "work"
+                / "rvc"
+                / "candidates"
+                / segment.id
+                / f"{effective_profile.name}.wav"
+            )
+            candidate_paths.append(str(candidate_path))
+            command: list[str] | None = None
+            try:
+                console.print(
+                    f"[dim]rvc candidate: {index}/{total} segment={escape(segment.id)} "
+                    f"profile={escape(effective_profile.name)} output={escape(str(candidate_path))}[/dim]"
+                )
+                if isinstance(client, RVCCommandClient):
+                    command = client.build_command(
+                        input_path=input_path,
+                        output_path=candidate_path,
+                        model_path=model_path,
+                        index_path=index_path,
+                        cfg=cfg,
+                        profile=effective_profile,
+                        segment_id=segment.id,
+                        sid=segment.speaker_id or "",
+                    )
+                result = client.convert(
+                    input_path,
+                    candidate_path,
+                    model_path=model_path,
+                    index_path=index_path,
+                    cfg=cfg,
+                    profile=effective_profile,
+                    segment_id=segment.id,
+                    sid=segment.speaker_id or "",
+                    force=force,
+                )
+                command = result.command or command
+                metrics = _rvc_metrics(input_path, candidate_path, segment, cfg)
+                attempt = _rvc_attempt_payload(
+                    profile=effective_profile,
+                    output_path=candidate_path,
+                    model_path=model_path,
+                    index_path=index_path,
+                    command=command,
+                    reused_existing=result.reused_existing,
+                    returncode=result.returncode,
+                    elapsed_sec=result.elapsed_sec,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    metrics=metrics,
+                )
+                attempts.append(attempt)
+                if metrics["accepted"]:
+                    console.print(
+                        f"[dim]rvc accepted: segment={escape(segment.id)} "
+                        f"profile={escape(effective_profile.name)} "
+                        f"duration_ratio={metrics.get('duration_ratio', 0):.3f} "
+                        f"elapsed={result.elapsed_sec:.1f}s"
+                        f"{' reused=true' if result.reused_existing else ''}[/dim]"
+                    )
+                    accepted_attempt = attempt
+                    selected_candidate_path = candidate_path
+                    break
+                console.print(
+                    f"[dim]rvc rejected: segment={escape(segment.id)} "
+                    f"profile={escape(effective_profile.name)} issues={metrics.get('issues', [])}[/dim]"
+                )
+            except Exception as exc:
+                console.print(
+                    f"[yellow]rvc candidate failed[/yellow]: segment={escape(segment.id)} "
+                    f"profile={escape(effective_profile.name)} error={escape(str(exc))}"
+                )
+                attempts.append(
+                    _rvc_attempt_payload(
+                        profile=effective_profile,
+                        output_path=candidate_path,
+                        model_path=model_path,
+                        index_path=index_path,
+                        command=command,
+                        error=str(exc),
+                    )
+                )
+                if cfg.rvc_failure_policy == "error":
+                    break
+        if selected_candidate_path is None or accepted_attempt is None:
+            error = "All RVC candidates failed or were rejected."
+            failed_segment_id: str | None = None
+            if cfg.rvc_allow_pre_rvc_fallback and not _rvc_downstream_required(cfg):
+                segment.rvc = RVCMetadata(
+                    backend=backend,
+                    input_path=str(input_path),
+                    output_path=str(input_path),
+                    selected_profile_name=None,
+                    candidate_paths=candidate_paths,
+                    model_path=str(model_path) if model_path else None,
+                    index_path=str(index_path) if index_path else None,
+                    accepted=False,
+                    fallback_used=True,
+                    fallback_reason=error,
+                    error=error,
+                    attempts=attempts,
+                )
+            else:
+                segment.rvc = RVCMetadata(
+                    backend=backend,
+                    input_path=str(input_path),
+                    output_path=None,
+                    selected_profile_name=None,
+                    candidate_paths=candidate_paths,
+                    model_path=str(model_path) if model_path else None,
+                    index_path=str(index_path) if index_path else None,
+                    accepted=False,
+                    error=error,
+                    attempts=attempts,
+                )
+                segment.status = "failed"
+                segment.errors.append(error)
+                failed_segment_id = segment.id
+            return index, segment, failed_segment_id
+        final_path = ensure_inside_project(project_dir, project_dir / "work" / "rvc" / f"{segment.id}_final.wav")
+        ensure_not_same_path(selected_candidate_path, final_path)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(selected_candidate_path, final_path)
+        metrics = dict(accepted_attempt.get("metrics") or {})
+        segment.rvc = RVCMetadata(
+            backend=backend,
+            input_path=str(input_path),
+            output_path=str(final_path),
+            selected_profile_name=str(accepted_attempt["profile_name"]),
+            candidate_paths=candidate_paths,
+            model_path=str(model_path) if model_path else None,
+            index_path=str(index_path) if index_path else None,
+            settings={
+                "failure_policy": cfg.rvc_failure_policy,
+                "duration_tolerance": metrics.get("duration_tolerance"),
+                "selected_settings": accepted_attempt.get("settings", {}),
+            },
+            pre_duration_sec=metrics.get("pre_duration_sec"),
+            post_duration_sec=metrics.get("post_duration_sec"),
+            duration_ratio=metrics.get("duration_ratio"),
+            accepted=True,
+            fallback_used=False,
+            command=accepted_attempt.get("command"),
+            attempts=attempts,
+        )
+        segment.status = "rvc_converted"
+        return index, segment, None
+
+    segment_jobs = list(enumerate(manifest.segments, start=1))
+    if backend == "command" and rvc_lane_count > 1 and len(segment_jobs) > 1:
+        with ThreadPoolExecutor(max_workers=rvc_lane_count) as executor:
+            futures = [executor.submit(convert_segment, index, segment) for index, segment in segment_jobs]
+            for future in as_completed(futures):
+                index, segment, failed_segment_id = future.result()
+                if failed_segment_id:
+                    failed_segments.append(failed_segment_id)
+                last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+                save_manifest(project_dir, manifest)
+    else:
+        for index, segment in segment_jobs:
+            index, segment, failed_segment_id = convert_segment(index, segment)
+            if failed_segment_id:
+                failed_segments.append(failed_segment_id)
+            last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+            save_manifest(project_dir, manifest)
+
+    out_path = project_dir / "work" / "rvc" / "rvc_manifest.json"
+    write_json_atomic(
+        out_path,
+        {
+            "backend": backend,
+            "segments": [
+                {"id": segment.id, "rvc": segment.rvc.model_dump(mode="json") if segment.rvc else None}
+                for segment in manifest.segments
+            ],
+        },
+    )
+    manifest.artifacts["rvc_manifest"] = str(out_path)
+    if failed_segments:
+        mark_stage(
+            manifest,
+            "rvc",
+            "failed",
+            backend=backend,
+            failed_segments=failed_segments,
+            rvc_manifest=str(out_path),
+            concurrency=rvc_lane_count,
+            segment_counts=_segment_counts(manifest),
+        )
+        save_manifest(project_dir, manifest)
+        raise RVCCommandError(
+            "RVC conversion failed for segments: "
+            + ", ".join(failed_segments[:20])
+            + (" ..." if len(failed_segments) > 20 else "")
+        )
+    mark_stage(
+        manifest,
+        "rvc",
+        "completed",
+        backend=backend,
+        rvc_manifest=str(out_path),
+        concurrency=rvc_lane_count,
+        segment_counts=_segment_counts(manifest),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("rvc", manifest, f"backend={backend}")
+    return manifest
+
+
 def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
     total = len(manifest.segments)
     _log_stage_start("qc", f"backend={backend_kind}, segments={total}")
     _require_audio_stage_rights(manifest, "qc", confirm_rights, metadata={"backend": backend_kind})
+    _require_rvc_ready_for_downstream(project_dir, manifest)
     cfg = manifest.project_config
     backend = create_gemma_backend(backend_kind, _gemma_backend_config(cfg))
     context = _gemma_context(manifest)
@@ -2306,7 +3279,11 @@ def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) 
                 "qc", index, total, segment, manifest, started_at, last_logged_at
             )
             continue
-        audio_path = Path(segment.tts.selected_candidate_path)
+        audio_path = (
+            Path(segment.rvc.output_path)
+            if segment.rvc and segment.rvc.output_path
+            else Path(segment.tts.selected_candidate_path)
+        )
         audio_metrics = measure_audio_qc(audio_path, segment.duration)
         try:
             gemma_result = validate_gemma_task_response(
@@ -2396,6 +3373,7 @@ def mix_step(project_dir: Path, confirm_rights: bool) -> PipelineManifest:
     manifest.rights_audit = merge_rights_audit(manifest.rights_audit, audit)
     if manifest.stage_state.get("qc", {}).get("status") != "completed":
         raise ValueError("Mix requires a completed QC stage.")
+    _require_rvc_ready_for_downstream(project_dir, manifest)
     allow_korean_timing_draft = (
         cfg.mix_allow_korean_timing_draft
         and _canonical_language(cfg.target_language) == "ko"
@@ -2535,6 +3513,7 @@ def mix_step(project_dir: Path, confirm_rights: bool) -> PipelineManifest:
             if included
             else f"status_{segment.status}",
             "selected_candidate_path": segment.tts.selected_candidate_path if segment.tts else None,
+            "rvc_output_path": segment.rvc.output_path if segment.rvc else None,
             "start": segment.start,
             "estimated_pan": segment.estimated_pan,
             "dialogue_gain_db": cfg.mix_dialogue_gain_db if included else None,
@@ -2580,6 +3559,7 @@ def export_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> Pi
     _load_config_into_manifest(project_dir, manifest)
     audit = require_confirmed_rights(confirm_rights, "export", input_path)
     manifest.rights_audit = merge_rights_audit(manifest.rights_audit, audit)
+    _require_rvc_ready_for_downstream(project_dir, manifest)
     final_audio = Path(manifest.artifacts.get("final_audio", project_dir / "work/mix/final_audio.wav"))
     suffix = ".mp4" if manifest.source_info and manifest.source_info.has_video else ".wav"
     output = ensure_inside_project(project_dir, project_dir / "output" / f"{input_path.stem}_dub{suffix}")

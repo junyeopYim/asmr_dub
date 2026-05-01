@@ -119,6 +119,11 @@ gsv_few_shot_force: false
 gsv_few_shot_version: auto
 ```
 
+Few-shot training runs the GPT-SoVITS prepare/train scripts with a Python that
+can import the GPT-SoVITS training dependencies. If auto-detection chooses the
+wrong environment, set `ASMR_DUB_GSV_PYTHON=/path/to/python` before running
+`asmr-dub full --real` or `asmr-dub train-gsv`.
+
 If no command is supplied and no known `api_v2.py` exists, it fails before
 synthesis with a message telling you to install GPT-SoVITS or set
 `gsv_server_command`.
@@ -184,10 +189,12 @@ Generation fields sent explicitly for deterministic records:
 
 Each manifest candidate records the exact payload plus retry metadata. If a
 candidate is too long for the source segment, synthesis first retries with a
-higher `speed_factor`; if it is still too long, it retries after requesting the
-existing script-duration rewrite hook. If a previous QC pass flagged repetition
-or omission and the segment is synthesized again, the next GPT-SoVITS attempt
-uses a deterministic new seed and a higher `repetition_penalty`.
+higher `speed_factor` capped by `gsv_tts_max_speed_factor`; if it is still too
+long, it retries after requesting the existing script-duration rewrite hook.
+This prevents Korean or whisper-heavy lines from being compressed until
+pronunciation collapses. If a previous QC pass flagged repetition or omission
+and the segment is synthesized again, the next GPT-SoVITS attempt uses a
+deterministic new seed and a higher `repetition_penalty`.
 
 ### Optional smoke test
 

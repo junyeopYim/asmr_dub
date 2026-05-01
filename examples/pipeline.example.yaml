@@ -38,6 +38,8 @@ gsv_server_shutdown_timeout_sec: 10.0
 gsv_server_startup_timeout_sec: 120.0
 gsv_timeout_sec: 120.0
 gsv_url: http://127.0.0.1:9880
+gsv_tts_min_speed_factor: 0.85
+gsv_tts_max_speed_factor: 1.12
 hf_local_files_only: true
 mix_background_bed: preserve_original
 mix_dialogue_fade_ms: null

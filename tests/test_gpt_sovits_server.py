@@ -110,6 +110,7 @@ def test_default_gsv_command_discovers_third_party_install(monkeypatch, tmp_path
     api.write_text("", "utf-8")
     config.write_text("", "utf-8")
     monkeypatch.setattr(gsv_server, "REPO_ROOT", root)
+    monkeypatch.setattr(gsv_server, "_default_gsv_python", lambda: "python")
 
     command = _default_gsv_command("http://127.0.0.1:9880")
 
@@ -142,12 +143,44 @@ def test_default_gsv_command_prepares_fast_langdetect_cache(monkeypatch, tmp_pat
     api.write_text("", "utf-8")
     config.write_text("", "utf-8")
     monkeypatch.setattr(gsv_server, "REPO_ROOT", root)
+    monkeypatch.setattr(gsv_server, "_default_gsv_python", lambda: "python")
 
     _default_gsv_command("http://127.0.0.1:9880")
 
     cache_dir = source / "fast_langdetect"
     assert cache_dir.is_dir()
     assert (target / "fast_langdetect").resolve() == cache_dir.resolve()
+
+
+def test_default_gsv_python_prefers_dependency_complete_env(monkeypatch, tmp_path: Path) -> None:
+    override = tmp_path / "gsv_env" / "bin" / "python"
+    base = tmp_path / "base" / "bin" / "python"
+    monkeypatch.setenv("ASMR_DUB_GSV_PYTHON", str(override))
+    monkeypatch.setattr(gsv_server.sys, "base_prefix", str(base.parent.parent))
+    monkeypatch.setattr(gsv_server.shutil, "which", lambda name: None)
+
+    def fake_has_modules(python: str, modules) -> bool:
+        return python == str(override)
+
+    monkeypatch.setattr(gsv_server, "_python_has_modules", fake_has_modules)
+
+    assert gsv_server._default_gsv_python() == str(override)
+
+
+def test_default_gsv_python_skips_venv_without_server_deps(monkeypatch, tmp_path: Path) -> None:
+    base = tmp_path / "base" / "bin" / "python"
+    venv = tmp_path / ".venv" / "bin" / "python"
+    monkeypatch.delenv("ASMR_DUB_GSV_PYTHON", raising=False)
+    monkeypatch.setattr(gsv_server.sys, "base_prefix", str(base.parent.parent))
+    monkeypatch.setattr(gsv_server.sys, "executable", str(venv))
+    monkeypatch.setattr(gsv_server.shutil, "which", lambda name: str(venv))
+
+    def fake_has_modules(python: str, modules) -> bool:
+        return python == str(base)
+
+    monkeypatch.setattr(gsv_server, "_python_has_modules", fake_has_modules)
+
+    assert gsv_server._default_gsv_python() == str(base)
 
 
 def test_gsv_subprocess_env_adds_mecab_shim_when_missing(monkeypatch, tmp_path: Path) -> None:

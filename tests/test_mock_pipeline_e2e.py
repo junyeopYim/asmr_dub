@@ -31,6 +31,7 @@ def test_mock_pipeline_e2e(cli_runner, tiny_wav_path: Path, tmp_project_dir: Pat
     assert (tmp_project_dir / "work/audio/original_stereo_48k.wav").exists()
     assert (tmp_project_dir / "work/audio/gemma_mono_16k.wav").exists()
     assert (tmp_project_dir / "work/segments/manifests/segments_raw.json").exists()
+    assert (tmp_project_dir / "work/rvc/rvc_manifest.json").exists()
     assert (tmp_project_dir / "work/mix/dialogue_stem.wav").exists()
     assert (tmp_project_dir / "work/mix/final_audio.wav").exists()
     manifest = load_manifest(tmp_project_dir)
@@ -38,7 +39,17 @@ def test_mock_pipeline_e2e(cli_runner, tiny_wav_path: Path, tmp_project_dir: Pat
     assert manifest.segments
     assert manifest.segments[0].tts is not None
     assert manifest.segments[0].tts.selected_candidate_path
+    assert manifest.segments[0].rvc is not None
+    assert manifest.segments[0].rvc.accepted is True
+    assert manifest.segments[0].rvc.output_path is not None
+    assert "work/tts" in manifest.segments[0].tts.selected_candidate_path
+    assert "work/rvc" in manifest.segments[0].rvc.output_path
+    assert manifest.stage_state["train-rvc"]["status"] == "completed"
+    assert manifest.stage_state["train-rvc"]["backend"] == "mock"
+    assert manifest.stage_state["rvc"]["status"] == "completed"
+    assert manifest.stage_state["rvc"]["backend"] == "mock"
     assert manifest.artifacts["export"].endswith("_dub.wav")
+    assert manifest.artifacts["rvc_manifest"].endswith("rvc_manifest.json")
     assert manifest.artifacts["mix_manifest"].endswith("mix_manifest.json")
     assert manifest.artifacts["export_manifest"].endswith("export_manifest.json")
     assert manifest.segments[0].mix["included"] is True
@@ -70,6 +81,8 @@ def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path
     assert "translate-ko: 1/" in result.output
     assert "korean-script: 1/" in result.output
     assert "synth: 1/" in result.output
+    assert "train-rvc complete" in result.output
+    assert "rvc: 1/" in result.output
     assert "mix dialogue: 1/" in result.output
     assert "Pipeline complete" in result.output
     assert "Project:" in result.output
@@ -87,6 +100,8 @@ def test_full_real_applies_high_quality_preset_by_default(
     monkeypatch,
 ) -> None:
     project = tmp_path / "full_real_hq"
+    fake_repo = tmp_path / "repo"
+    (fake_repo / ".cache/third_party/Retrieval-based-Voice-Conversion-WebUI").mkdir(parents=True)
     captured: dict[str, object] = {}
 
     def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
@@ -94,6 +109,7 @@ def test_full_real_applies_high_quality_preset_by_default(
         captured["kwargs"] = kwargs
         return PipelineManifest(artifacts={"export": "out.wav"})
 
+    monkeypatch.setattr(cli_module, "REPO_ROOT", fake_repo)
     monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
 
     result = cli_runner.invoke(
@@ -123,6 +139,31 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gemma_text_concurrency == 4
     assert cfg.gemma_text_n_predict == 8192
     assert cfg.mix_allow_korean_timing_draft is False
+    assert cfg.rvc_required is True
+    assert cfg.rvc_backend == "command"
+    assert cfg.rvc_train_required is True
+    assert cfg.rvc_train_backend == "command"
+    assert cfg.rvc_train_timeout_sec == 43200.0
+    assert cfg.rvc_train_experiment_name == f"asmr-{tiny_wav_path.stem.lower()}-speaker-1"
+    assert cfg.rvc_train_command
+    assert str(fake_repo / "asmr_dub_pipeline/rvc/webui_train.py") in cfg.rvc_train_command
+    assert cfg.rvc_train_batch_size == 0
+    assert cfg.rvc_train_preprocess_processes == 0
+    assert cfg.rvc_train_f0_workers == 0
+    assert cfg.rvc_train_feature_workers == 0
+    assert cfg.rvc_train_save_every_epoch == 50
+    assert cfg.rvc_train_reuse_intermediate_cache is True
+    assert "{sample_rate}" in cfg.rvc_train_command
+    assert "{batch_size}" in cfg.rvc_train_command
+    assert "{preprocess_processes}" in cfg.rvc_train_command
+    assert "{f0_workers}" in cfg.rvc_train_command
+    assert "{feature_workers}" in cfg.rvc_train_command
+    assert "{save_every_epoch}" in cfg.rvc_train_command
+    assert "{reuse_intermediate_cache}" in cfg.rvc_train_command
+    assert cfg.rvc_command
+    assert str(fake_repo / "asmr_dub_pipeline/rvc/webui_infer.py") in cfg.rvc_command
+    assert cfg.rvc_failure_policy == "retry_then_error"
+    assert cfg.rvc_allow_pre_rvc_fallback is False
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["mock"] is False
