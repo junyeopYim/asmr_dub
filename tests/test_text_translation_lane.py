@@ -37,6 +37,10 @@ from asmr_dub_pipeline.schemas import (
     TTSCandidate,
     TTSMetadata,
 )
+from asmr_dub_pipeline.script.korean_colloquial import (
+    COLLOQUIAL_REWRITE_NOTE,
+    colloquialize_korean_text,
+)
 
 
 def sample_segment(
@@ -152,7 +156,9 @@ def test_source_script_and_korean_translation_schema_round_trip() -> None:
 
 
 def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None:
-    assert ProjectConfig().gemma_text_batch_size == 1
+    assert ProjectConfig().gemma_text_batch_size == 12
+    assert ProjectConfig().gemma_text_context_radius == 4
+    assert ProjectConfig().gemma_text_two_pass is True
     assert ProjectConfig().gemma_text_concurrency == 4
     assert ProjectConfig().gsv_concurrency == 3
     assert ProjectConfig().source_language == "ja"
@@ -165,6 +171,17 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().gsv_ref_max_sec == pytest.approx(10.0)
     assert ProjectConfig().gsv_tts_min_speed_factor == pytest.approx(0.85)
     assert ProjectConfig().gsv_tts_max_speed_factor == pytest.approx(1.12)
+    assert ProjectConfig().gsv_top_k == 15
+    assert ProjectConfig().gsv_top_p == pytest.approx(1.0)
+    assert ProjectConfig().gsv_temperature == pytest.approx(1.0)
+    assert ProjectConfig().gsv_text_split_method == "cut5"
+    assert ProjectConfig().gsv_parallel_infer is True
+    assert ProjectConfig().gsv_repetition_penalty == pytest.approx(1.35)
+    assert ProjectConfig().gsv_sample_steps == 32
+    assert ProjectConfig().gsv_super_sampling is False
+    assert ProjectConfig().gsv_overlap_length == 2
+    assert ProjectConfig().gsv_min_chunk_length == 16
+    assert ProjectConfig().gsv_fragment_interval == pytest.approx(0.3)
 
 
 def test_source_voice_ref_selection_extends_short_candidate_to_duration_window(
@@ -277,6 +294,155 @@ def _force_single_translation_lane(project_dir: Path) -> None:
     )
 
 
+def test_translate_ko_passes_neighbor_context_to_context_aware_clients(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_batch_size=1,
+            gemma_text_concurrency=1,
+            gemma_text_context_radius=1,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+    manifest = load_manifest(tmp_project_dir)
+    base = manifest.segments[0]
+    for index in range(2, 4):
+        start = base.end + (index - 2) * base.duration
+        manifest.segments.append(
+            Segment(
+                id=f"seg_{index:04d}",
+                start=start,
+                end=start + base.duration,
+                duration=base.duration,
+                audio_for_gemma=base.audio_for_gemma,
+                audio_for_mix=base.audio_for_mix,
+                source_script=SourceScript(
+                    text=f"前後の台詞です {index}",
+                    language="ja",
+                    confidence=0.99,
+                    backend="mock",
+                    start=start,
+                    end=start + base.duration,
+                ),
+            )
+        )
+    save_manifest(tmp_project_dir, manifest)
+    contexts: list[tuple[str, list[str], list[str]]] = []
+
+    class FakeServer:
+        started = False
+        reused_existing = True
+        log_path = None
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+            context_segments: list[Segment] | None = None,
+        ) -> dict[str, KoreanTranslation]:
+            contexts.append(
+                (
+                    batch_id,
+                    [segment.id for segment in segments],
+                    [segment.id for segment in (context_segments or [])],
+                )
+            )
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal=f"직역 {segment.id}",
+                    ko_natural=f"자연 {segment.id}",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="llama_server")
+
+    assert contexts == [
+        ("batch_0001", ["seg_0001"], ["seg_0001", "seg_0002"]),
+        ("batch_0002", ["seg_0002"], ["seg_0001", "seg_0002", "seg_0003"]),
+        ("batch_0003", ["seg_0003"], ["seg_0002", "seg_0003"]),
+    ]
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["translate-ko"]["context_radius"] == 1
+    assert manifest.stage_state["translate-ko"]["two_pass"] is True
+
+
+def test_translate_ko_force_retranslate_ignores_resumed_translations(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            calls.append(batch_id)
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal=f"직역 {len(calls)}",
+                    ko_natural=f"자연 {len(calls)}",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+    first_manifest = load_manifest(tmp_project_dir)
+    first_translation = first_manifest.segments[0].translation_ko
+    assert first_translation is not None
+    assert first_translation.ko_natural == "자연 1"
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+    assert calls == ["batch_0001"]
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", force_retranslate=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    translation = manifest.segments[0].translation_ko
+    assert translation is not None
+    assert translation.ko_natural == "자연 2"
+    assert manifest.stage_state["translate-ko"]["force_retranslate"] is True
+
+
 def test_korean_draft_mix_allows_timing_only_qc_regeneration() -> None:
     segment = sample_segment()
     segment.status = "needs_regeneration"
@@ -359,7 +525,7 @@ def test_llama_server_translation_client_repairs_invalid_json() -> None:
     translations = client.translate_batch([segment], "batch_0001")
 
     assert translations["seg_0001"].ko_natural == "자연"
-    assert len(requests) == 2
+    assert len(requests) == 3
     second_messages = requests[1]["messages"]
     assert isinstance(second_messages, list)
     assert "Repair the previous response" in second_messages[0]["content"]
@@ -409,6 +575,53 @@ def test_translation_parser_accepts_minimal_model_output() -> None:
     assert translation.confidence is None
     assert translation.model == "gemma4"
     assert translation.batch_id == "batch_0001"
+
+
+def test_llama_server_translation_client_uses_literal_then_natural_pass() -> None:
+    requests: list[dict[str, object]] = []
+    responses = [
+        [{"segment_id": "seg_0001", "ko_literal": "어서 오세요, 오빠."}],
+        [{"segment_id": "seg_0001", "ko_natural": "어서 와요, 오빠."}],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(responses[len(requests) - 1], ensure_ascii=False)}}
+                ]
+            },
+        )
+
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="いらっしゃいませお兄さん",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=0.0,
+        end=1.0,
+    )
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=0,
+        n_predict=128,
+    )
+
+    translations = client.translate_batch([segment], "batch_0001")
+
+    assert translations["seg_0001"].ko_literal == "어서 오세요, 오빠."
+    assert translations["seg_0001"].ko_natural == "어서 와요, 오빠."
+    assert len(requests) == 2
+    first_prompt = requests[0]["messages"][0]["content"]
+    second_prompt = requests[1]["messages"][0]["content"]
+    assert "First pass" in first_prompt
+    assert "Second pass" in second_prompt
+    assert "ko_literal" in second_prompt
 
 
 def test_llama_server_translation_client_repairs_low_quality_translation() -> None:
@@ -464,7 +677,7 @@ def test_llama_server_translation_client_repairs_low_quality_translation() -> No
     translations = client.translate_batch([segment], "batch_0001")
 
     assert translations["seg_0001"].ko_natural == "왜냐하면요."
-    assert len(requests) == 2
+    assert len(requests) == 3
     second_prompt = requests[1]["messages"][0]["content"]
     assert "Original input" in second_prompt
     assert "だって" in second_prompt
@@ -522,6 +735,61 @@ def test_llama_server_translation_client_keeps_valid_items_from_mixed_batch() ->
     assert translations["seg_0001"].ko_natural == "안녕하세요."
 
 
+def test_korean_colloquializer_rewrites_stiff_polite_forms() -> None:
+    text = "저는 괜찮습니다. 이것은 좋은 것입니다. 천천히 하겠습니다."
+
+    assert colloquialize_korean_text(text) == "전 괜찮아요. 이건 좋은 거예요. 천천히 할게요."
+
+
+def test_translate_ko_colloquializes_finished_translations(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal="저는 괜찮습니다.",
+                    ko_natural="저는 괜찮습니다. 이것은 좋은 것입니다. 천천히 하겠습니다.",
+                    notes=["model_note"],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+
+    manifest = load_manifest(tmp_project_dir)
+    translation = manifest.segments[0].translation_ko
+    assert translation is not None
+    assert translation.ko_natural == "전 괜찮아요. 이건 좋은 거예요. 천천히 할게요."
+    assert translation.notes == ["model_note", COLLOQUIAL_REWRITE_NOTE]
+    assert manifest.stage_state["translate-ko"]["colloquialized"] == 1
+
+    rows = [
+        json.loads(line)
+        for line in Path(manifest.artifacts["translation_bundles"]).read_text().splitlines()
+    ]
+    assert rows[0]["colloquialized"] is True
+    assert rows[0]["translation_ko"]["ko_natural"] == translation.ko_natural
+
+
 def test_transcribe_and_translate_mock_steps_write_artifacts(
     tiny_wav_path: Path,
     tmp_project_dir: Path,
@@ -551,7 +819,7 @@ def test_transcribe_and_translate_mock_steps_write_artifacts(
     assert manifest.segments[0].script.source_language == "ja"
     assert manifest.segments[0].script.target_language == "ko"
     assert manifest.segments[0].script.ja_text.startswith("mock source script")
-    assert manifest.segments[0].script.tts_text.startswith("자연 번역:")
+    assert manifest.segments[0].script.tts_text.startswith("자연 번역,")
     assert Path(manifest.artifacts["source_segments"]).exists()
     assert Path(manifest.artifacts["segments_transcribed"]).exists()
     assert Path(manifest.artifacts["translation_bundles"]).exists()
@@ -1058,6 +1326,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         mock=False,
         gemma_backend="hf",
         target_language="kr",
+        asr_backend="qwen_asr",
     )
 
     assert [name for name, _, _ in calls] == [
@@ -1077,6 +1346,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "mix",
         "export",
     ]
+    assert calls[4][2]["asr_backend"] == "qwen_asr"
     assert calls[5][1][1] == "llama_server"
     assert calls[9][2]["mock"] is False
     assert calls[10][2]["mock"] is False

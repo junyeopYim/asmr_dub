@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -14,13 +15,20 @@ class GPTSoVITSError(RuntimeError):
     pass
 
 
+_HANGUL_RE = re.compile(r"[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]")
+
+
+def contains_hangul(text: str) -> bool:
+    return bool(_HANGUL_RE.search(text))
+
+
 def normalize_api_language_code(language: str) -> str:
     normalized = language.strip().lower().replace("-", "_")
-    if normalized in {"ja", "jp", "jpn", "japanese"}:
+    if normalized in {"ja", "jp", "jpn", "japanese", "all_ja"}:
         return "all_ja"
-    if normalized in {"ko", "kr", "kor", "korean"}:
+    if normalized in {"ko", "kr", "kor", "korean", "all_ko"}:
         return "all_ko"
-    if normalized in {"zh", "cn", "zho", "chinese", "mandarin"}:
+    if normalized in {"zh", "cn", "zho", "chinese", "mandarin", "all_zh"}:
         return "all_zh"
     return language.strip() or "all_ja"
 
@@ -36,12 +44,20 @@ def build_tts_request(
     if not ref.ref_audio_path.strip():
         raise GPTSoVITSError("GPT-SoVITS ref_audio_path must not be empty.")
     options = options or GPTSoVITSTTSOptions()
+    text_lang = normalize_api_language_code(options.text_lang)
+    prompt_lang = normalize_api_language_code(ref.prompt_lang or "ja")
+    if contains_hangul(text) and text_lang != "all_ko":
+        raise GPTSoVITSError(
+            "Korean TTS text must use text_lang='all_ko', got "
+            f"{text_lang!r}. Set GPTSoVITSTTSOptions(text_lang='ko') or fix "
+            "segment.script.tts_language."
+        )
     return GPTSoVITSTTSRequest(
         text=text,
-        text_lang=normalize_api_language_code(options.text_lang),
+        text_lang=text_lang,
         ref_audio_path=ref.ref_audio_path,
         prompt_text=ref.prompt_text,
-        prompt_lang=normalize_api_language_code(ref.prompt_lang or "ja"),
+        prompt_lang=prompt_lang,
         aux_ref_audio_paths=list(ref.aux_ref_audio_paths),
         top_k=options.top_k,
         top_p=options.top_p,

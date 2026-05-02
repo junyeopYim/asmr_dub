@@ -129,11 +129,22 @@ def test_full_real_applies_high_quality_preset_by_default(
     cfg = load_project_config(project)
     assert cfg.target_language == "ko"
     assert cfg.candidate_count == 3
-    assert cfg.duration_tolerance == 0.15
+    assert cfg.duration_tolerance == 0.25
     assert cfg.gsv_few_shot_target_sec == 180.0
     assert cfg.gsv_few_shot_min_clip_sec == 2.0
     assert cfg.gsv_few_shot_max_clip_sec == 8.0
     assert cfg.gsv_concurrency == 3
+    assert cfg.gsv_tts_min_speed_factor == 0.92
+    assert cfg.gsv_tts_max_speed_factor == 1.0
+    assert cfg.gsv_top_k == 8
+    assert cfg.gsv_top_p == 0.9
+    assert cfg.gsv_temperature == 0.7
+    assert cfg.gsv_text_split_method == "cut0"
+    assert cfg.gsv_parallel_infer is False
+    assert cfg.gsv_repetition_penalty == 1.25
+    assert cfg.gsv_sample_steps == 32
+    assert cfg.gsv_super_sampling is True
+    assert cfg.gsv_min_chunk_length == 8
     assert cfg.gemma_llama_cpp_ctx_size == 16384
     assert cfg.gemma_text_batch_size == 1
     assert cfg.gemma_text_concurrency == 4
@@ -153,6 +164,10 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.rvc_train_feature_workers == 0
     assert cfg.rvc_train_save_every_epoch == 50
     assert cfg.rvc_train_reuse_intermediate_cache is True
+    assert cfg.rvc_concurrency == 4
+    assert cfg.rvc_batch_infer is True
+    assert cfg.rvc_batch_size == 200
+    assert cfg.rvc_batch_concurrency == 1
     assert "{sample_rate}" in cfg.rvc_train_command
     assert "{batch_size}" in cfg.rvc_train_command
     assert "{preprocess_processes}" in cfg.rvc_train_command
@@ -162,6 +177,8 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert "{reuse_intermediate_cache}" in cfg.rvc_train_command
     assert cfg.rvc_command
     assert str(fake_repo / "asmr_dub_pipeline/rvc/webui_infer.py") in cfg.rvc_command
+    assert cfg.rvc_batch_command
+    assert str(fake_repo / "asmr_dub_pipeline/rvc/webui_batch_infer.py") in cfg.rvc_batch_command
     assert cfg.rvc_failure_policy == "retry_then_error"
     assert cfg.rvc_allow_pre_rvc_fallback is False
     kwargs = captured["kwargs"]
@@ -206,6 +223,43 @@ def test_full_real_use_trained_gpt_flag_passes_to_pipeline(
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["use_trained_gpt"] is True
+
+
+def test_full_real_asr_backend_flag_passes_to_pipeline(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "full_real_qwen_asr"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--real",
+            "--asr-backend",
+            "qwen_asr",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["asr_backend"] == "qwen_asr"
 
 
 def test_mix_requires_completed_qc(tiny_wav_path: Path, tmp_project_dir: Path) -> None:

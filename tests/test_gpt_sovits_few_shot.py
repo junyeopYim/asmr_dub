@@ -12,7 +12,7 @@ from conftest import write_tiny_wav
 
 from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.gpt_sovits import few_shot
-from asmr_dub_pipeline.gpt_sovits.client import build_tts_request
+from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSError, build_tts_request
 from asmr_dub_pipeline.gpt_sovits.few_shot import (
     build_training_dataset,
     discover_install,
@@ -321,7 +321,7 @@ def test_few_shot_fingerprint_changes_when_training_audio_changes(tmp_project_di
     assert second.reused_existing is False
 
 
-def test_synth_loads_few_shot_weights_from_manifest(
+def test_synth_rejects_korean_few_shot_gpt_policy_from_manifest(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -364,7 +364,6 @@ def test_synth_loads_few_shot_weights_from_manifest(
     )
     save_manifest(tmp_project_dir, manifest)
     calls: list[tuple[str, str]] = []
-    prompt_texts: list[str] = []
 
     class FakeClient:
         def __init__(self, *args, **kwargs) -> None:
@@ -379,7 +378,6 @@ def test_synth_loads_few_shot_weights_from_manifest(
             return "success"
 
         def build_payload(self, text, ref, options=None):
-            prompt_texts.append(ref.prompt_text)
             return build_tts_request(text, ref, options)
 
         def synthesize_to_file(self, request, output_path: Path) -> Path:
@@ -388,16 +386,53 @@ def test_synth_loads_few_shot_weights_from_manifest(
 
     monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
 
-    synth_step(
-        tmp_project_dir,
-        gsv_url="http://gsv.local",
-        refs_path=tmp_project_dir / "refs" / "refs.json",
-        mock=False,
-        confirm_rights=True,
+    with pytest.raises(GPTSoVITSError, match="base_for_korean"):
+        synth_step(
+            tmp_project_dir,
+            gsv_url="http://gsv.local",
+            refs_path=tmp_project_dir / "refs" / "refs.json",
+            mock=False,
+            confirm_rights=True,
+        )
+
+    assert calls == []
+
+
+def test_resolve_gpt_weights_rejects_project_few_shot_gpt_for_korean_tts(
+    tmp_project_dir: Path,
+) -> None:
+    gpt = tmp_project_dir / "work" / "gpt_sovits" / "few_shot" / "weights" / "gpt" / "final.ckpt"
+    external_gpt = tmp_project_dir / "models" / "korean-compatible.ckpt"
+    manifest = PipelineManifest(
+        artifacts={"gsv_few_shot_gpt_weights": str(gpt)},
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0.0,
+                end=1.0,
+                duration=1.0,
+                audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+                script=JapaneseScript(ja_text="こんにちは", tts_text="안녕하세요", tts_language="ko"),
+            )
+        ],
     )
 
-    assert calls[:2] == [("gpt", str(gpt)), ("sovits", str(sovits))]
-    assert prompt_texts and prompt_texts[0]
+    cfg = ProjectConfig(project_name="test", gsv_gpt_weights_policy="few_shot")
+    with pytest.raises(GPTSoVITSError, match="base_for_korean"):
+        steps._resolve_gpt_weights_for_tts(tmp_project_dir, manifest, cfg, None, {})
+
+    explicit_cfg = ProjectConfig(project_name="test", gsv_gpt_weights_path=str(gpt))
+    with pytest.raises(GPTSoVITSError, match="base_for_korean"):
+        steps._resolve_gpt_weights_for_tts(tmp_project_dir, manifest, explicit_cfg, None, {})
+
+    external_cfg = ProjectConfig(project_name="test", gsv_gpt_weights_path=str(external_gpt))
+    model_switch: dict[str, str] = {}
+    assert (
+        steps._resolve_gpt_weights_for_tts(tmp_project_dir, manifest, external_cfg, None, model_switch)
+        == str(external_gpt)
+    )
+    assert model_switch["gpt_weights_mode"] == "explicit"
 
 
 @pytest.mark.parametrize("use_trained_gpt", [False, True])
@@ -490,6 +525,20 @@ def test_synth_gpt_selection_for_korean_few_shot_voice(
 
     monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
 
+    if use_trained_gpt:
+        with pytest.raises(GPTSoVITSError, match="base_for_korean"):
+            synth_step(
+                tmp_project_dir,
+                gsv_url="http://gsv.local",
+                refs_path=tmp_project_dir / "refs" / "refs.json",
+                mock=False,
+                confirm_rights=True,
+                use_trained_gpt=use_trained_gpt,
+            )
+        assert calls == []
+        assert payloads == []
+        return
+
     synth_step(
         tmp_project_dir,
         gsv_url="http://gsv.local",
@@ -499,12 +548,109 @@ def test_synth_gpt_selection_for_korean_few_shot_voice(
         use_trained_gpt=use_trained_gpt,
     )
 
-    expected_gpt = gpt if use_trained_gpt else base_gpt
-    assert calls[:2] == [("gpt", str(expected_gpt)), ("sovits", str(sovits))]
+    assert calls[:2] == [("gpt", str(base_gpt)), ("sovits", str(sovits))]
     assert payloads[0]["text"] == "안녕하세요"
     assert payloads[0]["text_lang"] == "all_ko"
     assert payloads[0]["prompt_lang"] == "all_ja"
     assert payloads[0]["prompt_text"]
+    manifest = load_manifest(tmp_project_dir)
+    candidate_payload = manifest.segments[0].tts.candidates[0].payload
+    assert candidate_payload["text_lang"] == "all_ko"
+    assert candidate_payload["prompt_lang"] == "all_ja"
+    assert candidate_payload["speed_factor"] == payloads[0]["speed_factor"]
+    assert candidate_payload["top_k"] == payloads[0]["top_k"]
+
+
+def test_synth_uses_project_gsv_pronunciation_options(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_tts_min_speed_factor=0.92,
+        gsv_tts_max_speed_factor=1.0,
+        gsv_top_k=8,
+        gsv_top_p=0.9,
+        gsv_temperature=0.7,
+        gsv_text_split_method="cut0",
+        gsv_parallel_infer=False,
+        gsv_repetition_penalty=1.25,
+        gsv_sample_steps=32,
+        gsv_super_sampling=True,
+        gsv_overlap_length=2,
+        gsv_min_chunk_length=8,
+        gsv_fragment_interval=0.3,
+    )
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.2,
+        duration=1.2,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio),
+        source_script=SourceScript(text="こんにちは", language="ja", backend="mock", start=0.0, end=1.2),
+        script=JapaneseScript(
+            literal_ja="こんにちは",
+            ja_text="こんにちは",
+            tts_text="안녕하세요",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+            expected_tts_duration_sec=1.2,
+        ),
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    payloads: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            request = build_tts_request(text, ref, options)
+            payloads.append(request.as_payload())
+            return request
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            write_tiny_wav(output_path, duration=1.2)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://gsv.local",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    assert payloads
+    payload = payloads[0]
+    assert payload["top_k"] == 8
+    assert payload["top_p"] == 0.9
+    assert payload["temperature"] == 0.7
+    assert payload["text_split_method"] == "cut0"
+    assert payload["parallel_infer"] is False
+    assert payload["repetition_penalty"] == 1.25
+    assert payload["sample_steps"] == 32
+    assert payload["super_sampling"] is True
+    assert payload["overlap_length"] == 2
+    assert payload["min_chunk_length"] == 8
+    assert payload["fragment_interval"] == 0.3
+    assert payload["speed_factor"] <= cfg.gsv_tts_max_speed_factor
 
 
 def test_synth_switches_gpt_and_sovits_weights_per_voice_bank_speaker(
@@ -551,6 +697,7 @@ def test_synth_switches_gpt_and_sovits_weights_per_voice_bank_speaker(
     )
     save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
     segments: list[Segment] = []
+    spoken_numbers = ["일", "이", "삼"]
     for index, speaker_id in enumerate(("speaker_0001", "speaker_0002", "speaker_0001"), start=1):
         audio = tmp_project_dir / "work" / "segments" / "audio" / f"seg_{index:04d}_mix.wav"
         write_tiny_wav(audio)
@@ -567,7 +714,7 @@ def test_synth_switches_gpt_and_sovits_weights_per_voice_bank_speaker(
                 script=JapaneseScript(
                     literal_ja="こんにちは",
                     ja_text="こんにちは",
-                    tts_text=f"안녕하세요 {index}",
+                    tts_text=f"안녕하세요 {spoken_numbers[index - 1]}",
                     tts_language="ko",
                     source_language="ja",
                     target_language="ko",
@@ -701,11 +848,12 @@ def test_synth_uses_three_gsv_lanes_by_segment_id(
     ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
     write_tiny_wav(ref_audio)
     segments: list[Segment] = []
+    spoken_numbers = ["일", "이", "삼", "사", "오", "육"]
     for index in range(1, 7):
         audio = tmp_project_dir / "work" / "segments" / "audio" / f"seg_{index:04d}_mix.wav"
         write_tiny_wav(audio)
         source_text = f"テスト {index}"
-        tts_text = f"테스트 {index}"
+        tts_text = f"테스트 {spoken_numbers[index - 1]}"
         segments.append(
             Segment(
                 id=f"seg_{index:04d}",
@@ -763,12 +911,12 @@ def test_synth_uses_three_gsv_lanes_by_segment_id(
     )
 
     by_text = dict(calls)
-    assert by_text["테스트 1"] == "http://127.0.0.1:9880"
-    assert by_text["테스트 2"] == "http://127.0.0.1:9881"
-    assert by_text["테스트 3"] == "http://127.0.0.1:9882"
-    assert by_text["테스트 4"] == "http://127.0.0.1:9880"
-    assert by_text["테스트 5"] == "http://127.0.0.1:9881"
-    assert by_text["테스트 6"] == "http://127.0.0.1:9882"
+    assert by_text["테스트 일"] == "http://127.0.0.1:9880"
+    assert by_text["테스트 이"] == "http://127.0.0.1:9881"
+    assert by_text["테스트 삼"] == "http://127.0.0.1:9882"
+    assert by_text["테스트 사"] == "http://127.0.0.1:9880"
+    assert by_text["테스트 오"] == "http://127.0.0.1:9881"
+    assert by_text["테스트 육"] == "http://127.0.0.1:9882"
     manifest = load_manifest(tmp_project_dir)
     assert manifest.stage_state["synth"]["concurrency"] == 3
 

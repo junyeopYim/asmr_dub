@@ -7,7 +7,13 @@ from asmr_dub_pipeline.schemas import JapaneseScript
 
 KANA_RE = re.compile(r"[\u3040-\u30ff]")
 HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
-BRACKETED_RE = re.compile(r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|（[^）]*）|【[^】]*】)")
+LATIN_RE = re.compile(r"[A-Za-z]")
+DIGIT_RE = re.compile(r"\d")
+PRONUNCIATION_SYMBOL_RE = re.compile(r"[^\uac00-\ud7a3\s,.!?…]")
+BRACKETED_RE = re.compile(
+    r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|（[^）]*）|【[^】]*】|｛[^｝]*｝|〈[^〉]*〉|《[^》]*》)"
+)
+KOREAN_LONG_CLAUSE_MAX_CHARS = 44
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,26 @@ def has_bracketed_direction(text: str) -> bool:
     return bool(BRACKETED_RE.search(text))
 
 
+def has_latin(text: str) -> bool:
+    return bool(LATIN_RE.search(text))
+
+
+def has_digit(text: str) -> bool:
+    return bool(DIGIT_RE.search(text))
+
+
+def has_pronunciation_symbol(text: str) -> bool:
+    return bool(PRONUNCIATION_SYMBOL_RE.search(text))
+
+
+def has_long_korean_clause(text: str, max_chars: int = KOREAN_LONG_CLAUSE_MAX_CHARS) -> bool:
+    for clause in re.split(r"[,.!?…]+", text):
+        speech_len = sum(1 for char in clause if not char.isspace())
+        if speech_len > max_chars:
+            return True
+    return False
+
+
 def hangul_ratio(text: str) -> float:
     speech_chars = [char for char in text if not char.isspace() and not char.isdigit()]
     if not speech_chars:
@@ -67,6 +93,14 @@ def preflight_tts_text(
             issues.append("korean_tts_contains_kana")
         if has_bracketed_direction(text):
             issues.append("korean_tts_contains_stage_direction")
+        if has_latin(text):
+            issues.append("korean_tts_contains_latin")
+        if has_digit(text):
+            issues.append("korean_tts_contains_digit")
+        if has_pronunciation_symbol(text):
+            issues.append("korean_tts_contains_pronunciation_symbol")
+        if has_long_korean_clause(text):
+            issues.append("korean_tts_long_clause_without_pause")
         ratio = hangul_ratio(text)
         if source_text.strip() and text == source_text.strip():
             issues.append("korean_tts_matches_source_japanese")

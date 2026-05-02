@@ -21,9 +21,84 @@ TOKEN_REPLACEMENTS = {
     "ASMR": "エーエスエムアール",
     "OK": "オーケー",
 }
-KOREAN_TOKEN_REPLACEMENTS = {
-    "ASMR": "에이에스엠알",
-    "OK": "오케이",
+KOREAN_LATIN_TOKEN_REPLACEMENTS = {
+    "ai": "에이아이",
+    "asmr": "에이에스엠알",
+    "gpt": "지피티",
+    "gpt-sovits": "지피티 소비츠",
+    "ok": "오케이",
+    "rvc": "알브이씨",
+    "sns": "에스엔에스",
+    "sovits": "소비츠",
+    "tts": "티티에스",
+    "url": "유알엘",
+    "usb": "유에스비",
+}
+KOREAN_LATIN_LETTERS = {
+    "A": "에이",
+    "B": "비",
+    "C": "씨",
+    "D": "디",
+    "E": "이",
+    "F": "에프",
+    "G": "지",
+    "H": "에이치",
+    "I": "아이",
+    "J": "제이",
+    "K": "케이",
+    "L": "엘",
+    "M": "엠",
+    "N": "엔",
+    "O": "오",
+    "P": "피",
+    "Q": "큐",
+    "R": "알",
+    "S": "에스",
+    "T": "티",
+    "U": "유",
+    "V": "브이",
+    "W": "더블유",
+    "X": "엑스",
+    "Y": "와이",
+    "Z": "제트",
+}
+KOREAN_LATIN_DIGITS = {
+    "0": "영",
+    "1": "일",
+    "2": "이",
+    "3": "삼",
+    "4": "사",
+    "5": "오",
+    "6": "육",
+    "7": "칠",
+    "8": "팔",
+    "9": "구",
+}
+KOREAN_SYMBOL_REPLACEMENTS = {
+    "&": " 그리고 ",
+    "@": " 골뱅이 ",
+    "%": " 퍼센트 ",
+    "+": " 플러스 ",
+    "=": " 는 ",
+    "/": " 슬래시 ",
+    "\\": " 슬래시 ",
+    "#": " 샵 ",
+    "$": " 달러 ",
+    "€": " 유로 ",
+    "₩": " 원 ",
+    "°": " 도 ",
+    "~": " ",
+    "-": " ",
+    "_": " ",
+    "|": " ",
+    ":": ", ",
+    ";": ", ",
+    '"': " ",
+    "'": " ",
+    "*": " ",
+    "`": " ",
+    "<": " ",
+    ">": " ",
 }
 NUMBER_UNITS = {
     "1": "いっ",
@@ -63,6 +138,9 @@ KOREAN_PUNCT_TRANSLATION = str.maketrans(
 SPACE_RE = re.compile(r"[\s\u3000]+")
 JAPANESE_PUNCT_RE = re.compile(r"\s*([、。！？])\s*")
 KOREAN_PUNCT_RE = re.compile(r"\s*([,.!?])\s*")
+KOREAN_LATIN_TOKEN_RE = re.compile(r"[A-Za-z]+(?:[-_][A-Za-z]+)*")
+KOREAN_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+KOREAN_LONG_CLAUSE_MAX_CHARS = 44
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -146,6 +224,144 @@ def _normalize_numbers(text: str) -> tuple[str, list[str]]:
     return re.sub(r"(\d+)(分|秒)", repl, text), risk_flags
 
 
+def _integer_to_korean(value: int) -> str:
+    if value == 0:
+        return "영"
+    if value >= 100_000:
+        return "".join(KOREAN_LATIN_DIGITS[digit] for digit in str(value))
+    if value >= 10_000:
+        quotient, remainder = divmod(value, 10_000)
+        prefix = "" if quotient == 1 else _integer_to_korean(quotient)
+        return prefix + "만" + (_integer_to_korean(remainder) if remainder else "")
+    pieces: list[str] = []
+    for unit_value, unit_name in ((1000, "천"), (100, "백"), (10, "십")):
+        quotient, value = divmod(value, unit_value)
+        if quotient:
+            pieces.append(("" if quotient == 1 else KOREAN_LATIN_DIGITS[str(quotient)]) + unit_name)
+    if value:
+        pieces.append(KOREAN_LATIN_DIGITS[str(value)])
+    return "".join(pieces)
+
+
+def _korean_digits_to_speech(digits: str) -> str:
+    if len(digits) > 1 and digits.startswith("0"):
+        return "".join(KOREAN_LATIN_DIGITS[digit] for digit in digits)
+    return _integer_to_korean(int(digits or "0"))
+
+
+def _korean_number_to_speech(token: str) -> str:
+    whole, dot, fraction = token.partition(".")
+    spoken = _korean_digits_to_speech(whole)
+    if dot:
+        spoken += "점" + "".join(KOREAN_LATIN_DIGITS[digit] for digit in fraction)
+    return spoken
+
+
+def _normalize_korean_numbers(text: str) -> tuple[str, list[str]]:
+    risk_flags: list[str] = []
+
+    def repl(match: re.Match[str]) -> str:
+        risk_flags.append("normalized_numeric_token")
+        return _korean_number_to_speech(match.group(0))
+
+    return KOREAN_NUMBER_RE.sub(repl, text), risk_flags
+
+
+def _spell_korean_latin_component(component: str) -> str:
+    replacement = KOREAN_LATIN_TOKEN_REPLACEMENTS.get(component.lower())
+    if replacement:
+        return replacement
+    return "".join(KOREAN_LATIN_LETTERS[char.upper()] for char in component if char.upper() in KOREAN_LATIN_LETTERS)
+
+
+def _korean_latin_token_to_speech(token: str) -> str:
+    key = token.lower().replace("_", "-")
+    replacement = KOREAN_LATIN_TOKEN_REPLACEMENTS.get(key)
+    if replacement:
+        return replacement
+    components = re.split(r"[-_]+", token)
+    return " ".join(_spell_korean_latin_component(component) for component in components if component)
+
+
+def _normalize_korean_latin_tokens(text: str) -> tuple[str, list[str]]:
+    risk_flags: list[str] = []
+
+    def repl(match: re.Match[str]) -> str:
+        risk_flags.append("normalized_latin_token")
+        return _korean_latin_token_to_speech(match.group(0))
+
+    return KOREAN_LATIN_TOKEN_RE.sub(repl, text), risk_flags
+
+
+def _normalize_korean_symbols(text: str) -> tuple[str, list[str]]:
+    risk_flags: list[str] = []
+    out: list[str] = []
+    for char in text:
+        replacement = KOREAN_SYMBOL_REPLACEMENTS.get(char)
+        if replacement is None:
+            out.append(char)
+            continue
+        risk_flags.append("normalized_symbol_token")
+        out.append(replacement)
+    return "".join(out), risk_flags
+
+
+def _korean_clause_speech_len(text: str) -> int:
+    return sum(1 for char in text if not char.isspace() and char not in ".,!?…")
+
+
+def _split_korean_clause(clause: str, max_chars: int) -> list[str]:
+    if _korean_clause_speech_len(clause) <= max_chars:
+        return [clause.strip()]
+    words = clause.strip().split(" ")
+    if len(words) < 2:
+        return [clause.strip()]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for word in words:
+        word_len = _korean_clause_speech_len(word)
+        if current and current_len + word_len > max_chars:
+            chunks.append(" ".join(current).strip())
+            current = [word]
+            current_len = word_len
+            continue
+        current.append(word)
+        current_len += word_len
+    if current:
+        chunks.append(" ".join(current).strip())
+    return chunks
+
+
+def _split_long_korean_clauses(text: str) -> tuple[str, bool]:
+    parts: list[str] = []
+    current: list[str] = []
+    for char in text:
+        current.append(char)
+        if char in ".!?":
+            parts.append("".join(current))
+            current = []
+    if current:
+        parts.append("".join(current))
+
+    changed = False
+    out: list[str] = []
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+        terminal = stripped[-1] if stripped[-1] in ".!?" else ""
+        body = stripped[:-1].strip() if terminal else stripped
+        chunks = _split_korean_clause(body, KOREAN_LONG_CLAUSE_MAX_CHARS)
+        changed = changed or len(chunks) > 1
+        for index, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            ending = terminal if index == len(chunks) - 1 else ","
+            out.append(chunk + ending)
+    return " ".join(out), changed
+
+
 def _normalize_punctuation_and_space(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = SPACE_RE.sub(" ", text)
@@ -178,8 +394,12 @@ def _normalize_korean_punctuation_and_space(text: str) -> str:
 def normalize_korean_tts_text(text: str) -> NormalizedScriptText:
     without_brackets, cues = extract_bracketed_cues(text)
     risk_flags: list[str] = []
-    for token, replacement in KOREAN_TOKEN_REPLACEMENTS.items():
-        without_brackets = without_brackets.replace(token, replacement)
+    without_brackets, latin_flags = _normalize_korean_latin_tokens(without_brackets)
+    risk_flags.extend(latin_flags)
+    without_brackets, number_flags = _normalize_korean_numbers(without_brackets)
+    risk_flags.extend(number_flags)
+    without_brackets, symbol_flags = _normalize_korean_symbols(without_brackets)
+    risk_flags.extend(symbol_flags)
     out_chars: list[str] = []
     for idx, char in enumerate(without_brackets):
         if char in HEARTS:
@@ -198,6 +418,9 @@ def normalize_korean_tts_text(text: str) -> NormalizedScriptText:
             continue
         out_chars.append(char)
     normalized = _normalize_korean_punctuation_and_space("".join(out_chars))
+    normalized, split_long_clause = _split_long_korean_clauses(normalized)
+    if split_long_clause:
+        risk_flags.append("split_long_korean_clause")
     if normalized != text.strip():
         risk_flags.append("normalized_tts_text")
     if not normalized:

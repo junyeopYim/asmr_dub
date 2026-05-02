@@ -24,7 +24,12 @@ DEFAULT_LLAMA_CPP_DIR = (
     / "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive"
 )
 DEFAULT_LLAMA_CPP_MODEL = (
-    DEFAULT_LLAMA_CPP_DIR / "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
+    Path(".cache")
+    / "llama_cpp"
+    / "models"
+    / "mudler"
+    / "gemma-4-26B-A4B-it-heretic-APEX-GGUF"
+    / "gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf"
 )
 DEFAULT_LLAMA_CPP_MMPROJ = (
     DEFAULT_LLAMA_CPP_DIR / "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf"

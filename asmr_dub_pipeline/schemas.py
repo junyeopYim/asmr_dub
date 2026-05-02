@@ -242,8 +242,8 @@ class ProjectConfig(StrictBaseModel):
         ".cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli"
     )
     gemma_llama_cpp_model_path: str = (
-        ".cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/"
-        "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
+        ".cache/llama_cpp/models/mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF/"
+        "gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf"
     )
     gemma_llama_cpp_mmproj_path: str = (
         ".cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/"
@@ -256,10 +256,28 @@ class ProjectConfig(StrictBaseModel):
     gemma_llama_cpp_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     gemma_llama_cpp_seed: int = 12345
     gemma_llama_cpp_extra_args: list[str] = Field(default_factory=list)
-    asr_backend: Literal["mock", "faster_whisper"] = "faster_whisper"
-    asr_model_id: str = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+    asr_backend: Literal["mock", "faster_whisper", "qwen_asr"] = "faster_whisper"
+    asr_model_id: str = "Systran/faster-whisper-large-v3"
     asr_language: str = "ja"
     asr_local_files_only: bool = True
+    qwen_asr_model_id: str = "Qwen/Qwen3-ASR-1.7B"
+    qwen_asr_forced_aligner_model_id: str | None = "Qwen/Qwen3-ForcedAligner-0.6B"
+    qwen_asr_device_map: str = "cuda:0"
+    qwen_asr_dtype: str = "bfloat16"
+    qwen_asr_return_timestamps: bool = True
+    qwen_asr_context: str = ""
+    qwen_asr_max_inference_batch_size: int = Field(default=8, ge=1)
+    qwen_asr_max_new_tokens: int = Field(default=4096, ge=1)
+    qwen_tts_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    qwen_tts_candidate_count: int = Field(default=4, ge=1, le=8)
+    qwen_tts_device_map: str = "cuda:0"
+    qwen_tts_dtype: str = "bfloat16"
+    qwen_tts_attn_implementation: str = "flash_attention_2"
+    qwen_tts_local_files_only: bool = True
+    qwen_tts_temperature: float = Field(default=0.65, ge=0.0, le=2.0)
+    qwen_tts_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
+    qwen_tts_max_new_tokens: int = Field(default=4096, ge=1)
+    qwen_tts_x_vector_only_mode: bool = False
     asr_resegment_from_chunks: bool = True
     asr_resegment_min_sec: float = Field(default=0.8, gt=0)
     asr_resegment_merge_gap_sec: float = Field(default=0.45, ge=0)
@@ -269,7 +287,9 @@ class ProjectConfig(StrictBaseModel):
     gemma_text_server_url: str = "http://127.0.0.1:8080"
     gemma_text_server_auto_start: bool = True
     gemma_text_server_command: list[str] = Field(default_factory=list)
-    gemma_text_batch_size: int = Field(default=1, ge=1, le=200)
+    gemma_text_batch_size: int = Field(default=12, ge=1, le=200)
+    gemma_text_context_radius: int = Field(default=4, ge=0, le=20)
+    gemma_text_two_pass: bool = True
     gemma_text_concurrency: int = Field(default=4, ge=1, le=8)
     gemma_text_n_predict: int = Field(default=2048, ge=64)
     gemma_text_timeout_sec: float = Field(default=180.0, gt=0)
@@ -302,6 +322,17 @@ class ProjectConfig(StrictBaseModel):
     gsv_ref_max_sec: float = Field(default=10.0, gt=0)
     gsv_ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
     gsv_ko_text_min_hangul_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
+    gsv_top_k: int = Field(default=15, ge=1)
+    gsv_top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    gsv_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    gsv_text_split_method: str = Field(default="cut5", min_length=1)
+    gsv_parallel_infer: bool = True
+    gsv_repetition_penalty: float = Field(default=1.35, ge=0.0, le=5.0)
+    gsv_sample_steps: int = Field(default=32, ge=1)
+    gsv_super_sampling: bool = False
+    gsv_overlap_length: int = Field(default=2, ge=0)
+    gsv_min_chunk_length: int = Field(default=16, ge=1)
+    gsv_fragment_interval: float = Field(default=0.3, ge=0.0)
     gsv_tts_min_speed_factor: float = Field(default=0.85, gt=0.0, le=1.0)
     gsv_tts_max_speed_factor: float = Field(default=1.12, ge=1.0, le=1.35)
     gsv_few_shot_force: bool = False
@@ -349,6 +380,10 @@ class ProjectConfig(StrictBaseModel):
     rvc_train_output_model_path: str | None = None
     rvc_train_output_index_path: str | None = None
     rvc_command: list[str] = Field(default_factory=list)
+    rvc_batch_infer: bool = True
+    rvc_batch_command: list[str] = Field(default_factory=list)
+    rvc_batch_size: int = Field(default=200, ge=1, le=1000)
+    rvc_batch_concurrency: int = Field(default=1, ge=1, le=4)
     rvc_working_dir: str | None = None
     rvc_timeout_sec: float = Field(default=180.0, gt=0)
     rvc_concurrency: int = Field(default=1, ge=1, le=8)
@@ -532,7 +567,7 @@ class TTSCandidate(StrictBaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     output_path: str
     duration_sec: float | None = Field(default=None, ge=0)
-    backend: Literal["mock", "gpt-sovits"] = "mock"
+    backend: Literal["mock", "gpt-sovits", "qwen-tts"] = "mock"
     selected: bool = False
     error: str | None = None
     duration_ratio: float | None = Field(default=None, ge=0)
@@ -544,7 +579,7 @@ class TTSCandidate(StrictBaseModel):
 
 
 class TTSMetadata(StrictBaseModel):
-    backend: Literal["mock", "gpt-sovits"] = "mock"
+    backend: Literal["mock", "gpt-sovits", "qwen-tts"] = "mock"
     ref_style: str = "whisper_close"
     speed_factor: float = Field(default=1.0, gt=0)
     candidate_count: int = Field(default=1, ge=1)

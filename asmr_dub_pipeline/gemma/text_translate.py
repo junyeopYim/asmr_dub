@@ -149,21 +149,60 @@ def parse_translation_response(
     return parsed
 
 
-def _translation_prompt_payload(segments: Sequence[Segment], batch_id: str) -> dict[str, Any]:
+def _parse_literal_response(
+    text: str,
+    *,
+    batch_id: str,
+    model: str,
+) -> dict[str, KoreanTranslation]:
+    parsed: dict[str, KoreanTranslation] = {}
+    for item in _load_translation_items(text):
+        segment_id = str(item.get("segment_id") or "").strip()
+        if not segment_id:
+            raise GemmaTextTranslationError("Translation item missing segment_id.")
+        literal = str(item.get("ko_literal") or item.get("ko_natural") or "")
+        parsed[segment_id] = KoreanTranslation(
+            ko_literal=literal,
+            ko_natural=literal,
+            notes=_coerce_notes(item.get("notes")),
+            confidence=_coerce_confidence(item.get("confidence")),
+            model=str(item.get("model") or model),
+            batch_id=str(item.get("batch_id") or batch_id),
+        )
+    return parsed
+
+
+def _segment_prompt_item(segment: Segment) -> dict[str, Any]:
     return {
-        "batch_id": batch_id,
-        "segments": [
-            {
-                "segment_id": segment.id,
-                "start": segment.start,
-                "end": segment.end,
-                "duration": segment.duration,
-                "source_language": segment.source_script.language if segment.source_script else "ja",
-                "source_text": segment.source_script.text if segment.source_script else "",
-            }
-            for segment in segments
-        ],
+        "segment_id": segment.id,
+        "start": segment.start,
+        "end": segment.end,
+        "duration": segment.duration,
+        "source_language": segment.source_script.language if segment.source_script else "ja",
+        "source_text": segment.source_script.text if segment.source_script else "",
     }
+
+
+def _translation_prompt_payload(
+    segments: Sequence[Segment],
+    batch_id: str,
+    context_segments: Sequence[Segment] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "batch_id": batch_id,
+        "segments": [_segment_prompt_item(segment) for segment in segments],
+    }
+    if context_segments:
+        target_ids = {segment.id for segment in segments}
+        payload["context"] = [
+            {
+                **_segment_prompt_item(segment),
+                "is_target": segment.id in target_ids,
+            }
+            for segment in context_segments
+            if segment.source_script and segment.source_script.text.strip()
+        ]
+    return payload
 
 
 def _translation_quality_errors(
@@ -180,6 +219,8 @@ def _translation_quality_errors(
 def _translation_quality_error_map(
     segments: Sequence[Segment],
     translations: Mapping[str, KoreanTranslation],
+    *,
+    field: str = "ko_natural",
 ) -> dict[str, list[str]]:
     errors: dict[str, list[str]] = {}
     for segment in segments:
@@ -189,35 +230,88 @@ def _translation_quality_error_map(
         translation = translations.get(segment.id)
         if translation is None:
             continue
-        natural = translation.ko_natural.strip()
+        natural = getattr(translation, field).strip()
         if not natural:
-            errors.setdefault(segment.id, []).append(f"{segment.id}: ko_natural is empty")
+            errors.setdefault(segment.id, []).append(f"{segment.id}: {field} is empty")
             continue
         if _KANA_RE.search(natural):
             errors.setdefault(segment.id, []).append(
-                f"{segment.id}: ko_natural still contains Japanese kana"
+                f"{segment.id}: {field} still contains Japanese kana"
             )
         if not _NON_SPEECH_SOURCE_RE.fullmatch(source) and not _HANGUL_RE.search(natural):
             errors.setdefault(segment.id, []).append(
-                f"{segment.id}: ko_natural has no Hangul for Japanese source text"
+                f"{segment.id}: {field} has no Hangul for Japanese source text"
             )
         if len(source) >= 30 and len(natural) / max(len(source), 1) < 0.25:
             errors.setdefault(segment.id, []).append(
-                f"{segment.id}: ko_natural is too short for the source text"
+                f"{segment.id}: {field} is too short for the source text"
             )
     return errors
 
 
-def build_translate_ko_prompt(segments: Sequence[Segment], batch_id: str) -> str:
-    payload = _translation_prompt_payload(segments, batch_id)
+def build_translate_ko_prompt(
+    segments: Sequence[Segment],
+    batch_id: str,
+    context_segments: Sequence[Segment] | None = None,
+) -> str:
+    payload = _translation_prompt_payload(segments, batch_id, context_segments)
     return (
         "Return exactly one valid JSON array and no markdown. Translate Japanese ASMR source "
-        "text into Korean. Keep tone gentle and natural. Each array item must contain only "
+        "text into Korean. Keep tone gentle, natural, and conversational in polite spoken "
+        "Korean suitable for ASMR TTS. Each array item must contain only "
         "segment_id and ko_natural. ko_natural must be Korean Hangul prose; do not leave "
         "Japanese kana or untranslated Japanese particles in ko_natural. Do not include "
         "explanations, reasoning, analysis, notes, confidence, model, batch_id, or any text "
-        "outside the JSON array. For pure counts or non-speech tokens, preserving digits is "
-        "allowed. Translate the full source text without summarizing or dropping clauses.\n"
+        "outside the JSON array. Translate only the items in segments; use context only to "
+        "resolve names, pronouns, omitted subjects, and tone. For pure counts or non-speech "
+        "tokens, preserving digits is allowed. Translate the full source text without "
+        "summarizing or dropping clauses.\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_literal_translate_prompt(
+    segments: Sequence[Segment],
+    batch_id: str,
+    context_segments: Sequence[Segment] | None = None,
+) -> str:
+    payload = _translation_prompt_payload(segments, batch_id, context_segments)
+    return (
+        "Return exactly one valid JSON array and no markdown. First pass: translate the "
+        "Japanese ASMR source text into faithful Korean literal meaning. Each array item "
+        "must contain only segment_id and ko_literal. ko_literal must be Korean Hangul prose; "
+        "do not leave Japanese kana or untranslated Japanese particles. Do not polish into "
+        "final TTS copy yet. Translate only the items in segments; use context only to resolve "
+        "names, pronouns, omitted subjects, and tone. Preserve all clauses without summary.\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_naturalize_ko_prompt(
+    segments: Sequence[Segment],
+    batch_id: str,
+    literal_translations: Mapping[str, KoreanTranslation],
+    context_segments: Sequence[Segment] | None = None,
+) -> str:
+    payload = _translation_prompt_payload(segments, batch_id, context_segments)
+    payload["literal_translations"] = [
+        {
+            "segment_id": segment.id,
+            "source_text": segment.source_script.text if segment.source_script else "",
+            "ko_literal": literal_translations[segment.id].ko_literal,
+        }
+        for segment in segments
+        if segment.id in literal_translations
+    ]
+    return (
+        "Return exactly one valid JSON array and no markdown. Second pass: rewrite the "
+        "literal Korean translations into natural Korean ASMR TTS dialogue. Each array item "
+        "must contain only segment_id and ko_natural. ko_natural must be gentle, polite, "
+        "spoken Korean that can be read aloud naturally; split stiff written phrasing into "
+        "short breath-friendly wording when useful. Keep the meaning of ko_literal and the "
+        "source text; do not add new events, omit clauses, or leave Japanese kana. Translate "
+        "only the items in literal_translations; use context only for continuity of names, "
+        "pronouns, register, and tone.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -227,18 +321,20 @@ def build_repair_prompt(
     error: str,
     batch_id: str,
     segments: Sequence[Segment] | None = None,
+    context_segments: Sequence[Segment] | None = None,
+    output_field: str = "ko_natural",
 ) -> str:
     input_text = ""
     if segments is not None:
         input_text = (
             "\nOriginal input:\n"
-            f"{json.dumps(_translation_prompt_payload(segments, batch_id), ensure_ascii=False)}"
+            f"{json.dumps(_translation_prompt_payload(segments, batch_id, context_segments), ensure_ascii=False)}"
         )
     return (
         "Repair the previous response into exactly one valid JSON array. Each item must contain "
-        "only segment_id and ko_natural. ko_natural must be Korean Hangul prose with no Japanese "
-        "kana unless the source is only numbers or non-speech tokens. Translate the full source "
-        "text without summarizing. "
+        f"only segment_id and {output_field}. {output_field} must be Korean Hangul prose in polite "
+        "spoken conversational style with no Japanese kana unless the source is only numbers "
+        "or non-speech tokens. Translate the full source text without summarizing. "
         f"Batch id: {batch_id}. Validation error: {error}{input_text}\nPrevious response:\n"
         f"{bad_response[:6000]}"
     )
@@ -253,6 +349,7 @@ class LlamaServerTranslationClient:
         retries: int = 1,
         n_predict: int = 2048,
         model: str = "gemma4",
+        two_pass: bool = True,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -260,6 +357,7 @@ class LlamaServerTranslationClient:
         self.retries = retries
         self.n_predict = n_predict
         self.model = model
+        self.two_pass = two_pass
         self.client = client or httpx.Client(timeout=timeout_sec)
 
     def _complete(self, prompt: str, *, n_predict: int | None = None) -> str:
@@ -289,8 +387,16 @@ class LlamaServerTranslationClient:
             return data["content"]
         raise GemmaTextTranslationError("Gemma text server response did not include content.")
 
-    def translate_batch(self, segments: Sequence[Segment], batch_id: str) -> dict[str, KoreanTranslation]:
-        prompt = build_translate_ko_prompt(segments, batch_id)
+    def _translate_once(
+        self,
+        *,
+        segments: Sequence[Segment],
+        batch_id: str,
+        prompt: str,
+        parser: Any,
+        output_field: str,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> dict[str, KoreanTranslation]:
         raw_response = ""
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
@@ -298,9 +404,16 @@ class LlamaServerTranslationClient:
                 raw_response = self._complete(
                     prompt
                     if attempt == 0
-                    else build_repair_prompt(raw_response, str(last_error), batch_id, segments),
+                    else build_repair_prompt(
+                        raw_response,
+                        str(last_error),
+                        batch_id,
+                        segments,
+                        context_segments=context_segments,
+                        output_field=output_field,
+                    ),
                 )
-                translations = parse_translation_response(
+                translations = parser(
                     raw_response,
                     batch_id=batch_id,
                     model=self.model,
@@ -311,7 +424,11 @@ class LlamaServerTranslationClient:
                     for segment_id, translation in translations.items()
                     if segment_id in expected_ids
                 }
-                quality_error_map = _translation_quality_error_map(segments, translations)
+                quality_error_map = _translation_quality_error_map(
+                    segments,
+                    translations,
+                    field=output_field,
+                )
                 if quality_error_map:
                     quality_errors = [
                         error
@@ -343,12 +460,80 @@ class LlamaServerTranslationClient:
                 break
         raise GemmaTextTranslationError(f"Gemma text translation failed: {last_error}")
 
+    def _translate_batch_single_pass(
+        self,
+        segments: Sequence[Segment],
+        batch_id: str,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> dict[str, KoreanTranslation]:
+        return self._translate_once(
+            segments=segments,
+            batch_id=batch_id,
+            prompt=build_translate_ko_prompt(segments, batch_id, context_segments),
+            parser=parse_translation_response,
+            output_field="ko_natural",
+            context_segments=context_segments,
+        )
+
+    def _translate_batch_two_pass(
+        self,
+        segments: Sequence[Segment],
+        batch_id: str,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> dict[str, KoreanTranslation]:
+        literal_translations = self._translate_once(
+            segments=segments,
+            batch_id=f"{batch_id}_literal",
+            prompt=build_literal_translate_prompt(segments, batch_id, context_segments),
+            parser=_parse_literal_response,
+            output_field="ko_literal",
+            context_segments=context_segments,
+        )
+        natural_translations = self._translate_once(
+            segments=segments,
+            batch_id=f"{batch_id}_natural",
+            prompt=build_naturalize_ko_prompt(
+                segments,
+                batch_id,
+                literal_translations,
+                context_segments,
+            ),
+            parser=parse_translation_response,
+            output_field="ko_natural",
+            context_segments=context_segments,
+        )
+        return {
+            segment_id: natural.model_copy(
+                update={
+                    "ko_literal": literal_translations[segment_id].ko_literal,
+                    "batch_id": batch_id,
+                }
+            )
+            for segment_id, natural in natural_translations.items()
+            if segment_id in literal_translations
+        }
+
+    def translate_batch(
+        self,
+        segments: Sequence[Segment],
+        batch_id: str,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> dict[str, KoreanTranslation]:
+        if not self.two_pass:
+            return self._translate_batch_single_pass(segments, batch_id, context_segments)
+        return self._translate_batch_two_pass(segments, batch_id, context_segments)
+
 
 class MockTranslationClient:
     def __init__(self, model: str = "mock") -> None:
         self.model = model
 
-    def translate_batch(self, segments: Sequence[Segment], batch_id: str) -> dict[str, KoreanTranslation]:
+    def translate_batch(
+        self,
+        segments: Sequence[Segment],
+        batch_id: str,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> dict[str, KoreanTranslation]:
         result: dict[str, KoreanTranslation] = {}
         for segment in segments:
             result[segment.id] = KoreanTranslation(

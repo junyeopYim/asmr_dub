@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from inspect import signature
 from pathlib import Path
 from threading import Lock
 from time import monotonic
@@ -89,6 +90,7 @@ from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest,
 from asmr_dub_pipeline.pipeline.state import mark_stage
 from asmr_dub_pipeline.qc.audio_qc import measure_audio_qc
 from asmr_dub_pipeline.qc.scoring import score_qc
+from asmr_dub_pipeline.qwen_tts import QwenTTSClient, QwenTTSError, QwenTTSRequest, qwen_language
 from asmr_dub_pipeline.rights import (
     RightsError,
     ensure_inside_project,
@@ -100,8 +102,11 @@ from asmr_dub_pipeline.rights import (
     sha256_file,
 )
 from asmr_dub_pipeline.rvc import (
+    RVCBatchCommandClient,
+    RVCBatchJob,
     RVCCommandClient,
     RVCCommandError,
+    RVCCommandResult,
     RVCMockClient,
     RVCTrainCommandClient,
     RVCTrainMockClient,
@@ -122,6 +127,10 @@ from asmr_dub_pipeline.schemas import (
     TTSMetadata,
 )
 from asmr_dub_pipeline.script.duration_rewrite import rewrite_for_duration
+from asmr_dub_pipeline.script.korean_colloquial import (
+    COLLOQUIAL_REWRITE_NOTE,
+    colloquialize_korean_translation,
+)
 from asmr_dub_pipeline.script.normalizer import normalize_korean_tts_text, normalize_script_payload
 from asmr_dub_pipeline.script.text_qc import preflight_tts_text
 from asmr_dub_pipeline.voice_bank import (
@@ -247,6 +256,35 @@ def _manifest_tts_languages(manifest: PipelineManifest) -> set[str]:
     return languages
 
 
+def _segment_tts_text_language(segment: Segment, project_target_language: str) -> str:
+    script_language = _canonical_language(segment.script.tts_language if segment.script else None)
+    target_language = _canonical_language(project_target_language) or "ko"
+    if script_language == "ko" or target_language == "ko":
+        return "ko"
+    return script_language or target_language
+
+
+def _same_project_path(project_dir: Path, left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+
+    def resolve(raw: str) -> Path:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = project_dir / path
+        return path.resolve()
+
+    return resolve(left) == resolve(right)
+
+
+def _raise_unsafe_korean_few_shot_gpt() -> None:
+    raise GPTSoVITSError(
+        "Korean TTS cannot safely use the project's Japanese source-trained few-shot GPT "
+        "weights. Use gsv_gpt_weights_policy: auto or gsv_gpt_weights_policy: "
+        "base_for_korean, and keep few-shot SoVITS/RVC for timbre."
+    )
+
+
 def _resolve_manifest_path(project_dir: Path, value: str | None) -> Path | None:
     if not value:
         return None
@@ -295,15 +333,19 @@ def _resolve_gpt_weights_for_tts(
     model_switch: dict[str, str],
 ) -> str | None:
     policy = getattr(cfg, "gsv_gpt_weights_policy", "auto")
+    few_shot_gpt = manifest.artifacts.get(FEW_SHOT_ARTIFACT_GPT)
+    source_language = _canonical_language(getattr(cfg, "source_language", "ja"))
+    target_language = _canonical_language(getattr(cfg, "target_language", "ko"))
+    model_switch["source_language"] = source_language
+    model_switch["target_language"] = target_language
+    korean_tts_from_japanese_source = source_language == "ja" and target_language == "ko"
     configured = explicit_gpt_weights_path or cfg.gsv_gpt_weights_path
     if configured:
         model_switch["gpt_weights_mode"] = "explicit"
+        if korean_tts_from_japanese_source and _same_project_path(project_dir, configured, few_shot_gpt):
+            _raise_unsafe_korean_few_shot_gpt()
         return configured
 
-    few_shot_gpt = manifest.artifacts.get(FEW_SHOT_ARTIFACT_GPT)
-    target_language = _canonical_language(getattr(cfg, "target_language", "ko"))
-    model_switch["source_language"] = _canonical_language(getattr(cfg, "source_language", "ja"))
-    model_switch["target_language"] = target_language
     if policy == "unchanged":
         model_switch["gpt_weights_mode"] = "unchanged_by_policy"
         return None
@@ -312,7 +354,12 @@ def _resolve_gpt_weights_for_tts(
 
     languages = _manifest_tts_languages(manifest)
     model_switch["tts_languages"] = ",".join(sorted(languages)) if languages else "unknown"
-    if policy == "few_shot" or (target_language == "ja" and languages and languages <= {"ja"}):
+    if policy == "few_shot":
+        if korean_tts_from_japanese_source:
+            _raise_unsafe_korean_few_shot_gpt()
+        model_switch["gpt_weights_mode"] = "few_shot"
+        return few_shot_gpt
+    if target_language == "ja" and languages and languages <= {"ja"}:
         model_switch["gpt_weights_mode"] = "few_shot"
         return few_shot_gpt
 
@@ -413,6 +460,24 @@ def assign_speakers_step(
 def _ref_for_tts_language(ref: GPTSoVITSRef, tts_language: str) -> GPTSoVITSRef:
     _ = tts_language
     return ref
+
+
+def _tts_request_debug_payload(
+    text: str,
+    ref: GPTSoVITSRef,
+    options: GPTSoVITSTTSOptions,
+) -> dict[str, Any]:
+    return {
+        "text": text,
+        "text_lang": normalize_api_language_code(options.text_lang),
+        "prompt_text": ref.prompt_text,
+        "prompt_lang": normalize_api_language_code(ref.prompt_lang),
+        "seed": options.seed,
+        "speed_factor": options.speed_factor,
+        "top_k": options.top_k,
+        "top_p": options.top_p,
+        "temperature": options.temperature,
+    }
 
 
 def _can_rewrite_script_for_duration(script: JapaneseScript) -> bool:
@@ -637,6 +702,89 @@ def _log_translate_progress(
         f"[dim]  - 번역문: {escape(_log_text_snippet(translated_text))}[/dim]"
     )
     return now
+
+
+def _apply_korean_colloquial_postprocess(segments: list[Segment]) -> int:
+    rewritten_count = 0
+    for segment in segments:
+        translation = segment.translation_ko
+        if translation is None or not translation.ko_natural.strip():
+            continue
+        if COLLOQUIAL_REWRITE_NOTE in translation.notes:
+            continue
+        rewritten = colloquialize_korean_translation(translation)
+        if rewritten.ko_natural == translation.ko_natural:
+            continue
+        segment.translation_ko = rewritten
+        rewritten_count += 1
+    return rewritten_count
+
+
+def _refresh_translation_rows(rows: list[dict[str, Any]], segments: list[Segment]) -> None:
+    by_segment_id = {segment.id: segment for segment in segments}
+    for row in rows:
+        if row.get("status") != "translated":
+            continue
+        segment = by_segment_id.get(str(row.get("segment_id") or ""))
+        if segment is None or segment.translation_ko is None:
+            continue
+        row["translation_ko"] = segment.translation_ko.model_dump(mode="json")
+        row["colloquialized"] = COLLOQUIAL_REWRITE_NOTE in segment.translation_ko.notes
+
+
+def _translation_context_segments(
+    all_segments: list[Segment],
+    target_segments: list[Segment],
+    radius: int,
+) -> list[Segment]:
+    if not target_segments:
+        return []
+    if radius <= 0:
+        return [
+            segment
+            for segment in target_segments
+            if segment.source_script and segment.source_script.text.strip()
+        ]
+    indices_by_id = {segment.id: index for index, segment in enumerate(all_segments)}
+    target_indices = [
+        indices_by_id[segment.id]
+        for segment in target_segments
+        if segment.id in indices_by_id
+    ]
+    if not target_indices:
+        return target_segments
+    start = max(0, min(target_indices) - radius)
+    end = min(len(all_segments), max(target_indices) + radius + 1)
+    return [
+        segment
+        for segment in all_segments[start:end]
+        if segment.source_script and segment.source_script.text.strip()
+    ]
+
+
+def _client_accepts_context_segments(client: Any) -> bool:
+    try:
+        parameters = signature(client.translate_batch).parameters
+    except (TypeError, ValueError):
+        return False
+    return "context_segments" in parameters or any(
+        parameter.kind == parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _translate_with_optional_context(
+    client: Any,
+    segments: list[Segment],
+    batch_id: str,
+    context_segments: list[Segment],
+) -> dict[str, Any]:
+    if _client_accepts_context_segments(client):
+        return client.translate_batch(
+            segments,
+            batch_id,
+            context_segments=context_segments,
+        )
+    return client.translate_batch(segments, batch_id)
 
 
 def _resolve_project_read_path(project_dir: Path, raw_path: str, field_name: str) -> Path:
@@ -1071,6 +1219,14 @@ def _asr_backend_config(cfg: Any) -> dict[str, Any]:
         "model_id": cfg.asr_model_id,
         "language": cfg.asr_language,
         "local_files_only": cfg.asr_local_files_only,
+        "qwen_model_id": cfg.qwen_asr_model_id,
+        "qwen_forced_aligner_model_id": cfg.qwen_asr_forced_aligner_model_id,
+        "qwen_device_map": cfg.qwen_asr_device_map,
+        "qwen_dtype": cfg.qwen_asr_dtype,
+        "qwen_return_timestamps": cfg.qwen_asr_return_timestamps,
+        "qwen_context": cfg.qwen_asr_context,
+        "qwen_max_inference_batch_size": cfg.qwen_asr_max_inference_batch_size,
+        "qwen_max_new_tokens": cfg.qwen_asr_max_new_tokens,
     }
 
 
@@ -1302,6 +1458,7 @@ def translate_ko_step(
     project_dir: Path,
     gemma_text_backend: str | None = None,
     confirm_rights: bool = False,
+    force_retranslate: bool = False,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
@@ -1322,10 +1479,11 @@ def translate_ko_step(
     rows: list[dict[str, Any]] = []
     translated = 0
     needs_manual_review = 0
+    colloquialized = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
     for segment in manifest.segments:
-        if segment.translation_ko and segment.translation_ko.ko_natural.strip():
+        if segment.translation_ko and segment.translation_ko.ko_natural.strip() and not force_retranslate:
             translated += 1
             rows.append(
                 {
@@ -1338,6 +1496,8 @@ def translate_ko_step(
                 }
             )
         elif segment.source_script and segment.source_script.text.strip():
+            if force_retranslate:
+                segment.translation_ko = None
             translatable.append(segment)
         else:
             needs_manual_review += 1
@@ -1366,6 +1526,7 @@ def translate_ko_step(
                 retries=cfg.gemma_text_retries,
                 n_predict=cfg.gemma_text_n_predict,
                 model=model_name,
+                two_pass=cfg.gemma_text_two_pass,
             )
         return MockTranslationClient(model=model_name)
 
@@ -1404,7 +1565,11 @@ def translate_ko_step(
                 "segments": total,
                 "translated": translated,
                 "needs_manual_review": needs_manual_review,
+                "colloquialized": colloquialized,
                 "concurrency": translation_worker_count,
+                "context_radius": cfg.gemma_text_context_radius,
+                "two_pass": cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
+                "force_retranslate": force_retranslate,
                 "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
                 "partial": True,
             },
@@ -1426,8 +1591,20 @@ def translate_ko_step(
             translation_failures.setdefault(segment.id, []).append(message)
 
         def retry_single(missing_segment: Segment, retry_batch_id: str) -> None:
+            context_segments = _translation_context_segments(
+                manifest.segments,
+                [missing_segment],
+                cfg.gemma_text_context_radius,
+            )
             try:
-                translations.update(client.translate_batch([missing_segment], retry_batch_id))
+                translations.update(
+                    _translate_with_optional_context(
+                        client,
+                        [missing_segment],
+                        retry_batch_id,
+                        context_segments,
+                    )
+                )
             except Exception as exc:
                 message = f"Korean translation retry failed for {retry_batch_id}: {exc}"
                 record_failure(missing_segment, message)
@@ -1441,8 +1618,18 @@ def translate_ko_step(
         def translate_group(group: list[Segment], group_batch_id: str) -> None:
             if not group:
                 return
+            context_segments = _translation_context_segments(
+                manifest.segments,
+                group,
+                cfg.gemma_text_context_radius,
+            )
             try:
-                group_translations = client.translate_batch(group, group_batch_id)
+                group_translations = _translate_with_optional_context(
+                    client,
+                    group,
+                    group_batch_id,
+                    context_segments,
+                )
             except Exception as exc:
                 if backend_kind == "llama_server" and _is_gemma_text_server_unavailable(exc):
                     raise
@@ -1581,6 +1768,8 @@ def translate_ko_step(
         for server_manager in reversed(server_managers):
             server_manager.stop()
 
+    colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
+    _refresh_translation_rows(rows, manifest.segments)
     _write_jsonl_atomic(jsonl_path, rows)
     summary = {
         "backend": backend_kind,
@@ -1588,7 +1777,11 @@ def translate_ko_step(
         "segments": total,
         "translated": translated,
         "needs_manual_review": needs_manual_review,
+        "colloquialized": colloquialized,
         "concurrency": translation_worker_count,
+        "context_radius": cfg.gemma_text_context_radius,
+        "two_pass": cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
+        "force_retranslate": force_retranslate,
         "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
     }
     write_json_atomic(summary_path, summary)
@@ -1627,7 +1820,11 @@ def translate_ko_step(
         model=model_name,
         translated=translated,
         needs_manual_review=needs_manual_review,
+        colloquialized=colloquialized,
         concurrency=translation_worker_count,
+        context_radius=cfg.gemma_text_context_radius,
+        two_pass=cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
+        force_retranslate=force_retranslate,
         server=server_metadata,
     )
     save_manifest(project_dir, manifest)
@@ -2097,6 +2294,21 @@ def _tts_candidate_path(project_dir: Path, segment_id: str, candidate_index: int
     return project_dir / "work" / "tts" / "candidates" / f"{segment_id}_cand_{candidate_index}{suffix}.wav"
 
 
+def _qwen_tts_candidate_path(project_dir: Path, segment_id: str, candidate_index: int) -> Path:
+    return project_dir / "work" / "tts" / "qwen" / "candidates" / f"{segment_id}_qwen_cand_{candidate_index}.wav"
+
+
+def _qwen_tts_best_path(project_dir: Path, segment_id: str) -> Path:
+    return project_dir / "work" / "tts" / "qwen" / f"{segment_id}_qwen_best.wav"
+
+
+def _invalidate_downstream_after_tts_promotion(manifest: PipelineManifest) -> None:
+    for stage in ("rvc", "qc", "mix", "export"):
+        manifest.stage_state.pop(stage, None)
+    for artifact in ("rvc_manifest", "rvc", "qc", "mix", "export"):
+        manifest.artifacts.pop(artifact, None)
+
+
 def synth_step(
     project_dir: Path,
     gsv_url: str | None,
@@ -2314,10 +2526,22 @@ def synth_step(
             can_rewrite_for_duration = _can_rewrite_script_for_duration(segment.script)
             for candidate_index in range(cfg.candidate_count):
                 seed = cfg.base_seed + index * 100 + candidate_index
+                tts_text_language = _segment_tts_text_language(segment, target_language)
                 options = GPTSoVITSTTSOptions(
                     seed=seed,
                     speed_factor=speed,
-                    text_lang=target_language if target_language == "ko" else segment.script.tts_language,
+                    text_lang=tts_text_language,
+                    top_k=cfg.gsv_top_k,
+                    top_p=cfg.gsv_top_p,
+                    temperature=cfg.gsv_temperature,
+                    text_split_method=cfg.gsv_text_split_method,
+                    fragment_interval=cfg.gsv_fragment_interval,
+                    parallel_infer=cfg.gsv_parallel_infer,
+                    repetition_penalty=cfg.gsv_repetition_penalty,
+                    sample_steps=cfg.gsv_sample_steps,
+                    super_sampling=cfg.gsv_super_sampling,
+                    overlap_length=cfg.gsv_overlap_length,
+                    min_chunk_length=cfg.gsv_min_chunk_length,
                 )
                 attempt_signals: list[GPTSoVITSRetrySignal] = []
                 if has_repetition_or_omission_signal:
@@ -2356,6 +2580,7 @@ def synth_step(
                             "signals": retry_signal_values(attempt_signals),
                         },
                     }
+                    payload.update(_tts_request_debug_payload(attempt_text, synthesis_ref, options))
                     if mock:
                         mock_duration = max(0.05, expected / max(options.speed_factor, 0.01))
                         _mock_synthesize(candidate_path, mock_duration, options.seed, cfg.mix_sample_rate)
@@ -2364,12 +2589,6 @@ def synth_step(
                         payload.update(
                             {
                                 "mock": True,
-                                "text": attempt_text,
-                                "text_lang": normalize_api_language_code(options.text_lang),
-                                "prompt_text": synthesis_ref.prompt_text,
-                                "prompt_lang": normalize_api_language_code(synthesis_ref.prompt_lang),
-                                "seed": options.seed,
-                                "speed_factor": options.speed_factor,
                                 "repetition_penalty": options.repetition_penalty,
                             }
                         )
@@ -2646,6 +2865,331 @@ def synth_step(
     finally:
         for server_manager in reversed(server_managers):
             server_manager.stop()
+
+
+def synth_qwen_step(
+    project_dir: Path,
+    refs_path: Path,
+    confirm_rights: bool = False,
+    *,
+    model_id: str | None = None,
+    candidate_count: int | None = None,
+    promote: bool = False,
+    local_files_only: bool | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    total = len(manifest.segments)
+    effective_model_id = model_id or cfg.qwen_tts_model_id
+    effective_candidate_count = candidate_count or cfg.qwen_tts_candidate_count
+    effective_local_files_only = cfg.qwen_tts_local_files_only if local_files_only is None else local_files_only
+    _log_stage_start(
+        "synth-qwen",
+        f"model={effective_model_id}, segments={total}, candidates={effective_candidate_count}, promote={promote}",
+    )
+    refs = load_refs(refs_path, project_dir=project_dir)
+    actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
+    refs_metadata = _refs_audit_metadata(actual_refs_path, refs)
+    manifest.rights_audit = require_existing_or_confirmed_rights(
+        manifest.rights_audit,
+        confirm_rights,
+        "synth-qwen",
+        _manifest_source_path(manifest),
+        metadata={"backend": "qwen-tts", "model_id": effective_model_id, **refs_metadata},
+    )
+    use_speaker_refs = bool(cfg.gsv_speaker_models)
+    if use_speaker_refs:
+        _validate_gsv_speaker_models(project_dir, manifest)
+    client = QwenTTSClient(
+        model_id=effective_model_id,
+        device_map=cfg.qwen_tts_device_map,
+        dtype=cfg.qwen_tts_dtype,
+        attn_implementation=cfg.qwen_tts_attn_implementation,
+        local_files_only=effective_local_files_only,
+    )
+    source_language = _canonical_language(cfg.source_language)
+    target_language = _canonical_language(cfg.target_language)
+    started_at = monotonic()
+    last_logged_at = started_at
+    failed_segments: list[str] = []
+    promoted_segments: list[str] = []
+    speaker_refs_cache: dict[str, dict[str, GPTSoVITSRef]] = {}
+
+    for index, segment in enumerate(manifest.segments, start=1):
+        if not segment.script:
+            payload = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "error": "Cannot synthesize without script metadata.",
+            }
+            segment.analysis["qwen_tts"] = payload
+            if promote:
+                segment.status = "needs_manual_review"
+                segment.errors.append(payload["error"])
+                failed_segments.append(segment.id)
+            last_logged_at = _log_segment_progress(
+                "synth-qwen",
+                index,
+                total,
+                segment,
+                manifest,
+                started_at,
+                last_logged_at,
+            )
+            continue
+        if target_language == "ko":
+            preflight = preflight_tts_text(
+                segment.script,
+                target_language=target_language,
+                source_text=segment.source_script.text if segment.source_script else "",
+                min_hangul_ratio=cfg.gsv_ko_text_min_hangul_ratio,
+            )
+            segment.analysis["pre_synth_qwen_text_qc"] = preflight.as_payload()
+            if preflight.blocked:
+                payload = {
+                    "backend": "qwen-tts",
+                    "model_id": effective_model_id,
+                    "error": "Korean TTS preflight blocked synthesis: " + ", ".join(preflight.issues),
+                    "preflight": preflight.as_payload(),
+                }
+                segment.analysis["qwen_tts"] = payload
+                if promote:
+                    segment.status = "needs_manual_review"
+                    segment.errors.append(payload["error"])
+                    failed_segments.append(segment.id)
+                last_logged_at = _log_segment_progress(
+                    "synth-qwen",
+                    index,
+                    total,
+                    segment,
+                    manifest,
+                    started_at,
+                    last_logged_at,
+                )
+                continue
+
+        segment_refs = refs
+        requested_ref_style = segment.script.ref_style
+        resolved_ref_style = requested_ref_style if requested_ref_style in segment_refs else "whisper_close"
+        speaker_refs_path: Path | None = None
+        if use_speaker_refs and segment.speaker_id:
+            speaker_cfg = _gsv_speaker_cfg(cfg, segment)
+            if speaker_cfg is not None:
+                speaker_refs_path = _resolve_gsv_speaker_path(project_dir, speaker_cfg.refs_path)
+                cache_key = str(speaker_refs_path)
+                if cache_key not in speaker_refs_cache:
+                    speaker_refs_cache[cache_key] = load_refs(speaker_refs_path, project_dir)
+                segment_refs = speaker_refs_cache[cache_key]
+                if requested_ref_style not in segment_refs:
+                    requested_ref_style = speaker_cfg.default_ref_style
+                resolved_ref_style = requested_ref_style if requested_ref_style in segment_refs else "whisper_close"
+        ref = resolve_ref(segment_refs, requested_ref_style)
+        tts_text_language = _segment_tts_text_language(segment, target_language)
+        qwen_request_language = qwen_language(tts_text_language)
+        generation_kwargs = {
+            "temperature": cfg.qwen_tts_temperature,
+            "top_p": cfg.qwen_tts_top_p,
+            "max_new_tokens": cfg.qwen_tts_max_new_tokens,
+        }
+        candidates: list[TTSCandidate] = []
+        for candidate_index in range(effective_candidate_count):
+            seed = cfg.base_seed + index * 100 + candidate_index
+            candidate_path = _qwen_tts_candidate_path(project_dir, segment.id, candidate_index)
+            request = QwenTTSRequest(
+                text=segment.script.tts_text,
+                language=qwen_request_language,
+                ref_audio_path=ref.ref_audio_path,
+                ref_text=ref.prompt_text,
+                seed=seed,
+                x_vector_only_mode=cfg.qwen_tts_x_vector_only_mode,
+                generation_kwargs=generation_kwargs,
+            )
+            payload: dict[str, Any] = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "speaker_id": segment.speaker_id,
+                "requested_ref_style": segment.script.ref_style,
+                "resolved_ref_style": resolved_ref_style,
+                "fallback_used": resolved_ref_style != segment.script.ref_style,
+                "speaker_refs_path": str(speaker_refs_path) if speaker_refs_path else None,
+                "source_language": source_language,
+                "target_language": target_language,
+                "cross_lingual_voice_transfer": source_language != target_language,
+                "target_duration_sec": segment.duration,
+                "prompt_lang": ref.prompt_lang,
+                **request.as_payload(),
+            }
+            try:
+                result = client.synthesize_to_file(request, candidate_path)
+                if cfg.gsv_trim_edge_silence:
+                    trim = trim_edge_silence(
+                        candidate_path,
+                        threshold_db=cfg.gsv_trim_silence_threshold_db,
+                        keep_sec=cfg.gsv_trim_silence_keep_sec,
+                    )
+                    payload.setdefault("postprocess", {})["edge_silence_trim"] = trim
+                duration = duration_sec(candidate_path)
+                payload["sample_rate"] = result.sample_rate
+            except QwenTTSError as exc:
+                candidates.append(
+                    TTSCandidate(
+                        candidate_index=candidate_index,
+                        seed=seed,
+                        payload=payload,
+                        output_path=str(candidate_path),
+                        backend="qwen-tts",
+                        error=str(exc),
+                    )
+                )
+                continue
+            too_long = duration_too_long(duration, segment.duration, cfg.duration_tolerance)
+            too_short = duration_too_short(duration, segment.duration, cfg.duration_tolerance)
+            candidate_ratio = duration_ratio(duration, segment.duration)
+            duration_gate = "too_long" if too_long else "too_short" if too_short else "pass"
+            language_contract_ok = payload["text"] == segment.script.tts_text
+            if target_language == "ko":
+                language_contract_ok = language_contract_ok and payload["language"] == "Korean"
+            acceptable_for_mix = duration_gate == "pass" and language_contract_ok
+            payload["duration_ratio"] = candidate_ratio
+            payload["duration_gate"] = duration_gate
+            candidates.append(
+                TTSCandidate(
+                    candidate_index=candidate_index,
+                    seed=seed,
+                    payload=payload,
+                    output_path=str(candidate_path),
+                    duration_sec=duration,
+                    backend="qwen-tts",
+                    duration_ratio=candidate_ratio,
+                    duration_gate=duration_gate,
+                    acceptable_for_mix=acceptable_for_mix,
+                    selection_score=max(0.0, 1.0 - min(abs(candidate_ratio - 1.0), 1.0)),
+                    selection_reason=(
+                        "duration_and_language_contract_pass"
+                        if acceptable_for_mix
+                        else "duration_or_language_contract_failed"
+                    ),
+                )
+            )
+
+        successful = [
+            candidate for candidate in candidates if not candidate.error and candidate.duration_sec is not None
+        ]
+        acceptable = [candidate for candidate in successful if candidate.acceptable_for_mix]
+        selected = min(acceptable or successful, key=lambda c: abs((c.duration_sec or 0.0) - segment.duration)) if successful else None
+        selected_path: Path | None = None
+        if selected is None:
+            failed_segments.append(segment.id)
+            summary = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "candidate_count": effective_candidate_count,
+                "selected_candidate_path": None,
+                "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+                "error": "All Qwen TTS candidates failed.",
+            }
+            segment.analysis["qwen_tts"] = summary
+            if promote:
+                segment.status = "failed"
+                segment.errors.append("All Qwen TTS candidates failed.")
+        else:
+            selected.selected = True
+            selected_path = _qwen_tts_best_path(project_dir, segment.id)
+            ensure_not_same_path(Path(selected.output_path), selected_path)
+            selected_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(selected.output_path, selected_path)
+            summary = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "candidate_count": effective_candidate_count,
+                "selected_candidate_path": str(selected_path),
+                "selected_duration_gate": selected.duration_gate,
+                "selected_acceptable_for_mix": selected.acceptable_for_mix,
+                "selected_duration_ratio": selected.duration_ratio,
+                "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+            }
+            segment.analysis["qwen_tts"] = summary
+            if promote:
+                final_path = project_dir / "work" / "tts" / f"{segment.id}_final.wav"
+                ensure_not_same_path(Path(selected.output_path), final_path)
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(selected.output_path, final_path)
+                segment.tts = TTSMetadata(
+                    backend="qwen-tts",
+                    ref_style=resolved_ref_style,
+                    speed_factor=1.0,
+                    candidate_count=effective_candidate_count,
+                    selected_candidate_path=str(final_path),
+                    candidates=candidates,
+                    source_language=source_language,
+                    target_language=target_language,
+                    cross_lingual_voice_transfer=source_language != target_language,
+                    retry_summary={
+                        "selected_duration_gate": selected.duration_gate,
+                        "selected_acceptable_for_mix": selected.acceptable_for_mix,
+                        "selected_duration_ratio": selected.duration_ratio,
+                    },
+                )
+                segment.rvc = None
+                segment.qc = None
+                segment.mix = {}
+                segment.status = "synthesized"
+                promoted_segments.append(segment.id)
+        save_manifest(project_dir, manifest)
+        last_logged_at = _log_segment_progress(
+            "synth-qwen",
+            index,
+            total,
+            segment,
+            manifest,
+            started_at,
+            last_logged_at,
+            note=f"selected={selected_path}" if selected_path else None,
+        )
+
+    if promoted_segments:
+        _invalidate_downstream_after_tts_promotion(manifest)
+    out_path = project_dir / "work" / "tts" / "qwen" / "qwen_tts_manifest.json"
+    write_json_atomic(
+        out_path,
+        {
+            "backend": "qwen-tts",
+            "model_id": effective_model_id,
+            "promote": promote,
+            "segments": [
+                {
+                    "id": segment.id,
+                    "qwen_tts": segment.analysis.get("qwen_tts"),
+                }
+                for segment in manifest.segments
+            ],
+        },
+    )
+    manifest.artifacts["qwen_tts"] = str(out_path)
+    status = "failed" if promote and failed_segments else "completed"
+    mark_stage(
+        manifest,
+        "synth-qwen",
+        status,
+        backend="qwen-tts",
+        model_id=effective_model_id,
+        candidate_count=effective_candidate_count,
+        promote=promote,
+        promoted_segments=promoted_segments,
+        failed_segments=failed_segments,
+        qwen_tts_manifest=str(out_path),
+        segment_counts=_segment_counts(manifest),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("synth-qwen", manifest, f"backend=qwen-tts promote={promote}")
+    if promote and failed_segments:
+        raise QwenTTSError(
+            "Qwen TTS synthesis failed for segments: "
+            + ", ".join(failed_segments[:20])
+            + (" ..." if len(failed_segments) > 20 else "")
+        )
+    return manifest
 
 
 def _rvc_profile_for_segment(cfg: ProjectConfig, profile: RVCProfile, segment: Segment) -> RVCProfile:
@@ -2968,6 +3512,7 @@ def rvc_step(
         allow_trained_artifact=True,
     )
     if backend == "command":
+        working_dir: Path | None = None
         if not confirm_rights:
             raise RightsError("Real RVC conversion requires --confirm-rights for the source and voice model.")
         source_path = Path(manifest.source_info.path) if manifest.source_info else None
@@ -3002,20 +3547,26 @@ def rvc_step(
     started_at = monotonic()
     last_logged_at = started_at
     total = len(manifest.segments)
+    use_batch_rvc = backend == "command" and cfg.rvc_batch_infer and bool(cfg.rvc_batch_command)
     rvc_lane_count = 1 if backend != "command" else _effective_lane_count(cfg.rvc_concurrency, total)
+    batch_lane_count = _effective_lane_count(cfg.rvc_batch_concurrency, total) if use_batch_rvc else 1
     console.print(
         f"[cyan]rvc[/cyan] converting segments with {len(cfg.rvc_auto_profiles)} profile candidate(s); "
-        f"failure_policy={cfg.rvc_failure_policy} concurrency={rvc_lane_count}"
+        f"failure_policy={cfg.rvc_failure_policy} "
+        f"mode={'batch' if use_batch_rvc else 'per-segment'} "
+        f"concurrency={batch_lane_count if use_batch_rvc else rvc_lane_count}"
     )
 
-    def convert_segment(index: int, segment: Segment) -> tuple[int, Segment, str | None]:
+    def prepare_segment(
+        segment: Segment,
+    ) -> tuple[tuple[Path, Path | None, Path | None] | None, str | None]:
         if segment.status in SKIP_STATUSES:
-            return index, segment, None
+            return None, None
         if not segment.tts or not segment.tts.selected_candidate_path:
             message = "RVC requires segment.tts.selected_candidate_path from synth."
             segment.status = "failed"
             segment.errors.append(message)
-            return index, segment, segment.id
+            return None, segment.id
         raw_tts_path = segment.rvc.input_path if segment.rvc and segment.rvc.input_path else segment.tts.selected_candidate_path
         input_path = Path(raw_tts_path)
         if not input_path.exists():
@@ -3027,14 +3578,21 @@ def rvc_step(
                 input_path=str(input_path),
                 error=message,
             )
-            return index, segment, segment.id
+            return None, segment.id
         model_path, index_path = _rvc_model_paths(project_dir, cfg, segment, manifest)
         if backend == "command" and (model_path is None or not model_path.exists()):
             message = "RVC requires the model artifact produced by train-rvc."
             segment.status = "failed"
             segment.errors.append(message)
             segment.rvc = RVCMetadata(backend=backend, input_path=str(input_path), error=message)
-            return index, segment, segment.id
+            return None, segment.id
+        return (input_path, model_path, index_path), None
+
+    def convert_segment(index: int, segment: Segment) -> tuple[int, Segment, str | None]:
+        prepared, failed_segment_id = prepare_segment(segment)
+        if prepared is None:
+            return index, segment, failed_segment_id
+        input_path, model_path, index_path = prepared
         attempts: list[dict[str, Any]] = []
         candidate_paths: list[str] = []
         accepted_attempt: dict[str, Any] | None = None
@@ -3193,8 +3751,276 @@ def rvc_step(
         segment.status = "rvc_converted"
         return index, segment, None
 
+    def batch_chunks(items: list[Any], size: int) -> list[list[Any]]:
+        return [items[start : start + size] for start in range(0, len(items), size)]
+
+    def convert_segments_batched(segment_jobs: list[tuple[int, Segment]]) -> None:
+        nonlocal last_logged_at
+        batch_client = RVCBatchCommandClient(
+            cfg.rvc_batch_command,
+            working_dir=working_dir,
+            timeout_sec=cfg.rvc_timeout_sec,
+            runner=runner or subprocess.run,
+            stream_output=True,
+            log_prefix="rvc-batch",
+        )
+        prepared_segments: list[tuple[int, Segment, Path, Path, Path | None]] = []
+        for index, segment in segment_jobs:
+            prepared, failed_segment_id = prepare_segment(segment)
+            if failed_segment_id:
+                failed_segments.append(failed_segment_id)
+            if prepared is None:
+                last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+                save_manifest(project_dir, manifest)
+                continue
+            input_path, model_path, index_path = prepared
+            if model_path is None:
+                failed_segments.append(segment.id)
+                continue
+            prepared_segments.append((index, segment, input_path, model_path, index_path))
+
+        attempts_by_segment: dict[str, list[dict[str, Any]]] = {
+            segment.id: [] for _, segment, *_ in prepared_segments
+        }
+        candidate_paths_by_segment: dict[str, list[str]] = {
+            segment.id: [] for _, segment, *_ in prepared_segments
+        }
+        profiles = cfg.rvc_auto_profiles
+        if cfg.rvc_failure_policy == "error":
+            profiles = profiles[:1]
+
+        pending = prepared_segments
+        batches_dir = project_dir / "work" / "rvc" / "batches"
+        batch_counter = 0
+        batch_counter_lock = Lock()
+
+        def apply_batch_result(
+            entries: list[tuple[int, Segment, Path, Path, Path | None, RVCProfile, Path]],
+            results: dict[str, RVCCommandResult] | None,
+            batch_error: Exception | None = None,
+        ) -> list[tuple[int, Segment, Path, Path, Path | None]]:
+            nonlocal last_logged_at
+            rejected: list[tuple[int, Segment, Path, Path, Path | None]] = []
+            for index, segment, input_path, model_path, index_path, profile, candidate_path in entries:
+                attempts = attempts_by_segment[segment.id]
+                result = results.get(segment.id) if results else None
+                if batch_error is not None or result is None or result.returncode != 0:
+                    error = str(batch_error) if batch_error is not None else "RVC batch command did not return a result."
+                    command = None
+                    if result is not None:
+                        command = result.command
+                        error = result.stderr or result.stdout or f"RVC batch command failed with exit code {result.returncode}."
+                    console.print(
+                        f"[yellow]rvc candidate failed[/yellow]: segment={escape(segment.id)} "
+                        f"profile={escape(profile.name)} error={escape(error)}"
+                    )
+                    attempts.append(
+                        _rvc_attempt_payload(
+                            profile=profile,
+                            output_path=candidate_path,
+                            model_path=model_path,
+                            index_path=index_path,
+                            command=command,
+                            error=error,
+                        )
+                    )
+                    rejected.append((index, segment, input_path, model_path, index_path))
+                    continue
+
+                metrics = _rvc_metrics(input_path, candidate_path, segment, cfg)
+                attempt = _rvc_attempt_payload(
+                    profile=profile,
+                    output_path=candidate_path,
+                    model_path=model_path,
+                    index_path=index_path,
+                    command=result.command,
+                    reused_existing=result.reused_existing,
+                    returncode=result.returncode,
+                    elapsed_sec=result.elapsed_sec,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    metrics=metrics,
+                )
+                attempts.append(attempt)
+                if not metrics["accepted"]:
+                    console.print(
+                        f"[dim]rvc rejected: segment={escape(segment.id)} "
+                        f"profile={escape(profile.name)} issues={metrics.get('issues', [])}[/dim]"
+                    )
+                    rejected.append((index, segment, input_path, model_path, index_path))
+                    continue
+
+                final_path = ensure_inside_project(project_dir, project_dir / "work" / "rvc" / f"{segment.id}_final.wav")
+                ensure_not_same_path(candidate_path, final_path)
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(candidate_path, final_path)
+                segment.rvc = RVCMetadata(
+                    backend=backend,
+                    input_path=str(input_path),
+                    output_path=str(final_path),
+                    selected_profile_name=str(attempt["profile_name"]),
+                    candidate_paths=candidate_paths_by_segment[segment.id],
+                    model_path=str(model_path),
+                    index_path=str(index_path) if index_path else None,
+                    settings={
+                        "failure_policy": cfg.rvc_failure_policy,
+                        "duration_tolerance": metrics.get("duration_tolerance"),
+                        "selected_settings": attempt.get("settings", {}),
+                        "execution_mode": "batch",
+                    },
+                    pre_duration_sec=metrics.get("pre_duration_sec"),
+                    post_duration_sec=metrics.get("post_duration_sec"),
+                    duration_ratio=metrics.get("duration_ratio"),
+                    accepted=True,
+                    fallback_used=False,
+                    command=attempt.get("command"),
+                    attempts=attempts,
+                )
+                segment.status = "rvc_converted"
+                console.print(
+                    f"[dim]rvc accepted: segment={escape(segment.id)} "
+                    f"profile={escape(profile.name)} "
+                    f"duration_ratio={metrics.get('duration_ratio', 0):.3f} "
+                    f"elapsed={result.elapsed_sec:.1f}s"
+                    f"{' reused=true' if result.reused_existing else ''}[/dim]"
+                )
+                last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+                save_manifest(project_dir, manifest)
+            return rejected
+
+        for profile in profiles:
+            if not pending:
+                break
+            grouped: dict[tuple[str, str, str], list[tuple[int, Segment, Path, Path, Path | None, RVCProfile, Path]]] = {}
+            for index, segment, input_path, model_path, index_path in pending:
+                effective_profile = _rvc_profile_for_segment(cfg, profile, segment)
+                candidate_path = (
+                    project_dir
+                    / "work"
+                    / "rvc"
+                    / "candidates"
+                    / segment.id
+                    / f"{effective_profile.name}.wav"
+                )
+                candidate_paths_by_segment[segment.id].append(str(candidate_path))
+                console.print(
+                    f"[dim]rvc candidate: {index}/{total} segment={escape(segment.id)} "
+                    f"profile={escape(effective_profile.name)} output={escape(str(candidate_path))}[/dim]"
+                )
+                profile_key = json.dumps(effective_profile.model_dump(mode="json"), sort_keys=True)
+                key = (str(model_path.resolve()), str(index_path.resolve()) if index_path else "", profile_key)
+                grouped.setdefault(key, []).append(
+                    (index, segment, input_path, model_path, index_path, effective_profile, candidate_path)
+                )
+
+            next_pending: list[tuple[int, Segment, Path, Path, Path | None]] = []
+            batch_tasks: list[list[tuple[int, Segment, Path, Path, Path | None, RVCProfile, Path]]] = []
+            for entries in grouped.values():
+                batch_tasks.extend(batch_chunks(entries, cfg.rvc_batch_size))
+
+            def run_batch(
+                entries: list[tuple[int, Segment, Path, Path, Path | None, RVCProfile, Path]]
+            ) -> tuple[
+                list[tuple[int, Segment, Path, Path, Path | None, RVCProfile, Path]],
+                dict[str, RVCCommandResult],
+            ]:
+                nonlocal batch_counter
+                with batch_counter_lock:
+                    batch_counter += 1
+                    batch_id = batch_counter
+                first = entries[0]
+                _, _, _, model_path, index_path, effective_profile, _ = first
+                jobs = [
+                    RVCBatchJob(
+                        segment_id=segment.id,
+                        input_path=input_path,
+                        output_path=candidate_path,
+                        model_path=model_path,
+                        index_path=index_path,
+                        profile=effective_profile,
+                        sid=segment.speaker_id or "",
+                    )
+                    for _, segment, input_path, model_path, index_path, effective_profile, candidate_path in entries
+                ]
+                jobs_path = batches_dir / f"batch_{batch_id:04d}_{effective_profile.name}_jobs.jsonl"
+                results_path = batches_dir / f"batch_{batch_id:04d}_{effective_profile.name}_results.jsonl"
+                console.print(
+                    f"[cyan]rvc batch[/cyan] profile={escape(effective_profile.name)} "
+                    f"jobs={len(jobs)} model={escape(str(model_path))}"
+                )
+                return entries, batch_client.convert_many(
+                    jobs,
+                    jobs_path=jobs_path,
+                    results_path=results_path,
+                    model_path=model_path,
+                    index_path=index_path,
+                    cfg=cfg,
+                    profile=effective_profile,
+                    force=force,
+                )
+
+            if batch_lane_count > 1 and len(batch_tasks) > 1:
+                with ThreadPoolExecutor(max_workers=batch_lane_count) as executor:
+                    futures = [executor.submit(run_batch, entries) for entries in batch_tasks]
+                    for future in as_completed(futures):
+                        try:
+                            entries, results = future.result()
+                        except Exception as exc:
+                            entries = batch_tasks[futures.index(future)]
+                            next_pending.extend(apply_batch_result(entries, None, exc))
+                        else:
+                            next_pending.extend(apply_batch_result(entries, results))
+            else:
+                for entries in batch_tasks:
+                    try:
+                        entries, results = run_batch(entries)
+                    except Exception as exc:
+                        next_pending.extend(apply_batch_result(entries, None, exc))
+                    else:
+                        next_pending.extend(apply_batch_result(entries, results))
+            pending = next_pending
+
+        for index, segment, input_path, model_path, index_path in pending:
+            error = "All RVC candidates failed or were rejected."
+            attempts = attempts_by_segment[segment.id]
+            if cfg.rvc_allow_pre_rvc_fallback and not _rvc_downstream_required(cfg):
+                segment.rvc = RVCMetadata(
+                    backend=backend,
+                    input_path=str(input_path),
+                    output_path=str(input_path),
+                    selected_profile_name=None,
+                    candidate_paths=candidate_paths_by_segment[segment.id],
+                    model_path=str(model_path),
+                    index_path=str(index_path) if index_path else None,
+                    accepted=False,
+                    fallback_used=True,
+                    fallback_reason=error,
+                    error=error,
+                    attempts=attempts,
+                )
+            else:
+                segment.rvc = RVCMetadata(
+                    backend=backend,
+                    input_path=str(input_path),
+                    output_path=None,
+                    selected_profile_name=None,
+                    candidate_paths=candidate_paths_by_segment[segment.id],
+                    model_path=str(model_path),
+                    index_path=str(index_path) if index_path else None,
+                    accepted=False,
+                    error=error,
+                    attempts=attempts,
+                )
+                segment.status = "failed"
+                segment.errors.append(error)
+                failed_segments.append(segment.id)
+            last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+            save_manifest(project_dir, manifest)
+
     segment_jobs = list(enumerate(manifest.segments, start=1))
-    if backend == "command" and rvc_lane_count > 1 and len(segment_jobs) > 1:
+    if use_batch_rvc and len(segment_jobs) > 1:
+        convert_segments_batched(segment_jobs)
+    elif backend == "command" and rvc_lane_count > 1 and len(segment_jobs) > 1:
         with ThreadPoolExecutor(max_workers=rvc_lane_count) as executor:
             futures = [executor.submit(convert_segment, index, segment) for index, segment in segment_jobs]
             for future in as_completed(futures):
@@ -3216,6 +4042,7 @@ def rvc_step(
         out_path,
         {
             "backend": backend,
+            "execution_mode": "batch" if use_batch_rvc else "per_segment",
             "segments": [
                 {"id": segment.id, "rvc": segment.rvc.model_dump(mode="json") if segment.rvc else None}
                 for segment in manifest.segments
@@ -3223,6 +4050,7 @@ def rvc_step(
         },
     )
     manifest.artifacts["rvc_manifest"] = str(out_path)
+    effective_concurrency = batch_lane_count if use_batch_rvc else rvc_lane_count
     if failed_segments:
         mark_stage(
             manifest,
@@ -3231,7 +4059,8 @@ def rvc_step(
             backend=backend,
             failed_segments=failed_segments,
             rvc_manifest=str(out_path),
-            concurrency=rvc_lane_count,
+            concurrency=effective_concurrency,
+            execution_mode="batch" if use_batch_rvc else "per_segment",
             segment_counts=_segment_counts(manifest),
         )
         save_manifest(project_dir, manifest)
@@ -3246,7 +4075,8 @@ def rvc_step(
         "completed",
         backend=backend,
         rvc_manifest=str(out_path),
-        concurrency=rvc_lane_count,
+        concurrency=effective_concurrency,
+        execution_mode="batch" if use_batch_rvc else "per_segment",
         segment_counts=_segment_counts(manifest),
     )
     save_manifest(project_dir, manifest)

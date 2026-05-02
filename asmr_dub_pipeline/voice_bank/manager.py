@@ -913,6 +913,14 @@ def _transcribe_turns(audio_path: Path, turns: list[DiarizationTurn], cfg: Proje
             "model_id": cfg.asr_model_id,
             "language": cfg.asr_language,
             "local_files_only": cfg.asr_local_files_only,
+            "qwen_model_id": cfg.qwen_asr_model_id,
+            "qwen_forced_aligner_model_id": cfg.qwen_asr_forced_aligner_model_id,
+            "qwen_device_map": cfg.qwen_asr_device_map,
+            "qwen_dtype": cfg.qwen_asr_dtype,
+            "qwen_return_timestamps": cfg.qwen_asr_return_timestamps,
+            "qwen_context": cfg.qwen_asr_context,
+            "qwen_max_inference_batch_size": cfg.qwen_asr_max_inference_batch_size,
+            "qwen_max_new_tokens": cfg.qwen_asr_max_new_tokens,
         },
     )
     chunks = backend.transcribe(audio_path, segments)

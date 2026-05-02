@@ -33,6 +33,7 @@ from .pipeline.steps import (
     script_step,
     segment_step,
     source_separation_step,
+    synth_qwen_step,
     synth_step,
     transcribe_step,
     translate_ko_step,
@@ -55,7 +56,7 @@ DEFAULT_VOICE_BANK_PROJECT_NAME = "voice_bank_all"
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
     "candidate_count": 3,
-    "duration_tolerance": 0.15,
+    "duration_tolerance": 0.25,
     "gemma_llama_cpp_ctx_size": 16384,
     "gemma_llama_cpp_n_predict": 2048,
     "gemma_text_batch_size": 1,
@@ -72,7 +73,17 @@ FULL_REAL_QUALITY_PRESET = {
     "gsv_few_shot_max_clip_sec": 8.0,
     "gsv_few_shot_min_quality_score": 0.35,
     "gsv_ref_min_quality_score": 0.40,
-    "gsv_tts_max_speed_factor": 1.08,
+    "gsv_tts_max_speed_factor": 1.0,
+    "gsv_tts_min_speed_factor": 0.92,
+    "gsv_top_k": 8,
+    "gsv_top_p": 0.9,
+    "gsv_temperature": 0.7,
+    "gsv_text_split_method": "cut0",
+    "gsv_parallel_infer": False,
+    "gsv_repetition_penalty": 1.25,
+    "gsv_sample_steps": 32,
+    "gsv_super_sampling": True,
+    "gsv_min_chunk_length": 8,
     "gsv_gpt_weights_policy": "auto",
     "gsv_sovits_weights_policy": "auto",
     "mix_allow_korean_timing_draft": False,
@@ -87,7 +98,10 @@ FULL_REAL_QUALITY_PRESET = {
     "rvc_train_feature_workers": 0,
     "rvc_train_save_every_epoch": 50,
     "rvc_train_reuse_intermediate_cache": True,
-    "rvc_concurrency": 1,
+    "rvc_concurrency": 4,
+    "rvc_batch_infer": True,
+    "rvc_batch_size": 200,
+    "rvc_batch_concurrency": 1,
     "rvc_failure_policy": "retry_then_error",
     "rvc_allow_pre_rvc_fallback": False,
 }
@@ -237,6 +251,7 @@ def _local_rvc_webui_defaults(project_dir: Path, source_path: Path | None = None
     python = _rvc_python()
     train_wrapper = REPO_ROOT / "asmr_dub_pipeline" / "rvc" / "webui_train.py"
     infer_wrapper = REPO_ROOT / "asmr_dub_pipeline" / "rvc" / "webui_infer.py"
+    batch_infer_wrapper = REPO_ROOT / "asmr_dub_pipeline" / "rvc" / "webui_batch_infer.py"
     return {
         "rvc_train_experiment_name": _rvc_experiment_name(source_for_name),
         "rvc_train_command": [
@@ -301,6 +316,22 @@ def _local_rvc_webui_defaults(project_dir: Path, source_path: Path | None = None
             "--protect",
             "{protect}",
         ],
+        "rvc_batch_command": [
+            python,
+            str(batch_infer_wrapper),
+            "--rvc-root",
+            str(rvc_root),
+            "--jobs",
+            "{jobs}",
+            "--results",
+            "{results}",
+            "--model",
+            "{model}",
+            "--index",
+            "{index}",
+            "--device",
+            "{device}",
+        ],
     }
 
 
@@ -314,7 +345,7 @@ def _apply_full_real_quality_preset(
     payload = cfg.model_dump(mode="json")
     payload.update(FULL_REAL_QUALITY_PRESET)
     for key, value in _local_rvc_webui_defaults(project_dir, source_path).items():
-        if key in {"rvc_train_command", "rvc_command"} and payload.get(key):
+        if key in {"rvc_train_command", "rvc_command", "rvc_batch_command"} and payload.get(key):
             continue
         payload[key] = value
     payload["target_language"] = target_language
@@ -420,7 +451,7 @@ def analyze(
 @app.command()
 def transcribe(
     project: Path = typer.Option(..., "--project", "-p"),
-    asr_backend: str = typer.Option("faster_whisper", "--asr-backend", help="faster_whisper|mock"),
+    asr_backend: str = typer.Option("faster_whisper", "--asr-backend", help="faster_whisper|qwen_asr|mock"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
 ) -> None:
     """Create segment-level source scripts with local ASR."""
@@ -440,6 +471,11 @@ def translate_ko_cmd(
         help="llama_server|mock",
     ),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    force_retranslate: bool = typer.Option(
+        False,
+        "--force-retranslate",
+        help="Ignore existing Korean translations and regenerate translate-ko artifacts.",
+    ),
 ) -> None:
     """Translate source scripts to Korean with text-only Gemma."""
     try:
@@ -447,6 +483,7 @@ def translate_ko_cmd(
             project.expanduser().resolve(),
             gemma_text_backend,
             confirm_rights=confirm_rights,
+            force_retranslate=force_retranslate,
         )
     except Exception as exc:
         _handle_error(exc)
@@ -507,6 +544,48 @@ def synth(
     except Exception as exc:
         _handle_error(exc)
     console.print("Synthesis complete.")
+
+
+@app.command(name="synth-qwen")
+def synth_qwen(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    model_id: str | None = typer.Option(None, "--model-id", help="Qwen3-TTS model id or local path."),
+    candidate_count: int | None = typer.Option(
+        None,
+        "--candidate-count",
+        min=1,
+        max=8,
+        help="Number of Qwen candidates per segment. Defaults to qwen_tts_candidate_count.",
+    ),
+    promote: bool = typer.Option(
+        False,
+        "--promote/--compare-only",
+        help="Replace selected TTS with the best Qwen candidate and invalidate downstream RVC/QC/mix.",
+    ),
+    allow_download: bool = typer.Option(
+        False,
+        "--allow-download/--local-files-only",
+        help="Allow qwen-tts to resolve a remote Hugging Face model id instead of requiring repo-local cache.",
+    ),
+) -> None:
+    """Generate Qwen TTS candidates from an existing scripted manifest."""
+    try:
+        manifest = synth_qwen_step(
+            project.expanduser().resolve(),
+            refs,
+            confirm_rights=confirm_rights,
+            model_id=model_id,
+            candidate_count=candidate_count,
+            promote=promote,
+            local_files_only=False if allow_download else None,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Qwen synthesis complete: {manifest.artifacts.get('qwen_tts')}")
 
 
 @app.command(name="train-rvc")
@@ -805,6 +884,11 @@ def full(
         "--gemma-backend",
         help="hf|http|llama_cpp when --real is set.",
     ),
+    asr_backend: str | None = typer.Option(
+        None,
+        "--asr-backend",
+        help="Override ASR backend for the transcribe stage: faster_whisper|qwen_asr|mock.",
+    ),
     target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
     gsv_url: str | None = typer.Option(None, "--gsv-url"),
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
@@ -883,6 +967,7 @@ def full(
             confirm_rights=confirm_rights,
             mock=not real,
             gemma_backend=gemma_backend if real else "mock",
+            asr_backend=asr_backend,
             target_language=target_language,
             gsv_url=gsv_url,
             refs_path=refs,

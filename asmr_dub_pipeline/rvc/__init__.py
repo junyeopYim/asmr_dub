@@ -1,4 +1,6 @@
 from .client import (
+    RVCBatchCommandClient,
+    RVCBatchJob,
     RVCCommandClient,
     RVCCommandError,
     RVCCommandResult,
@@ -18,6 +20,8 @@ __all__ = [
     "RVCCommandClient",
     "RVCCommandError",
     "RVCCommandResult",
+    "RVCBatchCommandClient",
+    "RVCBatchJob",
     "RVCMockClient",
     "RVCTrainCommandClient",
     "RVCTrainMockClient",

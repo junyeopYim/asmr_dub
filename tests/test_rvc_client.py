@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 from conftest import write_tiny_wav
 
 from asmr_dub_pipeline.rvc import (
+    RVCBatchCommandClient,
+    RVCBatchJob,
     RVCCommandClient,
     RVCCommandError,
     render_rvc_command,
@@ -243,6 +247,41 @@ def test_timeout_handling(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX process groups")
+def test_stream_timeout_kills_child_process_group(tmp_path: Path) -> None:
+    input_path = write_tiny_wav(tmp_path / "input.wav")
+    marker_path = tmp_path / "child_survived.txt"
+    child_code = (
+        "import pathlib, sys, time; "
+        "time.sleep(1); "
+        "pathlib.Path(sys.argv[1]).write_text('alive', encoding='utf-8')"
+    )
+    parent_code = (
+        "import subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]]); "
+        "time.sleep(10)"
+    )
+    cfg = ProjectConfig(
+        rvc_backend="command",
+        rvc_command=[sys.executable, "-c", parent_code, str(marker_path), child_code],
+    )
+    client = RVCCommandClient(cfg.rvc_command, timeout_sec=0.2, stream_output=True)
+
+    with pytest.raises(RVCCommandError, match="timed out"):
+        client.convert(
+            input_path,
+            tmp_path / "out.wav",
+            model_path=tmp_path / "model.pth",
+            index_path=None,
+            cfg=cfg,
+            profile=cfg.rvc_auto_profiles[0],
+            segment_id="seg_0001",
+        )
+
+    time.sleep(1.2)
+    assert not marker_path.exists()
+
+
 def test_existing_output_reuse_when_force_false(tmp_path: Path) -> None:
     input_path = write_tiny_wav(tmp_path / "input.wav")
     output_path = write_tiny_wav(tmp_path / "out.wav")
@@ -260,3 +299,73 @@ def test_existing_output_reuse_when_force_false(tmp_path: Path) -> None:
     )
 
     assert result.reused_existing is True
+
+
+def test_batch_command_client_writes_jobs_and_reads_results(tmp_path: Path) -> None:
+    input_path = write_tiny_wav(tmp_path / "input.wav")
+    output_path = tmp_path / "out.wav"
+    model_path = tmp_path / "model.pth"
+    index_path = tmp_path / "added.index"
+    model_path.write_bytes(b"model")
+    index_path.write_bytes(b"index")
+    cfg = ProjectConfig(
+        rvc_backend="command",
+        rvc_batch_command=[
+            "batch",
+            "--jobs",
+            "{jobs}",
+            "--results",
+            "{results}",
+            "--model",
+            "{model}",
+            "--index",
+            "{index}",
+        ],
+    )
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        _ = kwargs
+        jobs_path = Path(command[command.index("--jobs") + 1])
+        results_path = Path(command[command.index("--results") + 1])
+        rows = [json.loads(line) for line in jobs_path.read_text("utf-8").splitlines()]
+        with results_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                Path(row["output_path"]).write_bytes(input_path.read_bytes())
+                handle.write(
+                    json.dumps(
+                        {
+                            "segment_id": row["segment_id"],
+                            "output_path": row["output_path"],
+                            "returncode": 0,
+                            "elapsed_sec": 1.25,
+                            "stdout": "ok",
+                            "stderr": "",
+                        }
+                    )
+                    + "\n"
+                )
+        return subprocess.CompletedProcess(command, 0, stdout="batch ok", stderr="")
+
+    client = RVCBatchCommandClient(cfg.rvc_batch_command, runner=runner)
+    results = client.convert_many(
+        [
+            RVCBatchJob(
+                segment_id="seg_0001",
+                input_path=input_path,
+                output_path=output_path,
+                model_path=model_path,
+                index_path=index_path,
+                profile=cfg.rvc_auto_profiles[0],
+            )
+        ],
+        jobs_path=tmp_path / "jobs.jsonl",
+        results_path=tmp_path / "results.jsonl",
+        model_path=model_path,
+        index_path=index_path,
+        cfg=cfg,
+        profile=cfg.rvc_auto_profiles[0],
+    )
+
+    assert results["seg_0001"].returncode == 0
+    assert results["seg_0001"].elapsed_sec == 1.25
+    assert output_path.exists()

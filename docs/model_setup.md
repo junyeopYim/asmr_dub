@@ -28,13 +28,13 @@ schema failure. Mock mode remains deterministic and does not use repair prompts.
 
 The `http` backend is a project-specific JSON endpoint at `/gemma`. It is not a vLLM or OpenAI-compatible `/v1/chat/completions` adapter.
 
-The `llama_cpp` backend invokes `llama-mtmd-cli` locally for each Gemma task and
-expects a GGUF model plus the matching multimodal projector. The default paths
-target the repo-local HauhauCS Gemma 4 E4B Q8 cache:
+The `llama_cpp` backend invokes `llama-mtmd-cli` locally for each Gemma task. The
+Korean text lane uses the GGUF model path through `llama-server`; multimodal
+audio tasks also require a compatible projector.
 
 ```yaml
 gemma_llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli
-gemma_llama_cpp_model_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf
+gemma_llama_cpp_model_path: .cache/llama_cpp/models/mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF/gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf
 gemma_llama_cpp_mmproj_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf
 ```
 

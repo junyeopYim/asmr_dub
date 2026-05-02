@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from asmr_dub_pipeline.gemma.json_repair import JSONRepairError, loads_json_dict
+from asmr_dub_pipeline.schemas import JapaneseScript
 from asmr_dub_pipeline.script.normalizer import normalize_script_payload, normalize_tts_text
 from asmr_dub_pipeline.script.text_qc import preflight_tts_text
 
@@ -61,6 +62,41 @@ def test_korean_normalizer_preserves_cues_and_text_qc_blocks_kana() -> None:
     qc = preflight_tts_text(script, target_language="ko", source_text="少し近づきますね")
     assert qc.blocked
     assert "korean_tts_contains_kana" in qc.issues
+
+
+def test_korean_normalizer_spells_risky_tokens_and_splits_long_clauses() -> None:
+    result = normalize_tts_text("GPT-SoVITS 3% OK & RVC", language="ko")
+    assert result.text == "지피티 소비츠 삼 퍼센트 오케이 그리고 알브이씨"
+    assert "normalized_latin_token" in result.risk_flags
+    assert "normalized_numeric_token" in result.risk_flags
+    assert "normalized_symbol_token" in result.risk_flags
+    assert not preflight_tts_text(
+        JapaneseScript(ja_text=result.text, tts_text=result.text, tts_language="ko"),
+        target_language="ko",
+    ).blocked
+
+    raw_risky = JapaneseScript(
+        ja_text="테스트",
+        tts_text="오늘은 GPT-SoVITS 3%로 갈게요",
+        tts_language="ko",
+    )
+    raw_qc = preflight_tts_text(raw_risky, target_language="ko")
+    assert raw_qc.blocked
+    assert "korean_tts_contains_latin" in raw_qc.issues
+    assert "korean_tts_contains_digit" in raw_qc.issues
+    assert "korean_tts_contains_pronunciation_symbol" in raw_qc.issues
+
+    long_result = normalize_tts_text(
+        "오늘은 아주 조용하게 숨을 천천히 고르고 조금 더 가까이 다가가서 "
+        "편안하게 들리도록 말해드릴게요 계속 긴장을 풀어주세요",
+        language="ko",
+    )
+    assert "," in long_result.text
+    assert "split_long_korean_clause" in long_result.risk_flags
+    assert not preflight_tts_text(
+        JapaneseScript(ja_text=long_result.text, tts_text=long_result.text, tts_language="ko"),
+        target_language="ko",
+    ).blocked
 
 
 def test_pause_cue_gets_timing_metadata_not_tts_text() -> None:

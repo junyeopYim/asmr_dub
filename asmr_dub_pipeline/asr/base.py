@@ -93,8 +93,27 @@ def create_asr_backend(kind: str, config: Mapping[str, Any] | None = None) -> AS
         from .faster_whisper import FasterWhisperASRBackend
 
         return FasterWhisperASRBackend(
-            model_id=str(config.get("model_id", "mobiuslabsgmbh/faster-whisper-large-v3-turbo")),
+            model_id=str(config.get("model_id", "Systran/faster-whisper-large-v3")),
             language=str(config.get("language", "ja")),
             local_files_only=bool(config.get("local_files_only", True)),
+        )
+    if normalized == "qwen_asr":
+        from .qwen_asr import QwenASRBackend
+
+        return QwenASRBackend(
+            model_id=str(config.get("qwen_model_id") or "Qwen/Qwen3-ASR-1.7B"),
+            language=str(config.get("language", "ja")),
+            local_files_only=bool(config.get("local_files_only", True)),
+            forced_aligner_model_id=(
+                str(config["qwen_forced_aligner_model_id"])
+                if config.get("qwen_forced_aligner_model_id")
+                else None
+            ),
+            device_map=str(config.get("qwen_device_map", "cuda:0")),
+            dtype=str(config.get("qwen_dtype", "bfloat16")),
+            return_timestamps=bool(config.get("qwen_return_timestamps", True)),
+            context=str(config.get("qwen_context", "")),
+            max_inference_batch_size=int(config.get("qwen_max_inference_batch_size", 8)),
+            max_new_tokens=int(config.get("qwen_max_new_tokens", 4096)),
         )
     raise ASRUnavailableError(f"Unsupported ASR backend: {kind}")

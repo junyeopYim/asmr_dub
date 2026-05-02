@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSClient, GPTSoVITSError
+from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSClient, GPTSoVITSError, build_tts_request
 from asmr_dub_pipeline.gpt_sovits.refs import resolve_ref
 from asmr_dub_pipeline.gpt_sovits.schemas import GPTSoVITSRef, GPTSoVITSTTSOptions
 
@@ -40,6 +40,17 @@ def test_payload_can_request_korean_text_language() -> None:
 
     alias_payload = client.build_payload("괜찮아요.", ref, GPTSoVITSTTSOptions(text_lang="kr"))
     assert alias_payload.as_payload()["text_lang"] == "all_ko"
+
+
+def test_korean_text_rejects_japanese_text_language() -> None:
+    ref = GPTSoVITSRef(ref_audio_path="refs/a.wav", prompt_text="こんにちは", prompt_lang="ja")
+
+    with pytest.raises(GPTSoVITSError, match="all_ko"):
+        build_tts_request(
+            "조금 더 가까이 갈게요.",
+            ref,
+            GPTSoVITSTTSOptions(text_lang="ja"),
+        )
 
 
 def test_tts_contract_posts_api_v2_payload_without_real_server(

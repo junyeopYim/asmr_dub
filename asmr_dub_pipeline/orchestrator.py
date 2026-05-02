@@ -45,6 +45,7 @@ def run_pipeline(
     gsv_few_shot_force: bool | None = None,
     use_trained_gpt: bool = False,
     target_language: str | None = None,
+    asr_backend: str | None = None,
     voice_bank_path: Path | None = None,
     require_voice_bank: bool = False,
     source_separation_cache_project: Path | None = None,
@@ -52,11 +53,15 @@ def run_pipeline(
     if mock:
         gemma_backend = "mock"
     normalized_gemma_backend = gemma_backend.replace("-", "_")
+    normalized_asr_backend = asr_backend.replace("-", "_") if asr_backend else None
     use_korean_text_lane = not mock and normalized_gemma_backend == "llama_cpp"
     init_project(project_dir)
     cfg = load_project_config(project_dir)
     if target_language is not None:
         cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "target_language": target_language})
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    if normalized_asr_backend is not None:
+        cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "asr_backend": normalized_asr_backend})
         save_project_config(cfg, project_dir / "pipeline.yaml")
     if mock and cfg.rvc_backend != "mock":
         cfg = type(cfg).model_validate(
@@ -86,14 +91,14 @@ def run_pipeline(
             require_all=True,
         )
     if use_korean_text_lane:
-        transcribe_step(project_dir)
+        transcribe_step(project_dir, asr_backend=normalized_asr_backend)
         translate_ko_step(project_dir, "mock" if mock else "llama_server")
         korean_script_step(project_dir)
         if not mock and not use_voice_bank:
             prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
     else:
         if use_few_shot:
-            transcribe_step(project_dir)
+            transcribe_step(project_dir, asr_backend=normalized_asr_backend)
         analyze_step(project_dir, gemma_backend)
         script_step(project_dir, gemma_backend)
         if use_few_shot:

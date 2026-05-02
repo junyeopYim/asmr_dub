@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +20,8 @@ from asmr_dub_pipeline.schemas import ProjectConfig, RVCProfile, Segment
 SUPPORTED_PLACEHOLDERS = {
     "input",
     "output",
+    "jobs",
+    "results",
     "model",
     "index",
     "device",
@@ -62,6 +67,17 @@ class RVCCommandResult:
 
 
 @dataclass(frozen=True)
+class RVCBatchJob:
+    segment_id: str
+    input_path: Path
+    output_path: Path
+    model_path: Path
+    index_path: Path | None
+    profile: RVCProfile
+    sid: str = ""
+
+
+@dataclass(frozen=True)
 class RVCTrainResult:
     model_path: Path
     index_path: Path | None
@@ -81,6 +97,64 @@ def _tail(text: str | bytes | None, limit: int = 1200) -> str:
     return text.strip()[-limit:]
 
 
+def _popen_process_group_kwargs() -> dict[str, bool]:
+    return {"start_new_session": True} if os.name != "nt" else {}
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            return
+        process.wait()
+
+
+def _run_subprocess(
+    command: list[str],
+    *,
+    cwd: Path | None,
+    timeout_sec: float,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **_popen_process_group_kwargs(),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(process)
+        stdout = _tail(exc.stdout, limit=10_000)
+        stderr = _tail(exc.stderr, limit=10_000)
+        try:
+            collected_stdout, collected_stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            stdout = collected_stdout or stdout
+            stderr = collected_stderr or stderr
+        raise subprocess.TimeoutExpired(command, timeout_sec, output=stdout, stderr=stderr) from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+
+
 def _stream_subprocess(
     command: list[str],
     *,
@@ -97,6 +171,7 @@ def _stream_subprocess(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_popen_process_group_kwargs(),
         )
     except FileNotFoundError:
         raise
@@ -115,8 +190,7 @@ def _stream_subprocess(
     try:
         returncode = process.wait(timeout=timeout_sec)
     except subprocess.TimeoutExpired as exc:
-        process.kill()
-        process.wait()
+        _terminate_process_group(process)
         reader.join(timeout=5)
         raise subprocess.TimeoutExpired(command, timeout_sec, output="".join(output_parts), stderr="") from exc
     reader.join()
@@ -270,6 +344,24 @@ def command_values(
     }
 
 
+def batch_command_values(
+    *,
+    jobs_path: Path,
+    results_path: Path,
+    model_path: Path | None,
+    index_path: Path | None,
+    cfg: ProjectConfig,
+    profile: RVCProfile,
+) -> dict[str, object]:
+    return {
+        "jobs": jobs_path,
+        "results": results_path,
+        "model": model_path,
+        "index": index_path or "",
+        **_profile_values(profile, cfg),
+    }
+
+
 def validate_rvc_config(
     project_dir: Path,
     cfg: ProjectConfig,
@@ -340,6 +432,22 @@ def validate_rvc_config(
                     cfg=cfg,
                     profile=dummy_profile,
                     segment_id="seg_0000",
+                ),
+            )
+        except RVCCommandError as exc:
+            errors.append(str(exc))
+    if cfg.rvc_batch_command and cfg.rvc_auto_profiles:
+        dummy_profile = cfg.rvc_auto_profiles[0]
+        try:
+            render_rvc_command(
+                cfg.rvc_batch_command,
+                batch_command_values(
+                    jobs_path=project_dir / "work" / "rvc" / "batch_jobs.jsonl",
+                    results_path=project_dir / "work" / "rvc" / "batch_results.jsonl",
+                    model_path=default_model or Path("dummy_model.pth"),
+                    index_path=default_index,
+                    cfg=cfg,
+                    profile=dummy_profile,
                 ),
             )
         except RVCCommandError as exc:
@@ -508,6 +616,12 @@ class RVCTrainCommandClient:
                     cwd=self.working_dir,
                     timeout_sec=self.timeout_sec,
                     log_prefix=self.log_prefix,
+                )
+            elif self.runner is subprocess.run:
+                completed = _run_subprocess(
+                    command,
+                    cwd=self.working_dir,
+                    timeout_sec=self.timeout_sec,
                 )
             else:
                 completed = self.runner(
@@ -678,6 +792,12 @@ class RVCCommandClient:
                     timeout_sec=self.timeout_sec,
                     log_prefix=self.log_prefix,
                 )
+            elif self.runner is subprocess.run:
+                completed = _run_subprocess(
+                    command,
+                    cwd=self.working_dir,
+                    timeout_sec=self.timeout_sec,
+                )
             else:
                 completed = self.runner(
                     command,
@@ -719,6 +839,192 @@ class RVCCommandClient:
         if output_path.stat().st_size <= 0:
             raise RVCCommandError(f"RVC command created an empty output file: {output_path}")
         return result
+
+
+class RVCBatchCommandClient:
+    def __init__(
+        self,
+        command_template: list[str],
+        *,
+        working_dir: Path | None = None,
+        timeout_sec: float = 180.0,
+        runner: Any = subprocess.run,
+        stream_output: bool = False,
+        log_prefix: str = "rvc-batch",
+    ) -> None:
+        self.command_template = command_template
+        self.working_dir = working_dir
+        self.timeout_sec = timeout_sec
+        self.runner = runner
+        self.stream_output = stream_output
+        self.log_prefix = log_prefix
+
+    def build_command(
+        self,
+        *,
+        jobs_path: Path,
+        results_path: Path,
+        model_path: Path | None,
+        index_path: Path | None,
+        cfg: ProjectConfig,
+        profile: RVCProfile,
+    ) -> list[str]:
+        return render_rvc_command(
+            self.command_template,
+            batch_command_values(
+                jobs_path=jobs_path,
+                results_path=results_path,
+                model_path=model_path,
+                index_path=index_path,
+                cfg=cfg,
+                profile=profile,
+            ),
+        )
+
+    def convert_many(
+        self,
+        jobs: list[RVCBatchJob],
+        *,
+        jobs_path: Path,
+        results_path: Path,
+        model_path: Path,
+        index_path: Path | None,
+        cfg: ProjectConfig,
+        profile: RVCProfile,
+        force: bool = False,
+    ) -> dict[str, RVCCommandResult]:
+        command = self.build_command(
+            jobs_path=jobs_path,
+            results_path=results_path,
+            model_path=model_path,
+            index_path=index_path,
+            cfg=cfg,
+            profile=profile,
+        )
+        results: dict[str, RVCCommandResult] = {}
+        pending: list[RVCBatchJob] = []
+        for job in jobs:
+            if job.output_path.exists() and job.output_path.stat().st_size > 0 and not force:
+                results[job.segment_id] = RVCCommandResult(
+                    output_path=job.output_path,
+                    command=command,
+                    stdout="",
+                    stderr="",
+                    returncode=0,
+                    elapsed_sec=0.0,
+                    reused_existing=True,
+                )
+            else:
+                pending.append(job)
+        if not pending:
+            return results
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        if results_path.exists():
+            results_path.unlink()
+        with jobs_path.open("w", encoding="utf-8") as handle:
+            for job in pending:
+                handle.write(
+                    json.dumps(
+                        {
+                            "segment_id": job.segment_id,
+                            "input_path": str(job.input_path),
+                            "output_path": str(job.output_path),
+                            "f0_up_key": job.profile.f0_up_key,
+                            "f0_method": job.profile.f0_method,
+                            "index_rate": job.profile.index_rate,
+                            "filter_radius": job.profile.filter_radius,
+                            "resample_sr": job.profile.resample_sr,
+                            "rms_mix_rate": job.profile.rms_mix_rate,
+                            "protect": job.profile.protect,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        timeout_sec = self.timeout_sec * max(1, len(pending))
+        started = monotonic()
+        try:
+            if self.stream_output and self.runner is subprocess.run:
+                completed = _stream_subprocess(
+                    command,
+                    cwd=self.working_dir,
+                    timeout_sec=timeout_sec,
+                    log_prefix=self.log_prefix,
+                )
+            elif self.runner is subprocess.run:
+                completed = _run_subprocess(
+                    command,
+                    cwd=self.working_dir,
+                    timeout_sec=timeout_sec,
+                )
+            else:
+                completed = self.runner(
+                    command,
+                    cwd=str(self.working_dir) if self.working_dir else None,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                )
+        except FileNotFoundError as exc:
+            raise RVCCommandError(f"RVC batch command executable was not found: {command[0]}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RVCCommandError(
+                f"RVC batch command timed out after {timeout_sec:g}s for {len(pending)} job(s). "
+                f"stdout={_tail(exc.stdout)} stderr={_tail(exc.stderr)}"
+            ) from exc
+        batch_elapsed = monotonic() - started
+        stdout = str(getattr(completed, "stdout", "") or "")
+        stderr = str(getattr(completed, "stderr", "") or "")
+        returncode = int(getattr(completed, "returncode", 1))
+
+        parsed: dict[str, dict[str, object]] = {}
+        if results_path.exists():
+            for line in results_path.read_text("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                segment_id = str(payload.get("segment_id") or "")
+                if segment_id:
+                    parsed[segment_id] = payload
+
+        for job in pending:
+            payload = parsed.get(job.segment_id)
+            if payload is None:
+                results[job.segment_id] = RVCCommandResult(
+                    output_path=job.output_path,
+                    command=command,
+                    stdout=stdout,
+                    stderr=f"RVC batch command did not report a result for {job.segment_id}. {_tail(stderr)}",
+                    returncode=returncode or 1,
+                    elapsed_sec=batch_elapsed,
+                )
+                continue
+            job_returncode = int(payload.get("returncode") or 0)
+            job_stdout = str(payload.get("stdout") or "")
+            job_stderr = str(payload.get("stderr") or "")
+            job_elapsed = payload.get("elapsed_sec")
+            elapsed_sec = float(job_elapsed) if isinstance(job_elapsed, (int, float)) else batch_elapsed
+            if job_returncode == 0 and (not job.output_path.exists() or job.output_path.stat().st_size <= 0):
+                job_returncode = 1
+                job_stderr = (
+                    job_stderr
+                    or f"RVC batch command completed but did not create output: {job.output_path}"
+                )
+            results[job.segment_id] = RVCCommandResult(
+                output_path=job.output_path,
+                command=command,
+                stdout=job_stdout,
+                stderr=job_stderr,
+                returncode=job_returncode,
+                elapsed_sec=elapsed_sec,
+            )
+        return results
 
 
 class RVCMockClient:
