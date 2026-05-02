@@ -19,6 +19,7 @@ from asmr_dub_pipeline.schemas import (
     PipelineManifest,
     ProjectConfig,
     QCMetadata,
+    RVCMetadata,
     RVCSpeakerConfig,
     Segment,
     TTSMetadata,
@@ -317,6 +318,54 @@ def test_rvc_batch_command_converts_segments_in_chunks(tmp_project_dir: Path, mo
     assert seen_batches == [["seg_0001", "seg_0002"], ["seg_0003"]]
     assert manifest.stage_state["rvc"]["status"] == "completed"
     assert manifest.stage_state["rvc"]["execution_mode"] == "batch"
+    assert all(segment.rvc and segment.rvc.accepted for segment in manifest.segments)
+
+
+def test_rvc_batch_skips_already_converted_segments(tmp_project_dir: Path, monkeypatch) -> None:
+    model_path = tmp_project_dir / "models" / "voice.pth"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model")
+    cfg = ProjectConfig(
+        rvc_backend="command",
+        rvc_command=["rvc", "{input}", "{output}", "{model}", "{profile_name}"],
+        rvc_batch_command=["rvc-batch", "--jobs", "{jobs}", "--results", "{results}", "--model", "{model}"],
+        rvc_model_path=str(model_path),
+        rvc_batch_infer=True,
+        rvc_batch_size=2,
+    )
+    segments = [
+        _segment_with_tts(tmp_project_dir, duration=1.0, segment_id=f"seg_{index:04d}")
+        for index in range(1, 4)
+    ]
+    completed_output = _write_exact_wav(tmp_project_dir / "work" / "rvc" / "seg_0001_final.wav", duration=1.0)
+    segments[0].status = "rvc_converted"
+    assert segments[0].tts is not None
+    assert segments[0].tts.selected_candidate_path is not None
+    segments[0].rvc = RVCMetadata(
+        backend="command",
+        input_path=segments[0].tts.selected_candidate_path,
+        output_path=str(completed_output),
+        selected_profile_name="rmvpe_index045",
+        accepted=True,
+    )
+    _save_synth_manifest(tmp_project_dir, cfg, segments=segments)
+    seen_batches: list[list[str]] = []
+
+    def fake_convert_many(self, jobs: list[pipeline_steps.RVCBatchJob], **kwargs: object) -> dict[str, RVCCommandResult]:
+        _ = self, kwargs
+        seen_batches.append([job.segment_id for job in jobs])
+        results: dict[str, RVCCommandResult] = {}
+        for job in jobs:
+            _write_exact_wav(job.output_path, duration=1.0)
+            results[job.segment_id] = RVCCommandResult(job.output_path, ["batch"], "ok", "", 0, 0.1)
+        return results
+
+    monkeypatch.setattr(pipeline_steps.RVCBatchCommandClient, "convert_many", fake_convert_many)
+
+    manifest = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True)
+
+    assert seen_batches == [["seg_0002", "seg_0003"]]
+    assert manifest.stage_state["rvc"]["status"] == "completed"
     assert all(segment.rvc and segment.rvc.accepted for segment in manifest.segments)
 
 

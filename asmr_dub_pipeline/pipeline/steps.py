@@ -3754,6 +3754,19 @@ def rvc_step(
     def batch_chunks(items: list[Any], size: int) -> list[list[Any]]:
         return [items[start : start + size] for start in range(0, len(items), size)]
 
+    def rvc_output_exists(segment: Segment) -> bool:
+        if force or segment.status != "rvc_converted" or not segment.rvc or not segment.rvc.accepted:
+            return False
+        if not segment.rvc.output_path:
+            return False
+        output_path = Path(segment.rvc.output_path).expanduser()
+        if not output_path.is_absolute():
+            output_path = project_dir / output_path
+        try:
+            return output_path.exists() and output_path.stat().st_size > 0
+        except OSError:
+            return False
+
     def convert_segments_batched(segment_jobs: list[tuple[int, Segment]]) -> None:
         nonlocal last_logged_at
         batch_client = RVCBatchCommandClient(
@@ -4017,7 +4030,15 @@ def rvc_step(
             last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
             save_manifest(project_dir, manifest)
 
-    segment_jobs = list(enumerate(manifest.segments, start=1))
+    indexed_segments = list(enumerate(manifest.segments, start=1))
+    skipped_completed = sum(1 for _, segment in indexed_segments if rvc_output_exists(segment))
+    segment_jobs = [
+        (index, segment)
+        for index, segment in indexed_segments
+        if segment.status not in SKIP_STATUSES and not rvc_output_exists(segment)
+    ]
+    if skipped_completed:
+        console.print(f"[dim]rvc skipped {skipped_completed} already converted segment(s)[/dim]")
     if use_batch_rvc and len(segment_jobs) > 1:
         convert_segments_batched(segment_jobs)
     elif backend == "command" and rvc_lane_count > 1 and len(segment_jobs) > 1:
