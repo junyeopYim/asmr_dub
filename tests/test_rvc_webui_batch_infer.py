@@ -35,16 +35,33 @@ def test_batch_infer_reuses_loaded_model_for_job_file(monkeypatch, tmp_path: Pat
         "utf-8",
     )
     loaded_models: list[str] = []
+    original_argv = [
+        "webui_batch_infer.py",
+        "--rvc-root",
+        str(rvc_root),
+        "--jobs",
+        str(jobs_path),
+        "--results",
+        str(results_path),
+        "--model",
+        str(model_path),
+        "--index",
+        str(index_path),
+    ]
 
     class FakeConfig:
         device = "cpu"
         is_half = False
+
+        def __init__(self) -> None:
+            assert sys.argv == ["webui_batch_infer.py"]
 
     class FakeVC:
         def __init__(self, config: FakeConfig) -> None:
             self.config = config
 
         def get_vc(self, model_name: str) -> None:
+            assert sys.argv == ["webui_batch_infer.py"]
             loaded_models.append(model_name)
 
         def vc_single(self, *args: object) -> tuple[str, tuple[int, list[int]]]:
@@ -56,24 +73,13 @@ def test_batch_infer_reuses_loaded_model_for_job_file(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(
         sys,
         "argv",
-        [
-            "webui_batch_infer.py",
-            "--rvc-root",
-            str(rvc_root),
-            "--jobs",
-            str(jobs_path),
-            "--results",
-            str(results_path),
-            "--model",
-            str(model_path),
-            "--index",
-            str(index_path),
-        ],
+        original_argv[:],
     )
 
     webui_batch_infer.main()
 
     results = [json.loads(line) for line in results_path.read_text("utf-8").splitlines()]
+    assert sys.argv == original_argv
     assert loaded_models == ["speaker.pth"]
     assert [row["segment_id"] for row in results] == ["seg_0001", "seg_0002"]
     assert all(row["returncode"] == 0 for row in results)

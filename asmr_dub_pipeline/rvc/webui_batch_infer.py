@@ -6,6 +6,8 @@ import os
 import shutil
 import sys
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -49,6 +51,16 @@ def _register_safe_globals() -> None:
         pass
 
 
+@contextmanager
+def _without_rvc_cli_args() -> Iterator[None]:
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [original_argv[0]]
+        yield
+    finally:
+        sys.argv = original_argv
+
+
 def _load_rvc_components(rvc_root: Path) -> tuple[type[Any], type[Any]]:
     os.chdir(rvc_root)
     sys.path.insert(0, str(rvc_root))
@@ -56,8 +68,9 @@ def _load_rvc_components(rvc_root: Path) -> tuple[type[Any], type[Any]]:
 
     _register_safe_globals()
     load_dotenv()
-    from configs.config import Config
-    from infer.modules.vc.modules import VC
+    with _without_rvc_cli_args():
+        from configs.config import Config
+        from infer.modules.vc.modules import VC
 
     return Config, VC
 
@@ -163,11 +176,12 @@ def main() -> None:
     os.environ["rmvpe_root"] = str(rvc_root / "assets" / "rmvpe")  # noqa: SIM112
 
     Config, VC = _load_rvc_components(rvc_root)
-    config = Config()
-    config.device = str(args.device) if args.device else config.device
-    config.is_half = _str_to_bool(str(args.is_half))
-    vc = VC(config)
-    vc.get_vc(model_path.name)
+    with _without_rvc_cli_args():
+        config = Config()
+        config.device = str(args.device) if args.device else config.device
+        config.is_half = _str_to_bool(str(args.is_half))
+        vc = VC(config)
+        vc.get_vc(model_path.name)
 
     jobs = _read_jobs(jobs_path)
     results_path.parent.mkdir(parents=True, exist_ok=True)
