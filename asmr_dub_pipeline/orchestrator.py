@@ -15,6 +15,7 @@ from .pipeline.steps import (
     mix_step,
     prepare_source_voice_refs_step,
     qc_step,
+    regenerate_needs_step,
     rvc_step,
     rvc_train_step,
     script_step,
@@ -49,6 +50,7 @@ def run_pipeline(
     voice_bank_path: Path | None = None,
     require_voice_bank: bool = False,
     source_separation_cache_project: Path | None = None,
+    regenerate_before_mix: bool = False,
 ) -> PipelineManifest:
     if mock:
         gemma_backend = "mock"
@@ -128,6 +130,21 @@ def run_pipeline(
     else:
         rvc_train_step(project_dir, confirm_rights=confirm_rights, mock=mock)
     rvc_step(project_dir, confirm_rights=confirm_rights, mock=mock)
-    qc_step(project_dir, "mock" if use_korean_text_lane else gemma_backend)
+    qc_backend = "mock" if use_korean_text_lane else gemma_backend
+    qc_step(project_dir, qc_backend)
+    if regenerate_before_mix:
+        regenerate_needs_step(
+            project_dir,
+            refs_path=refs_path or Path("refs/refs.json"),
+            confirm_rights=confirm_rights,
+            gemma_backend=qc_backend,
+            tts_backend="gpt-sovits",
+            gsv_url=gsv_url,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+        )
     mix_step(project_dir, confirm_rights)
     return export_step(input_path, project_dir, confirm_rights)

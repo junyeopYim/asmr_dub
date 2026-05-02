@@ -1314,6 +1314,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     monkeypatch.setattr(orchestrator, "rvc_train_step", step("train-rvc"))
     monkeypatch.setattr(orchestrator, "rvc_step", step("rvc"))
     monkeypatch.setattr(orchestrator, "qc_step", step("qc"))
+    monkeypatch.setattr(orchestrator, "regenerate_needs_step", step("regenerate"))
     monkeypatch.setattr(orchestrator, "mix_step", step("mix"))
     monkeypatch.setattr(orchestrator, "export_step", step("export"))
     monkeypatch.setattr(orchestrator, "validate_rvc_config", lambda *args, **kwargs: None)
@@ -1352,3 +1353,18 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     assert calls[10][2]["mock"] is False
     assert calls[11][2]["mock"] is False
     assert calls[12][1][1] == "mock"
+
+    calls.clear()
+    orchestrator.run_pipeline(
+        tmp_path / "input.wav",
+        tmp_path / "project_regen",
+        confirm_rights=True,
+        mock=False,
+        gemma_backend="hf",
+        target_language="kr",
+        regenerate_before_mix=True,
+    )
+
+    names = [name for name, _, _ in calls]
+    assert names[names.index("qc") + 1] == "regenerate"
+    assert names[names.index("regenerate") + 1] == "mix"

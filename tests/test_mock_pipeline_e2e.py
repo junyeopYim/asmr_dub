@@ -167,7 +167,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.rvc_concurrency == 4
     assert cfg.rvc_batch_infer is True
     assert cfg.rvc_batch_size == 200
-    assert cfg.rvc_batch_concurrency == 1
+    assert cfg.rvc_batch_concurrency == 2
     assert "{sample_rate}" in cfg.rvc_train_command
     assert "{batch_size}" in cfg.rvc_train_command
     assert "{preprocess_processes}" in cfg.rvc_train_command
@@ -187,6 +187,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert kwargs["gemma_backend"] == "llama_cpp"
     assert kwargs["few_shot"] is True
     assert kwargs["gsv_few_shot_force"] is True
+    assert kwargs["regenerate_before_mix"] is True
 
 
 def test_full_real_use_trained_gpt_flag_passes_to_pipeline(

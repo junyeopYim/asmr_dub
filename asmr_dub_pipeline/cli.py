@@ -28,6 +28,7 @@ from .pipeline.steps import (
     inspect_input,
     mix_step,
     qc_step,
+    regenerate_needs_step,
     rvc_step,
     rvc_train_step,
     script_step,
@@ -101,7 +102,7 @@ FULL_REAL_QUALITY_PRESET = {
     "rvc_concurrency": 4,
     "rvc_batch_infer": True,
     "rvc_batch_size": 200,
-    "rvc_batch_concurrency": 1,
+    "rvc_batch_concurrency": 2,
     "rvc_failure_policy": "retry_then_error",
     "rvc_allow_pre_rvc_fallback": False,
 }
@@ -588,6 +589,66 @@ def synth_qwen(
     console.print(f"Qwen synthesis complete: {manifest.artifacts.get('qwen_tts')}")
 
 
+@app.command(name="regenerate")
+def regenerate(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    tts_backend: str = typer.Option("gpt-sovits", "--tts-backend", help="gpt-sovits|qwen|mock"),
+    gemma_backend: str = typer.Option("mock", "--gemma-backend", help="mock|hf|http|llama_cpp"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    gsv_url: str | None = typer.Option(None, "--gsv-url"),
+    gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
+    sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
+    auto_gsv_server: bool = typer.Option(
+        False,
+        "--auto-gsv-server/--no-auto-gsv-server",
+        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already listening.",
+    ),
+    gsv_server_command: str | None = typer.Option(
+        None,
+        "--gsv-server-command",
+        help="Shell-style command used when --auto-gsv-server needs to start api_v2.",
+    ),
+    qwen_model_id: str | None = typer.Option(None, "--qwen-model-id", help="Qwen3-TTS model id or local path."),
+    qwen_candidate_count: int | None = typer.Option(
+        None,
+        "--qwen-candidate-count",
+        min=1,
+        max=8,
+        help="Number of Qwen candidates per regenerated segment.",
+    ),
+    qwen_allow_download: bool = typer.Option(
+        False,
+        "--qwen-allow-download/--qwen-local-files-only",
+        help="Allow qwen-tts to resolve a remote Hugging Face model id.",
+    ),
+) -> None:
+    """Regenerate QC-flagged segments, then rerun RVC and QC before mix."""
+    try:
+        manifest = regenerate_needs_step(
+            project.expanduser().resolve(),
+            refs_path=refs,
+            confirm_rights=confirm_rights,
+            gemma_backend=gemma_backend,
+            tts_backend=tts_backend,
+            gsv_url=gsv_url,
+            gpt_weights_path=gpt_weights,
+            sovits_weights_path=sovits_weights,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+            qwen_model_id=qwen_model_id,
+            qwen_candidate_count=qwen_candidate_count,
+            qwen_local_files_only=False if qwen_allow_download else None,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Regeneration complete: {manifest.stage_state.get('regenerate')}")
+
+
 @app.command(name="train-rvc")
 def train_rvc(
     project: Path = typer.Option(..., "--project", "-p"),
@@ -981,6 +1042,7 @@ def full(
             voice_bank_path=voice_bank,
             require_voice_bank=require_voice_bank,
             source_separation_cache_project=source_separation_cache_project,
+            regenerate_before_mix=real,
         )
     except Exception as exc:
         _handle_error(exc)

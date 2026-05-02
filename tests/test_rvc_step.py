@@ -301,6 +301,8 @@ def test_rvc_batch_command_converts_segments_in_chunks(tmp_project_dir: Path, mo
     ]
     _save_synth_manifest(tmp_project_dir, cfg, segments=segments)
     seen_batches: list[list[str]] = []
+    save_calls: list[Path] = []
+    original_save_manifest = pipeline_steps.save_manifest
 
     def fake_convert_many(self, jobs: list[pipeline_steps.RVCBatchJob], **kwargs: object) -> dict[str, RVCCommandResult]:
         _ = self, kwargs
@@ -311,11 +313,17 @@ def test_rvc_batch_command_converts_segments_in_chunks(tmp_project_dir: Path, mo
             results[job.segment_id] = RVCCommandResult(job.output_path, ["batch"], "ok", "", 0, 0.1)
         return results
 
+    def counting_save_manifest(project_dir: Path, manifest: PipelineManifest) -> Path:
+        save_calls.append(project_dir)
+        return original_save_manifest(project_dir, manifest)
+
     monkeypatch.setattr(pipeline_steps.RVCBatchCommandClient, "convert_many", fake_convert_many)
+    monkeypatch.setattr(pipeline_steps, "save_manifest", counting_save_manifest)
 
     manifest = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True)
 
     assert seen_batches == [["seg_0001", "seg_0002"], ["seg_0003"]]
+    assert len(save_calls) == 3
     assert manifest.stage_state["rvc"]["status"] == "completed"
     assert manifest.stage_state["rvc"]["execution_mode"] == "batch"
     assert all(segment.rvc and segment.rvc.accepted for segment in manifest.segments)
@@ -367,6 +375,49 @@ def test_rvc_batch_skips_already_converted_segments(tmp_project_dir: Path, monke
     assert seen_batches == [["seg_0002", "seg_0003"]]
     assert manifest.stage_state["rvc"]["status"] == "completed"
     assert all(segment.rvc and segment.rvc.accepted for segment in manifest.segments)
+
+
+def test_regenerate_needs_step_rebuilds_only_regeneration_segments(
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    pipeline_steps.init_project(tmp_project_dir)
+    cfg = ProjectConfig(rvc_backend="mock")
+    ok_segment = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    ok_segment.status = "ok"
+    ok_segment.qc = QCMetadata(recommendation="pass", status="ok")
+    regen_segment = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    regen_segment.status = "needs_regeneration"
+    regen_segment.qc = QCMetadata(
+        recommendation="regenerate",
+        status="needs_regeneration",
+        issues=["duration_ratio_out_of_range"],
+    )
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[ok_segment, regen_segment])
+    synthesized: list[str] = []
+    original_mock_synthesize = pipeline_steps._mock_synthesize
+
+    def counting_mock_synthesize(output_path: Path, duration: float, seed: int, sample_rate: int = 48_000) -> Path:
+        synthesized.append(output_path.name)
+        return original_mock_synthesize(output_path, duration, seed, sample_rate)
+
+    monkeypatch.setattr(pipeline_steps, "_mock_synthesize", counting_mock_synthesize)
+
+    manifest = pipeline_steps.regenerate_needs_step(
+        tmp_project_dir,
+        tts_backend="mock",
+        gemma_backend="mock",
+        confirm_rights=True,
+    )
+
+    assert synthesized
+    assert all(name.startswith("seg_0002") for name in synthesized)
+    assert manifest.segments[0].status == "ok"
+    assert manifest.segments[1].status == "ok"
+    assert manifest.segments[1].rvc is not None
+    assert manifest.segments[1].rvc.accepted is True
+    assert manifest.stage_state["regenerate"]["status"] == "completed"
+    assert manifest.stage_state["regenerate"]["target_segments"] == ["seg_0002"]
 
 
 def test_all_candidates_failing_causes_hard_failure(tmp_project_dir: Path, monkeypatch) -> None:

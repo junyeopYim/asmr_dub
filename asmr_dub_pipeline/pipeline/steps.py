@@ -2320,6 +2320,7 @@ def synth_step(
     auto_gsv_server: bool | None = None,
     gsv_server_command: list[str] | str | None = None,
     use_trained_gpt: bool = False,
+    only_segment_ids: set[str] | None = None,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
@@ -2787,6 +2788,7 @@ def synth_step(
         segment_jobs = [
             (index, segment, _segment_lane_index(segment, index - 1, gsv_lane_count))
             for index, segment in enumerate(manifest.segments, start=1)
+            if only_segment_ids is None or segment.id in only_segment_ids
         ]
         if not mock and gsv_lane_count > 1 and len(segment_jobs) > 1:
             with ThreadPoolExecutor(max_workers=gsv_lane_count) as executor:
@@ -2828,7 +2830,11 @@ def synth_step(
                 reused_existing=gsv_instances[0]["reused_existing"],
                 log_path=gsv_instances[0]["log_path"],
             )
-        failed_synth_segments = [segment.id for segment in manifest.segments if segment.status == "failed"]
+        failed_synth_segments = [
+            segment.id
+            for segment in manifest.segments
+            if segment.status == "failed" and (only_segment_ids is None or segment.id in only_segment_ids)
+        ]
         if not mock and failed_synth_segments:
             mark_stage(
                 manifest,
@@ -2876,6 +2882,7 @@ def synth_qwen_step(
     candidate_count: int | None = None,
     promote: bool = False,
     local_files_only: bool | None = None,
+    only_segment_ids: set[str] | None = None,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
@@ -2917,6 +2924,8 @@ def synth_qwen_step(
     speaker_refs_cache: dict[str, dict[str, GPTSoVITSRef]] = {}
 
     for index, segment in enumerate(manifest.segments, start=1):
+        if only_segment_ids is not None and segment.id not in only_segment_ids:
+            continue
         if not segment.script:
             payload = {
                 "backend": "qwen-tts",
@@ -3494,6 +3503,7 @@ def rvc_step(
     force: bool = False,
     mock: bool | None = None,
     runner: Any | None = None,
+    only_segment_ids: set[str] | None = None,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
@@ -3898,7 +3908,6 @@ def rvc_step(
                     f"{' reused=true' if result.reused_existing else ''}[/dim]"
                 )
                 last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
-                save_manifest(project_dir, manifest)
             return rejected
 
         for profile in profiles:
@@ -3983,6 +3992,7 @@ def rvc_step(
                             next_pending.extend(apply_batch_result(entries, None, exc))
                         else:
                             next_pending.extend(apply_batch_result(entries, results))
+                        save_manifest(project_dir, manifest)
             else:
                 for entries in batch_tasks:
                     try:
@@ -3991,6 +4001,7 @@ def rvc_step(
                         next_pending.extend(apply_batch_result(entries, None, exc))
                     else:
                         next_pending.extend(apply_batch_result(entries, results))
+                    save_manifest(project_dir, manifest)
             pending = next_pending
 
         for index, segment, input_path, model_path, index_path in pending:
@@ -4028,9 +4039,14 @@ def rvc_step(
                 segment.errors.append(error)
                 failed_segments.append(segment.id)
             last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+        if pending:
             save_manifest(project_dir, manifest)
 
-    indexed_segments = list(enumerate(manifest.segments, start=1))
+    indexed_segments = [
+        (index, segment)
+        for index, segment in enumerate(manifest.segments, start=1)
+        if only_segment_ids is None or segment.id in only_segment_ids
+    ]
     skipped_completed = sum(1 for _, segment in indexed_segments if rvc_output_exists(segment))
     segment_jobs = [
         (index, segment)
@@ -4105,7 +4121,12 @@ def rvc_step(
     return manifest
 
 
-def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) -> PipelineManifest:
+def qc_step(
+    project_dir: Path,
+    backend_kind: str,
+    confirm_rights: bool = False,
+    only_segment_ids: set[str] | None = None,
+) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
     total = len(manifest.segments)
@@ -4118,6 +4139,8 @@ def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) 
     started_at = monotonic()
     last_logged_at = started_at
     for index, segment in enumerate(manifest.segments, start=1):
+        if only_segment_ids is not None and segment.id not in only_segment_ids:
+            continue
         if segment.status in {"needs_manual_review", "failed"}:
             last_logged_at = _log_segment_progress(
                 "qc", index, total, segment, manifest, started_at, last_logged_at
@@ -4155,6 +4178,121 @@ def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) 
     mark_stage(manifest, "qc", "completed", backend=backend_kind, segment_counts=_segment_counts(manifest))
     save_manifest(project_dir, manifest)
     _log_stage_complete("qc", manifest, f"backend={backend_kind}")
+    return manifest
+
+
+def regenerate_needs_step(
+    project_dir: Path,
+    *,
+    refs_path: Path = Path("refs/refs.json"),
+    confirm_rights: bool = False,
+    gemma_backend: str = "mock",
+    tts_backend: str = "gpt-sovits",
+    gsv_url: str | None = None,
+    gpt_weights_path: str | None = None,
+    sovits_weights_path: str | None = None,
+    use_trained_gpt: bool = False,
+    auto_gsv_server: bool | None = None,
+    gsv_server_command: list[str] | str | None = None,
+    qwen_model_id: str | None = None,
+    qwen_candidate_count: int | None = None,
+    qwen_local_files_only: bool | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    target_ids = {
+        segment.id
+        for segment in manifest.segments
+        if segment.status == "needs_regeneration"
+        and segment.qc is not None
+        and segment.qc.recommendation == "regenerate"
+    }
+    _log_stage_start("regenerate", f"segments={len(target_ids)}, tts_backend={tts_backend}")
+    if not target_ids:
+        mark_stage(
+            manifest,
+            "regenerate",
+            "skipped",
+            target_status="needs_regeneration",
+            target_segments=[],
+            segment_counts=_segment_counts(manifest),
+        )
+        save_manifest(project_dir, manifest)
+        _log_stage_complete("regenerate", manifest, "no target segments")
+        return manifest
+
+    for segment in manifest.segments:
+        if segment.id not in target_ids:
+            continue
+        segment.rvc = None
+        segment.mix = {}
+    _invalidate_downstream_after_tts_promotion(manifest)
+    save_manifest(project_dir, manifest)
+
+    backend = tts_backend.strip().lower().replace("_", "-")
+    if backend in {"gpt-sovits", "gsv"}:
+        synth_step(
+            project_dir,
+            gsv_url,
+            refs_path,
+            mock=False,
+            confirm_rights=confirm_rights,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+            only_segment_ids=target_ids,
+        )
+    elif backend == "mock":
+        synth_step(
+            project_dir,
+            gsv_url,
+            refs_path,
+            mock=True,
+            confirm_rights=confirm_rights,
+            only_segment_ids=target_ids,
+        )
+    elif backend == "qwen":
+        synth_qwen_step(
+            project_dir,
+            refs_path,
+            confirm_rights=confirm_rights,
+            model_id=qwen_model_id,
+            candidate_count=qwen_candidate_count,
+            promote=True,
+            local_files_only=qwen_local_files_only,
+            only_segment_ids=target_ids,
+        )
+    else:
+        raise ValueError("tts_backend must be one of: gpt-sovits, qwen, mock")
+
+    rvc_step(project_dir, confirm_rights=confirm_rights, only_segment_ids=target_ids)
+    manifest = qc_step(
+        project_dir,
+        gemma_backend,
+        confirm_rights=confirm_rights,
+        only_segment_ids=target_ids,
+    )
+    remaining = [
+        segment.id for segment in manifest.segments if segment.id in target_ids and segment.status == "needs_regeneration"
+    ]
+    mark_stage(
+        manifest,
+        "regenerate",
+        "completed",
+        tts_backend=backend,
+        gemma_backend=gemma_backend,
+        target_segments=sorted(target_ids),
+        remaining_needs_regeneration=remaining,
+        segment_counts=_segment_counts(manifest),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete(
+        "regenerate",
+        manifest,
+        f"processed={len(target_ids)} remaining_needs_regeneration={len(remaining)}",
+    )
     return manifest
 
 
