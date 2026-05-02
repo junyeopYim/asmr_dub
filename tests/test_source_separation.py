@@ -65,7 +65,6 @@ def test_real_transcribe_runs_source_separation_and_uses_vocal_mono(
         project / "pipeline.yaml",
     )
     extract_step(tiny_wav_path, project, confirm_rights=True)
-    segment_step(project)
     captured: dict[str, Path] = {}
 
     class FakeASRBackend:
@@ -88,6 +87,7 @@ def test_real_transcribe_runs_source_separation_and_uses_vocal_mono(
     manifest = transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
 
     assert manifest.stage_state["source-separation"]["status"] == "completed"
+    assert manifest.stage_state["transcribe-seed"]["status"] == "completed"
     assert captured["audio_path"] == Path(manifest.artifacts["source_vocals_mono_16k"])
     assert captured["audio_path"].name == "source_vocals_mono_16k.wav"
     assert manifest.stage_state["transcribe"]["status"] == "completed"

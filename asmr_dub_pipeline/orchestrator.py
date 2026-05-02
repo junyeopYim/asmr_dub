@@ -93,21 +93,29 @@ def run_pipeline(
             source_separation_cache_project,
         )
     source_separation_step(project_dir, confirm_rights)
-    segment_step(project_dir)
-    if use_voice_bank:
-        assign_speakers_step(
-            project_dir,
-            voice_bank_path=voice_bank_path,
-            backend_kind=None,
-            require_all=True,
-        )
     if use_korean_text_lane:
         transcribe_step(project_dir, asr_backend=normalized_asr_backend)
+        segment_step(project_dir)
+        if use_voice_bank:
+            assign_speakers_step(
+                project_dir,
+                voice_bank_path=voice_bank_path,
+                backend_kind=None,
+                require_all=True,
+            )
         translate_ko_step(project_dir, "mock" if mock else "llama_server")
         korean_script_step(project_dir)
         if not mock and not use_voice_bank:
             prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
     else:
+        segment_step(project_dir)
+        if use_voice_bank:
+            assign_speakers_step(
+                project_dir,
+                voice_bank_path=voice_bank_path,
+                backend_kind=None,
+                require_all=True,
+            )
         if use_few_shot:
             transcribe_step(project_dir, asr_backend=normalized_asr_backend)
         analyze_step(project_dir, gemma_backend)

@@ -426,7 +426,7 @@ def segment(
     project: Path = typer.Option(..., "--project", "-p"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
 ) -> None:
-    """Create preliminary segment manifests."""
+    """Finalize ASR-derived segments or create preliminary segment manifests."""
     try:
         manifest = segment_step(project.expanduser().resolve(), confirm_rights=confirm_rights)
     except Exception as exc:
@@ -918,7 +918,7 @@ def run(
         help="Require speaker assignment and per-speaker SoVITS/RVC models before synthesis.",
     ),
 ) -> None:
-    """Run extract, segment, analyze, script, synth, QC, mix, and export."""
+    """Run the configured end-to-end lane, then synth, RVC, QC, mix, and export."""
     if not confirm_rights:
         _handle_error(RightsError(RIGHTS_MESSAGE))
     try:

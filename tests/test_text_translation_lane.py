@@ -994,9 +994,9 @@ def test_transcribe_and_translate_mock_steps_write_artifacts(
     tmp_project_dir: Path,
 ) -> None:
     extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
-    segment_step(tmp_project_dir)
 
     transcribe_step(tmp_project_dir, asr_backend="mock")
+    segment_step(tmp_project_dir)
     translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
     korean_script_step(tmp_project_dir, confirm_rights=True)
     save_project_config(
@@ -1007,6 +1007,8 @@ def test_transcribe_and_translate_mock_steps_write_artifacts(
 
     manifest = load_manifest(tmp_project_dir)
     assert manifest.stage_state["transcribe"]["status"] == "completed"
+    assert manifest.stage_state["transcribe-seed"]["status"] == "completed"
+    assert manifest.stage_state["segment"]["source"] == "transcribe"
     assert manifest.stage_state["translate-ko"]["status"] == "completed"
     assert manifest.stage_state["korean-script"]["status"] == "completed"
     assert manifest.stage_state["prepare-refs"]["status"] == "completed"
@@ -1020,7 +1022,9 @@ def test_transcribe_and_translate_mock_steps_write_artifacts(
     assert manifest.segments[0].script.ja_text.startswith("mock source script")
     assert manifest.segments[0].script.tts_text.startswith("자연 번역,")
     assert Path(manifest.artifacts["source_segments"]).exists()
+    assert Path(manifest.artifacts["segments_transcribe_seed"]).exists()
     assert Path(manifest.artifacts["segments_transcribed"]).exists()
+    assert Path(manifest.artifacts["segments_final"]).exists()
     assert Path(manifest.artifacts["translation_bundles"]).exists()
     assert Path(manifest.artifacts["translation_summary"]).exists()
     assert Path(manifest.artifacts["segments_ko_script"]).exists()
@@ -1534,8 +1538,8 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "init",
         "extract",
         "source-separation",
-        "segment",
         "transcribe",
+        "segment",
         "translate-ko",
         "korean-script",
         "prepare-refs",
@@ -1547,7 +1551,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "mix",
         "export",
     ]
-    assert calls[4][2]["asr_backend"] == "qwen_asr"
+    assert calls[3][2]["asr_backend"] == "qwen_asr"
     assert calls[5][1][1] == "llama_server"
     assert calls[9][2]["mock"] is False
     assert calls[10][2]["mock"] is False

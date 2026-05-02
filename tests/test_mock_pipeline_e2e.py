@@ -78,6 +78,7 @@ def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path
     )
     assert result.exit_code == 0, result.output
     assert "extract started" in result.output
+    assert result.output.index("transcribe started") < result.output.index("segment started")
     assert "translate-ko: 1/" in result.output
     assert "korean-script: 1/" in result.output
     assert "synth: 1/" in result.output
@@ -89,7 +90,9 @@ def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path
     assert str(project.resolve()) in result.output
     manifest = load_manifest(project)
     assert manifest.rights_audit.confirmed is True
+    assert manifest.stage_state["segment"]["source"] == "transcribe"
     assert manifest.artifacts["export"].endswith("_dub.wav")
+    assert Path(manifest.artifacts["segments_final"]).exists()
     assert Path(manifest.artifacts["export"]).exists()
 
 

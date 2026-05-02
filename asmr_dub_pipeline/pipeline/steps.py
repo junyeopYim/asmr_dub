@@ -1207,12 +1207,69 @@ def source_separation_step(
     return manifest
 
 
+def _write_segments_manifest(path: Path, segments: list[Segment]) -> None:
+    write_json_atomic(path, {"segments": [s.model_dump(mode="json") for s in segments]})
+
+
+def _seed_segments_for_transcribe(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    audio_path: Path,
+    mix_audio_path: Path,
+) -> bool:
+    if manifest.segments:
+        return False
+    audio_duration = round(max(duration_sec(audio_path), 0.05), 3)
+    seed = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=audio_duration,
+        duration=audio_duration,
+        audio_for_gemma=str(project_dir / "work" / "segments" / "audio" / "seg_0001_gemma.wav"),
+        audio_for_mix=str(project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"),
+        keep_original_texture=True,
+        status="raw",
+    )
+    manifest.segments = write_segment_audio_clips([seed], audio_path, mix_audio_path, project_dir)
+    seed_path = project_dir / "work" / "segments" / "manifests" / "segments_transcribe_seed.json"
+    _write_segments_manifest(seed_path, manifest.segments)
+    manifest.artifacts["segments_transcribe_seed"] = str(seed_path)
+    mark_stage(
+        manifest,
+        "transcribe-seed",
+        "completed",
+        segment_count=len(manifest.segments),
+        source_audio=str(audio_path),
+        mix_audio=str(mix_audio_path),
+    )
+    save_manifest(project_dir, manifest)
+    return True
+
+
 def segment_step(project_dir: Path, confirm_rights: bool = False) -> PipelineManifest:
     _log_stage_start("segment", f"project={project_dir}")
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
     _require_audio_stage_rights(manifest, "segment", confirm_rights)
     cfg = manifest.project_config
+    if manifest.stage_state.get("transcribe", {}).get("status") == "completed" and manifest.segments:
+        raw_path = project_dir / "work" / "segments" / "manifests" / "segments_raw.json"
+        final_path = project_dir / "work" / "segments" / "manifests" / "segments_final.json"
+        _write_segments_manifest(raw_path, manifest.segments)
+        _write_segments_manifest(final_path, manifest.segments)
+        manifest.artifacts["segments_raw"] = str(raw_path)
+        manifest.artifacts["segments_final"] = str(final_path)
+        mark_stage(
+            manifest,
+            "segment",
+            "completed",
+            source="transcribe",
+            segment_count=len(manifest.segments),
+            segment_counts=_segment_counts(manifest),
+        )
+        save_manifest(project_dir, manifest)
+        _log_stage_complete("segment", manifest, f"finalized={len(manifest.segments)}")
+        return manifest
     started_at = monotonic()
     last_logged_at = started_at
 
@@ -1261,7 +1318,7 @@ def segment_step(project_dir: Path, confirm_rights: bool = False) -> PipelineMan
         )
     manifest.segments = segments
     raw_path = project_dir / "work" / "segments" / "manifests" / "segments_raw.json"
-    write_json_atomic(raw_path, {"segments": [s.model_dump(mode="json") for s in segments]})
+    _write_segments_manifest(raw_path, segments)
     manifest.artifacts["segments_raw"] = str(raw_path)
     mark_stage(manifest, "segment", "completed", segment_count=len(segments), segment_counts=_segment_counts(manifest))
     save_manifest(project_dir, manifest)
@@ -1359,8 +1416,6 @@ def transcribe_step(
     total = len(manifest.segments)
     _log_stage_start("transcribe", f"backend={backend_kind}, segments={total}")
     _require_audio_stage_rights(manifest, "transcribe", confirm_rights, metadata={"backend": backend_kind})
-    if not manifest.segments:
-        raise ValueError("Transcribe requires existing segments. Run segment first.")
     if backend_kind != "mock" and "source_vocals_mono_16k" not in manifest.artifacts:
         manifest = source_separation_step(project_dir, confirm_rights=confirm_rights)
         _load_config_into_manifest(project_dir, manifest)
@@ -1381,18 +1436,20 @@ def transcribe_step(
         )
     )
     _validate_audio_contract(audio_path, cfg.gemma_sample_rate, 1, audio_path.stem)
+    mix_audio_path = Path(
+        manifest.artifacts.get(
+            "source_vocals_48k",
+            manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav"),
+        )
+    )
+    seeded_for_transcribe = _seed_segments_for_transcribe(project_dir, manifest, audio_path, mix_audio_path)
+    total = len(manifest.segments)
     backend = create_asr_backend(backend_kind, _asr_backend_config(cfg))
     chunks = backend.transcribe(audio_path, manifest.segments)
     resegmented_from_chunks = False
     previous_segment_count = len(manifest.segments)
     manual_segments_path = project_dir / "work" / "segments" / "manifests" / "segments_manual.json"
     if cfg.asr_resegment_from_chunks and backend_kind != "mock" and chunks and not manual_segments_path.exists():
-        mix_audio_path = Path(
-            manifest.artifacts.get(
-                "source_vocals_48k",
-                manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav"),
-            )
-        )
         resegmented = _segments_from_asr_chunks(
             chunks,
             project_dir=project_dir,
@@ -1455,6 +1512,7 @@ def transcribe_step(
         segment_count=total,
         previous_segment_count=previous_segment_count,
         asr_chunk_count=len(chunks),
+        seeded_for_transcribe=seeded_for_transcribe,
         resegmented_from_chunks=resegmented_from_chunks,
         transcribed=with_text,
         needs_manual_review=total - with_text,

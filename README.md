@@ -81,7 +81,9 @@ Expected mock outputs:
 
 - `work/audio/original_stereo_48k.wav`
 - `work/audio/gemma_mono_16k.wav`
+- `work/segments/manifests/segments_transcribe_seed.json` when `transcribe` starts without existing segments
 - `work/segments/manifests/segments_raw.json`
+- `work/segments/manifests/segments_final.json` when `segment` finalizes ASR-derived segments
 - `work/segments/manifests/segments_gemma.json`
 - `work/segments/manifests/segments_script.json`
 - `work/transcribe/source_segments.jsonl` when `transcribe` is run
@@ -103,8 +105,9 @@ Expected mock outputs:
 ```bash
 asmr-dub init ./project
 asmr-dub extract ./owned_source.mp4 --project ./project --confirm-rights
-asmr-dub segment --project ./project
+asmr-dub separate-background --project ./project --confirm-rights
 asmr-dub transcribe --project ./project --asr-backend faster_whisper
+asmr-dub segment --project ./project
 asmr-dub translate-ko --project ./project --gemma-text-backend llama_server
 asmr-dub analyze --project ./project --gemma-backend hf --model-id google/gemma-4-E4B-it
 asmr-dub script --project ./project --gemma-backend hf
@@ -292,8 +295,9 @@ attempts.
 
 ## Korean Translation Lane
 
-`transcribe` creates segment-level source scripts from `work/audio/gemma_mono_16k.wav`
-using local ASR. `translate-ko` then sends only text to Gemma4 through
+`transcribe` runs local ASR over the source vocal audio. If no segments exist
+yet, it creates a single temporary transcription seed, then `segment` finalizes
+the ASR timestamps into TTS-ready segment clips. `translate-ko` then sends only text to Gemma4 through
 `llama-server`; it never uses the unsupported `llama-mtmd-cli --audio` path.
 By default it starts one text model server and uses `gemma_text_concurrency`
 slot workers against the same endpoint instead of duplicating the model across

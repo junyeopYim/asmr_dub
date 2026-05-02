@@ -7,13 +7,12 @@ input media
 extract -> original_stereo_48k.wav + gemma_mono_16k.wav
   |
   v
-segment -> segments_raw.json + per-segment clips
+source-separation -> vocals + background stems
   |
   v
-Gemma analyze -> segments_gemma.json
-  |
-  v
-Gemma script + normalizer -> JapaneseScript metadata
+language lane
+  |-- Korean: transcribe -> segment -> translate-ko -> korean-script
+  `-- non-Korean: segment -> Gemma analyze -> Gemma script
   |
   v
 GPT-SoVITS or mock synth -> candidates + selected final WAV
