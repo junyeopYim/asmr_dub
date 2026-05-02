@@ -33,6 +33,7 @@ from .pipeline.steps import (
     script_step,
     segment_step,
     source_separation_step,
+    synth_qwen_step,
     synth_step,
     transcribe_step,
     translate_ko_step,
@@ -507,6 +508,48 @@ def synth(
     except Exception as exc:
         _handle_error(exc)
     console.print("Synthesis complete.")
+
+
+@app.command(name="synth-qwen")
+def synth_qwen(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    model_id: str | None = typer.Option(None, "--model-id", help="Qwen3-TTS model id or local path."),
+    candidate_count: int | None = typer.Option(
+        None,
+        "--candidate-count",
+        min=1,
+        max=8,
+        help="Number of Qwen candidates per segment. Defaults to qwen_tts_candidate_count.",
+    ),
+    promote: bool = typer.Option(
+        False,
+        "--promote/--compare-only",
+        help="Replace selected TTS with the best Qwen candidate and invalidate downstream RVC/QC/mix.",
+    ),
+    allow_download: bool = typer.Option(
+        False,
+        "--allow-download/--local-files-only",
+        help="Allow qwen-tts to resolve a remote Hugging Face model id instead of requiring repo-local cache.",
+    ),
+) -> None:
+    """Generate Qwen TTS candidates from an existing scripted manifest."""
+    try:
+        manifest = synth_qwen_step(
+            project.expanduser().resolve(),
+            refs,
+            confirm_rights=confirm_rights,
+            model_id=model_id,
+            candidate_count=candidate_count,
+            promote=promote,
+            local_files_only=False if allow_download else None,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Qwen synthesis complete: {manifest.artifacts.get('qwen_tts')}")
 
 
 @app.command(name="train-rvc")

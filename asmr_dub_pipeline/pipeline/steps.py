@@ -89,6 +89,7 @@ from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest,
 from asmr_dub_pipeline.pipeline.state import mark_stage
 from asmr_dub_pipeline.qc.audio_qc import measure_audio_qc
 from asmr_dub_pipeline.qc.scoring import score_qc
+from asmr_dub_pipeline.qwen_tts import QwenTTSClient, QwenTTSError, QwenTTSRequest, qwen_language
 from asmr_dub_pipeline.rights import (
     RightsError,
     ensure_inside_project,
@@ -245,6 +246,14 @@ def _manifest_tts_languages(manifest: PipelineManifest) -> set[str]:
         if language:
             languages.add(language)
     return languages
+
+
+def _segment_tts_text_language(segment: Segment, project_target_language: str) -> str:
+    script_language = _canonical_language(segment.script.tts_language if segment.script else None)
+    target_language = _canonical_language(project_target_language) or "ko"
+    if script_language == "ko" or target_language == "ko":
+        return "ko"
+    return script_language or target_language
 
 
 def _resolve_manifest_path(project_dir: Path, value: str | None) -> Path | None:
@@ -2097,6 +2106,21 @@ def _tts_candidate_path(project_dir: Path, segment_id: str, candidate_index: int
     return project_dir / "work" / "tts" / "candidates" / f"{segment_id}_cand_{candidate_index}{suffix}.wav"
 
 
+def _qwen_tts_candidate_path(project_dir: Path, segment_id: str, candidate_index: int) -> Path:
+    return project_dir / "work" / "tts" / "qwen" / "candidates" / f"{segment_id}_qwen_cand_{candidate_index}.wav"
+
+
+def _qwen_tts_best_path(project_dir: Path, segment_id: str) -> Path:
+    return project_dir / "work" / "tts" / "qwen" / f"{segment_id}_qwen_best.wav"
+
+
+def _invalidate_downstream_after_tts_promotion(manifest: PipelineManifest) -> None:
+    for stage in ("rvc", "qc", "mix", "export"):
+        manifest.stage_state.pop(stage, None)
+    for artifact in ("rvc_manifest", "rvc", "qc", "mix", "export"):
+        manifest.artifacts.pop(artifact, None)
+
+
 def synth_step(
     project_dir: Path,
     gsv_url: str | None,
@@ -2646,6 +2670,335 @@ def synth_step(
     finally:
         for server_manager in reversed(server_managers):
             server_manager.stop()
+
+
+def synth_qwen_step(
+    project_dir: Path,
+    refs_path: Path,
+    confirm_rights: bool = False,
+    *,
+    model_id: str | None = None,
+    candidate_count: int | None = None,
+    promote: bool = False,
+    local_files_only: bool | None = None,
+) -> PipelineManifest:
+    manifest = load_manifest(project_dir)
+    _load_config_into_manifest(project_dir, manifest)
+    cfg = manifest.project_config
+    total = len(manifest.segments)
+    effective_model_id = model_id or cfg.qwen_tts_model_id
+    effective_candidate_count = candidate_count or cfg.qwen_tts_candidate_count
+    effective_local_files_only = cfg.qwen_tts_local_files_only if local_files_only is None else local_files_only
+    _log_stage_start(
+        "synth-qwen",
+        f"model={effective_model_id}, segments={total}, candidates={effective_candidate_count}, promote={promote}",
+    )
+    refs = load_refs(refs_path, project_dir=project_dir)
+    actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
+    refs_metadata = _refs_audit_metadata(actual_refs_path, refs)
+    manifest.rights_audit = require_existing_or_confirmed_rights(
+        manifest.rights_audit,
+        confirm_rights,
+        "synth-qwen",
+        _manifest_source_path(manifest),
+        metadata={"backend": "qwen-tts", "model_id": effective_model_id, **refs_metadata},
+    )
+    use_speaker_refs = bool(cfg.gsv_speaker_models)
+    if use_speaker_refs:
+        _validate_gsv_speaker_models(project_dir, manifest)
+    client = QwenTTSClient(
+        model_id=effective_model_id,
+        device_map=cfg.qwen_tts_device_map,
+        dtype=cfg.qwen_tts_dtype,
+        attn_implementation=cfg.qwen_tts_attn_implementation,
+        local_files_only=effective_local_files_only,
+    )
+    source_language = _canonical_language(cfg.source_language)
+    target_language = _canonical_language(cfg.target_language)
+    started_at = monotonic()
+    last_logged_at = started_at
+    failed_segments: list[str] = []
+    promoted_segments: list[str] = []
+    speaker_refs_cache: dict[str, dict[str, GPTSoVITSRef]] = {}
+
+    for index, segment in enumerate(manifest.segments, start=1):
+        if not segment.script:
+            payload = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "error": "Cannot synthesize without script metadata.",
+            }
+            segment.analysis["qwen_tts"] = payload
+            if promote:
+                segment.status = "needs_manual_review"
+                segment.errors.append(payload["error"])
+                failed_segments.append(segment.id)
+            last_logged_at = _log_segment_progress(
+                "synth-qwen",
+                index,
+                total,
+                segment,
+                manifest,
+                started_at,
+                last_logged_at,
+            )
+            continue
+        if target_language == "ko":
+            preflight = preflight_tts_text(
+                segment.script,
+                target_language=target_language,
+                source_text=segment.source_script.text if segment.source_script else "",
+                min_hangul_ratio=cfg.gsv_ko_text_min_hangul_ratio,
+            )
+            segment.analysis["pre_synth_qwen_text_qc"] = preflight.as_payload()
+            if preflight.blocked:
+                payload = {
+                    "backend": "qwen-tts",
+                    "model_id": effective_model_id,
+                    "error": "Korean TTS preflight blocked synthesis: " + ", ".join(preflight.issues),
+                    "preflight": preflight.as_payload(),
+                }
+                segment.analysis["qwen_tts"] = payload
+                if promote:
+                    segment.status = "needs_manual_review"
+                    segment.errors.append(payload["error"])
+                    failed_segments.append(segment.id)
+                last_logged_at = _log_segment_progress(
+                    "synth-qwen",
+                    index,
+                    total,
+                    segment,
+                    manifest,
+                    started_at,
+                    last_logged_at,
+                )
+                continue
+
+        segment_refs = refs
+        requested_ref_style = segment.script.ref_style
+        resolved_ref_style = requested_ref_style if requested_ref_style in segment_refs else "whisper_close"
+        speaker_refs_path: Path | None = None
+        if use_speaker_refs and segment.speaker_id:
+            speaker_cfg = _gsv_speaker_cfg(cfg, segment)
+            if speaker_cfg is not None:
+                speaker_refs_path = _resolve_gsv_speaker_path(project_dir, speaker_cfg.refs_path)
+                cache_key = str(speaker_refs_path)
+                if cache_key not in speaker_refs_cache:
+                    speaker_refs_cache[cache_key] = load_refs(speaker_refs_path, project_dir)
+                segment_refs = speaker_refs_cache[cache_key]
+                if requested_ref_style not in segment_refs:
+                    requested_ref_style = speaker_cfg.default_ref_style
+                resolved_ref_style = requested_ref_style if requested_ref_style in segment_refs else "whisper_close"
+        ref = resolve_ref(segment_refs, requested_ref_style)
+        tts_text_language = _segment_tts_text_language(segment, target_language)
+        qwen_request_language = qwen_language(tts_text_language)
+        generation_kwargs = {
+            "temperature": cfg.qwen_tts_temperature,
+            "top_p": cfg.qwen_tts_top_p,
+            "max_new_tokens": cfg.qwen_tts_max_new_tokens,
+        }
+        candidates: list[TTSCandidate] = []
+        for candidate_index in range(effective_candidate_count):
+            seed = cfg.base_seed + index * 100 + candidate_index
+            candidate_path = _qwen_tts_candidate_path(project_dir, segment.id, candidate_index)
+            request = QwenTTSRequest(
+                text=segment.script.tts_text,
+                language=qwen_request_language,
+                ref_audio_path=ref.ref_audio_path,
+                ref_text=ref.prompt_text,
+                seed=seed,
+                x_vector_only_mode=cfg.qwen_tts_x_vector_only_mode,
+                generation_kwargs=generation_kwargs,
+            )
+            payload: dict[str, Any] = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "speaker_id": segment.speaker_id,
+                "requested_ref_style": segment.script.ref_style,
+                "resolved_ref_style": resolved_ref_style,
+                "fallback_used": resolved_ref_style != segment.script.ref_style,
+                "speaker_refs_path": str(speaker_refs_path) if speaker_refs_path else None,
+                "source_language": source_language,
+                "target_language": target_language,
+                "cross_lingual_voice_transfer": source_language != target_language,
+                "target_duration_sec": segment.duration,
+                "prompt_lang": ref.prompt_lang,
+                **request.as_payload(),
+            }
+            try:
+                result = client.synthesize_to_file(request, candidate_path)
+                if cfg.gsv_trim_edge_silence:
+                    trim = trim_edge_silence(
+                        candidate_path,
+                        threshold_db=cfg.gsv_trim_silence_threshold_db,
+                        keep_sec=cfg.gsv_trim_silence_keep_sec,
+                    )
+                    payload.setdefault("postprocess", {})["edge_silence_trim"] = trim
+                duration = duration_sec(candidate_path)
+                payload["sample_rate"] = result.sample_rate
+            except QwenTTSError as exc:
+                candidates.append(
+                    TTSCandidate(
+                        candidate_index=candidate_index,
+                        seed=seed,
+                        payload=payload,
+                        output_path=str(candidate_path),
+                        backend="qwen-tts",
+                        error=str(exc),
+                    )
+                )
+                continue
+            too_long = duration_too_long(duration, segment.duration, cfg.duration_tolerance)
+            too_short = duration_too_short(duration, segment.duration, cfg.duration_tolerance)
+            candidate_ratio = duration_ratio(duration, segment.duration)
+            duration_gate = "too_long" if too_long else "too_short" if too_short else "pass"
+            language_contract_ok = payload["text"] == segment.script.tts_text
+            if target_language == "ko":
+                language_contract_ok = language_contract_ok and payload["language"] == "Korean"
+            acceptable_for_mix = duration_gate == "pass" and language_contract_ok
+            payload["duration_ratio"] = candidate_ratio
+            payload["duration_gate"] = duration_gate
+            candidates.append(
+                TTSCandidate(
+                    candidate_index=candidate_index,
+                    seed=seed,
+                    payload=payload,
+                    output_path=str(candidate_path),
+                    duration_sec=duration,
+                    backend="qwen-tts",
+                    duration_ratio=candidate_ratio,
+                    duration_gate=duration_gate,
+                    acceptable_for_mix=acceptable_for_mix,
+                    selection_score=max(0.0, 1.0 - min(abs(candidate_ratio - 1.0), 1.0)),
+                    selection_reason=(
+                        "duration_and_language_contract_pass"
+                        if acceptable_for_mix
+                        else "duration_or_language_contract_failed"
+                    ),
+                )
+            )
+
+        successful = [
+            candidate for candidate in candidates if not candidate.error and candidate.duration_sec is not None
+        ]
+        acceptable = [candidate for candidate in successful if candidate.acceptable_for_mix]
+        selected = (
+            min(acceptable or successful, key=lambda c: abs((c.duration_sec or 0.0) - segment.duration))
+            if successful
+            else None
+        )
+        selected_path: Path | None = None
+        if selected is None:
+            failed_segments.append(segment.id)
+            summary = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "candidate_count": effective_candidate_count,
+                "selected_candidate_path": None,
+                "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+                "error": "All Qwen TTS candidates failed.",
+            }
+            segment.analysis["qwen_tts"] = summary
+            if promote:
+                segment.status = "failed"
+                segment.errors.append("All Qwen TTS candidates failed.")
+        else:
+            selected.selected = True
+            selected_path = _qwen_tts_best_path(project_dir, segment.id)
+            ensure_not_same_path(Path(selected.output_path), selected_path)
+            selected_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(selected.output_path, selected_path)
+            summary = {
+                "backend": "qwen-tts",
+                "model_id": effective_model_id,
+                "candidate_count": effective_candidate_count,
+                "selected_candidate_path": str(selected_path),
+                "selected_duration_gate": selected.duration_gate,
+                "selected_acceptable_for_mix": selected.acceptable_for_mix,
+                "selected_duration_ratio": selected.duration_ratio,
+                "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+            }
+            segment.analysis["qwen_tts"] = summary
+            if promote:
+                final_path = project_dir / "work" / "tts" / f"{segment.id}_final.wav"
+                ensure_not_same_path(Path(selected.output_path), final_path)
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(selected.output_path, final_path)
+                segment.tts = TTSMetadata(
+                    backend="qwen-tts",
+                    ref_style=resolved_ref_style,
+                    speed_factor=1.0,
+                    candidate_count=effective_candidate_count,
+                    selected_candidate_path=str(final_path),
+                    candidates=candidates,
+                    source_language=source_language,
+                    target_language=target_language,
+                    cross_lingual_voice_transfer=source_language != target_language,
+                    retry_summary={
+                        "selected_duration_gate": selected.duration_gate,
+                        "selected_acceptable_for_mix": selected.acceptable_for_mix,
+                        "selected_duration_ratio": selected.duration_ratio,
+                    },
+                )
+                segment.rvc = None
+                segment.qc = None
+                segment.mix = {}
+                segment.status = "synthesized"
+                promoted_segments.append(segment.id)
+        save_manifest(project_dir, manifest)
+        last_logged_at = _log_segment_progress(
+            "synth-qwen",
+            index,
+            total,
+            segment,
+            manifest,
+            started_at,
+            last_logged_at,
+            note=f"selected={selected_path}" if selected_path else None,
+        )
+
+    if promoted_segments:
+        _invalidate_downstream_after_tts_promotion(manifest)
+    out_path = project_dir / "work" / "tts" / "qwen" / "qwen_tts_manifest.json"
+    write_json_atomic(
+        out_path,
+        {
+            "backend": "qwen-tts",
+            "model_id": effective_model_id,
+            "promote": promote,
+            "segments": [
+                {
+                    "id": segment.id,
+                    "qwen_tts": segment.analysis.get("qwen_tts"),
+                }
+                for segment in manifest.segments
+            ],
+        },
+    )
+    manifest.artifacts["qwen_tts"] = str(out_path)
+    status = "failed" if promote and failed_segments else "completed"
+    mark_stage(
+        manifest,
+        "synth-qwen",
+        status,
+        backend="qwen-tts",
+        model_id=effective_model_id,
+        candidate_count=effective_candidate_count,
+        promote=promote,
+        promoted_segments=promoted_segments,
+        failed_segments=failed_segments,
+        qwen_tts_manifest=str(out_path),
+        segment_counts=_segment_counts(manifest),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("synth-qwen", manifest, f"backend=qwen-tts promote={promote}")
+    if promote and failed_segments:
+        raise QwenTTSError(
+            "Qwen TTS synthesis failed for segments: "
+            + ", ".join(failed_segments[:20])
+            + (" ..." if len(failed_segments) > 20 else "")
+        )
+    return manifest
 
 
 def _rvc_profile_for_segment(cfg: ProjectConfig, profile: RVCProfile, segment: Segment) -> RVCProfile:

@@ -260,6 +260,16 @@ class ProjectConfig(StrictBaseModel):
     asr_model_id: str = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
     asr_language: str = "ja"
     asr_local_files_only: bool = True
+    qwen_tts_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    qwen_tts_candidate_count: int = Field(default=4, ge=1, le=8)
+    qwen_tts_device_map: str = "cuda:0"
+    qwen_tts_dtype: str = "bfloat16"
+    qwen_tts_attn_implementation: str = "flash_attention_2"
+    qwen_tts_local_files_only: bool = True
+    qwen_tts_temperature: float = Field(default=0.65, ge=0.0, le=2.0)
+    qwen_tts_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
+    qwen_tts_max_new_tokens: int = Field(default=4096, ge=1)
+    qwen_tts_x_vector_only_mode: bool = False
     asr_resegment_from_chunks: bool = True
     asr_resegment_min_sec: float = Field(default=0.8, gt=0)
     asr_resegment_merge_gap_sec: float = Field(default=0.45, ge=0)
@@ -532,7 +542,7 @@ class TTSCandidate(StrictBaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     output_path: str
     duration_sec: float | None = Field(default=None, ge=0)
-    backend: Literal["mock", "gpt-sovits"] = "mock"
+    backend: Literal["mock", "gpt-sovits", "qwen-tts"] = "mock"
     selected: bool = False
     error: str | None = None
     duration_ratio: float | None = Field(default=None, ge=0)
@@ -544,7 +554,7 @@ class TTSCandidate(StrictBaseModel):
 
 
 class TTSMetadata(StrictBaseModel):
-    backend: Literal["mock", "gpt-sovits"] = "mock"
+    backend: Literal["mock", "gpt-sovits", "qwen-tts"] = "mock"
     ref_style: str = "whisper_close"
     speed_factor: float = Field(default=1.0, gt=0)
     candidate_count: int = Field(default=1, ge=1)

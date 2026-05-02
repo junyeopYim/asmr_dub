@@ -23,6 +23,8 @@ STANDARD_DIRS = [
     "work/segments/audio",
     "work/segments/manifests",
     "work/tts/candidates",
+    "work/tts/qwen",
+    "work/tts/qwen/candidates",
     "work/rvc_train/dataset",
     "work/rvc_train/model",
     "work/rvc_train/logs",
