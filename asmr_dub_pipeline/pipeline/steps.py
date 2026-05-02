@@ -970,6 +970,357 @@ def _repair_asr_chunks(
     return sorted(repaired_chunks, key=lambda item: (item.start, item.end)), summary
 
 
+ASR_TEXT_REVIEW_GLOSSARY = [
+    "絶頂",
+    "媚薬",
+    "耳舐め",
+    "耳なめ",
+    "暗示",
+    "快感",
+    "10数える",
+]
+
+
+def _asr_text_with_replacements(text: str, replacements: dict[str, str]) -> str:
+    normalized = text
+    for source, target in replacements.items():
+        if source:
+            normalized = normalized.replace(source, target)
+    return normalized
+
+
+def _asr_review_context(chunks: list[ASRChunk], index: int, radius: int, *, before: bool) -> list[dict[str, Any]]:
+    if radius <= 0:
+        return []
+    if before:
+        selected = chunks[max(0, index - radius) : index]
+    else:
+        selected = chunks[index + 1 : index + 1 + radius]
+    return [
+        {
+            "start": round(chunk.start, 3),
+            "end": round(chunk.end, 3),
+            "text": chunk.text,
+        }
+        for chunk in selected
+        if chunk.text.strip()
+    ]
+
+
+def _asr_text_review_item(
+    chunks: list[ASRChunk],
+    index: int,
+    *,
+    cfg: Any,
+) -> dict[str, Any] | None:
+    chunk = chunks[index]
+    text = chunk.text.strip()
+    if not text or NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
+        return None
+    suspicious_patterns = [
+        pattern
+        for pattern in cfg.asr_text_review_suspicious_text_patterns
+        if pattern and pattern in text
+    ]
+    candidate_text = _asr_text_with_replacements(
+        text,
+        cfg.asr_text_review_candidate_replacements,
+    ).strip()
+    low_confidence = (
+        chunk.confidence is not None
+        and chunk.confidence < cfg.asr_text_review_confidence_threshold
+    )
+    if not suspicious_patterns and candidate_text == text and not low_confidence:
+        return None
+
+    candidates: list[dict[str, str]] = [{"candidate_id": "original", "text": text}]
+    if candidate_text and candidate_text != text:
+        candidates.append({"candidate_id": "domain_replacement", "text": candidate_text})
+    return {
+        "chunk_id": f"chunk_{index + 1:04d}",
+        "chunk_index": index,
+        "start": round(chunk.start, 3),
+        "end": round(chunk.end, 3),
+        "duration": round(max(0.0, chunk.end - chunk.start), 3),
+        "confidence": chunk.confidence,
+        "suspicious_patterns": suspicious_patterns,
+        "context_before": _asr_review_context(
+            chunks,
+            index,
+            cfg.asr_text_review_context_radius,
+            before=True,
+        ),
+        "context_after": _asr_review_context(
+            chunks,
+            index,
+            cfg.asr_text_review_context_radius,
+            before=False,
+        ),
+        "glossary": ASR_TEXT_REVIEW_GLOSSARY,
+        "candidates": candidates,
+    }
+
+
+def _append_unique_asr_review_candidate(
+    item: dict[str, Any],
+    *,
+    candidate_id: str,
+    text: str,
+) -> bool:
+    normalized_text = text.strip()
+    if not normalized_text:
+        return False
+    candidates = item.setdefault("candidates", [])
+    if any(
+        isinstance(candidate, dict) and str(candidate.get("text", "")).strip() == normalized_text
+        for candidate in candidates
+    ):
+        return False
+    candidates.append({"candidate_id": candidate_id, "text": normalized_text})
+    return True
+
+
+def _generated_asr_review_candidate_options(cfg: Any) -> list[tuple[str, float, dict[str, Any]]]:
+    padding_values = [
+        max(0.0, float(value))
+        for value in getattr(cfg, "asr_text_review_candidate_padding_sec", [])
+    ]
+    if not padding_values:
+        padding_values = [0.8]
+    prompt = str(getattr(cfg, "asr_text_review_initial_prompt", "") or "").strip()
+    options: list[tuple[str, float, dict[str, Any]]] = []
+    for index, padding_sec in enumerate(padding_values, start=1):
+        base_options: dict[str, Any] = {
+            "vad_filter": False,
+            "vad_parameters": None,
+            "condition_on_previous_text": False,
+            "word_timestamps": False,
+            "hallucination_silence_threshold": None,
+        }
+        options.append((f"asr_no_vad_pad_{index}", padding_sec, base_options))
+        if prompt:
+            options.append(
+                (
+                    f"asr_prompted_pad_{index}",
+                    padding_sec,
+                    {**base_options, "initial_prompt": prompt},
+                )
+            )
+    return options
+
+
+def _add_generated_asr_review_candidates(
+    review_items: list[dict[str, Any]],
+    *,
+    backend: Any,
+    project_dir: Path,
+    review_audio_path: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> int:
+    if not cfg.asr_text_review_generate_candidates:
+        return 0
+    if not callable(getattr(backend, "transcribe_with_options", None)):
+        return 0
+    if not review_audio_path.exists():
+        return 0
+
+    generated = 0
+    review_dir = project_dir / "work" / "transcribe" / "asr_text_review_clips"
+    for item in review_items:
+        chunk_id = str(item.get("chunk_id") or "chunk")
+        start = float(item["start"])
+        end = float(item["end"])
+        for option_id, padding_sec, options in _generated_asr_review_candidate_options(cfg):
+            clip_start = max(0.0, start - padding_sec)
+            clip_end = min(audio_duration_sec, end + padding_sec)
+            if clip_end <= clip_start:
+                continue
+            clip_path = review_dir / f"{chunk_id}_{option_id}.wav"
+            ffmpeg.slice_audio(
+                review_audio_path,
+                clip_start,
+                clip_end,
+                clip_path,
+                sample_rate=cfg.gemma_sample_rate,
+                channels=1,
+            )
+            try:
+                candidate_chunks = _transcribe_with_backend_options(backend, clip_path, [], **options)
+            except Exception:
+                continue
+            candidate_text = _asr_candidate_text(candidate_chunks)
+            if _append_unique_asr_review_candidate(
+                item,
+                candidate_id=option_id,
+                text=candidate_text,
+            ):
+                generated += 1
+            replaced_text = _asr_text_with_replacements(
+                candidate_text,
+                cfg.asr_text_review_candidate_replacements,
+            )
+            if replaced_text != candidate_text and _append_unique_asr_review_candidate(
+                item,
+                candidate_id=f"{option_id}_domain_replacement",
+                text=replaced_text,
+            ):
+                generated += 1
+    return generated
+
+
+def _review_asr_chunks_with_text_model(
+    chunks: list[ASRChunk],
+    *,
+    backend: Any,
+    project_dir: Path,
+    review_audio_path: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> tuple[list[ASRChunk], dict[str, Any]]:
+    summary: dict[str, Any] = {
+        "enabled": bool(cfg.asr_text_review_enabled),
+        "backend": cfg.asr_text_review_backend,
+        "attempted": 0,
+        "reviewed": 0,
+        "replaced": 0,
+        "manual_review": 0,
+        "skipped": 0,
+        "generated_candidates": 0,
+        "error": None,
+        "items": [],
+    }
+    if not cfg.asr_text_review_enabled or not chunks:
+        return chunks, summary
+
+    review_items = [
+        item
+        for index in range(len(chunks))
+        if (item := _asr_text_review_item(chunks, index, cfg=cfg)) is not None
+    ]
+    if cfg.asr_text_review_max_chunks >= 0 and len(review_items) > cfg.asr_text_review_max_chunks:
+        summary["skipped"] = len(review_items) - cfg.asr_text_review_max_chunks
+        review_items = review_items[: cfg.asr_text_review_max_chunks]
+    if not review_items:
+        return chunks, summary
+
+    summary["generated_candidates"] = _add_generated_asr_review_candidates(
+        review_items,
+        backend=backend,
+        project_dir=project_dir,
+        review_audio_path=review_audio_path,
+        audio_duration_sec=audio_duration_sec,
+        cfg=cfg,
+    )
+
+    backend_kind = cfg.asr_text_review_backend.replace("-", "_")
+    if backend_kind not in {"llama_server", "mock"}:
+        summary["error"] = f"unsupported backend: {cfg.asr_text_review_backend}"
+        return chunks, summary
+
+    review_by_chunk_id = {str(item["chunk_id"]): item for item in review_items}
+    selected_text_by_chunk_id: dict[str, str] = {}
+    review_results: dict[str, dict[str, Any]] = {}
+    model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
+    base_url = cfg.gemma_text_server_url.rstrip("/")
+
+    def create_review_client() -> Any:
+        if backend_kind == "llama_server":
+            return LlamaServerTranslationClient(
+                base_url,
+                timeout_sec=cfg.gemma_text_timeout_sec,
+                retries=cfg.gemma_text_retries,
+                n_predict=cfg.gemma_text_n_predict,
+                model=model_name,
+                two_pass=False,
+            )
+        return MockTranslationClient(model=model_name)
+
+    server_manager = None
+    if backend_kind == "llama_server":
+        server_manager = ManagedGemmaTextServer(
+            enabled=cfg.gemma_text_server_auto_start,
+            base_url=base_url,
+            command=(
+                _gemma_text_server_command(cfg, base_url=base_url, lane_index=0)
+                if cfg.gemma_text_server_auto_start
+                else []
+            ),
+            log_path=project_dir / "work" / "transcribe" / "asr_text_review_llama_server.log",
+            startup_timeout_sec=cfg.gemma_text_server_startup_timeout_sec,
+            shutdown_timeout_sec=cfg.gemma_text_server_shutdown_timeout_sec,
+        )
+
+    try:
+        if server_manager is not None:
+            server_manager.start()
+        client = create_review_client()
+        for batch_index, batch in enumerate(
+            _chunked(review_items, cfg.asr_text_review_batch_size),
+            start=1,
+        ):
+            batch_id = f"asr_review_{batch_index:04d}"
+            review_results.update(client.review_asr_candidates(batch, batch_id))
+    except Exception as exc:
+        summary["error"] = str(exc)
+        return chunks, summary
+    finally:
+        if server_manager is not None:
+            server_manager.stop()
+
+    summary["attempted"] = len(review_items)
+    reviewed_chunks = [chunk.model_copy() for chunk in chunks]
+    for chunk_id, review in review_results.items():
+        item = review_by_chunk_id.get(chunk_id)
+        if item is None:
+            continue
+        candidate_by_id = {
+            str(candidate["candidate_id"]): str(candidate["text"])
+            for candidate in item.get("candidates", [])
+            if isinstance(candidate, dict)
+        }
+        selected_id = str(review.get("selected_candidate_id") or "")
+        selected_text = candidate_by_id.get(selected_id)
+        confidence = review.get("confidence")
+        accepted = (
+            review.get("decision") == "replace"
+            and selected_id != "original"
+            and selected_text is not None
+            and confidence is not None
+            and confidence >= cfg.asr_text_review_confidence_threshold
+        )
+        if review.get("decision") == "manual_review":
+            summary["manual_review"] += 1
+        if accepted:
+            selected_text_by_chunk_id[chunk_id] = selected_text
+            summary["replaced"] += 1
+        summary["items"].append(
+            {
+                "chunk_id": chunk_id,
+                "start": item["start"],
+                "end": item["end"],
+                "accepted": accepted,
+                "decision": review.get("decision"),
+                "selected_candidate_id": selected_id,
+                "confidence": confidence,
+                "original_text": candidate_by_id.get("original", ""),
+                "selected_text": selected_text,
+                "reason": review.get("reason"),
+                "risk_terms": review.get("risk_terms", []),
+                "suspicious_patterns": item.get("suspicious_patterns", []),
+            }
+        )
+
+    for index, chunk in enumerate(reviewed_chunks):
+        chunk_id = f"chunk_{index + 1:04d}"
+        selected_text = selected_text_by_chunk_id.get(chunk_id)
+        if selected_text is not None:
+            reviewed_chunks[index] = chunk.model_copy(update={"text": selected_text})
+
+    summary["reviewed"] = len(review_results)
+    return reviewed_chunks, summary
+
+
 def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1229,6 +1580,85 @@ def _refresh_translation_rows(rows: list[dict[str, Any]], segments: list[Segment
         row["numeric_counting_postprocessed"] = (
             NUMERIC_COUNTING_POSTPROCESS_NOTE in segment.translation_ko.notes
         )
+
+
+def _translation_asr_backcheck_item(segment: Segment, cfg: Any) -> dict[str, Any] | None:
+    if segment.source_script is None or segment.translation_ko is None:
+        return None
+    source_text = segment.source_script.text.strip()
+    translation_text = " ".join(
+        text.strip()
+        for text in [
+            segment.translation_ko.ko_literal,
+            segment.translation_ko.ko_natural,
+        ]
+        if text.strip()
+    )
+    source_hits = [
+        pattern
+        for pattern in cfg.asr_translation_backcheck_source_patterns
+        if pattern and pattern in source_text
+    ]
+    translation_hits = [
+        pattern
+        for pattern in cfg.asr_translation_backcheck_ko_patterns
+        if pattern and pattern in translation_text
+    ]
+    if not source_hits and not translation_hits:
+        return None
+    reasons: list[str] = []
+    if source_hits:
+        reasons.append("source_text_contains_known_asr_risk")
+    if translation_hits:
+        reasons.append("korean_translation_contains_asr_smell")
+    return {
+        "segment_id": segment.id,
+        "start": round(segment.start, 3),
+        "end": round(segment.end, 3),
+        "source_text": source_text,
+        "ko_natural": segment.translation_ko.ko_natural,
+        "source_hits": source_hits,
+        "translation_hits": translation_hits,
+        "reasons": reasons,
+        "recommendation": "rerun_asr_text_review_or_manual_review",
+    }
+
+
+def _apply_translation_asr_backcheck(
+    segments: list[Segment],
+    cfg: Any,
+) -> list[dict[str, Any]]:
+    if not cfg.asr_translation_backcheck_enabled:
+        return []
+    items = [
+        item
+        for segment in segments
+        if (item := _translation_asr_backcheck_item(segment, cfg)) is not None
+    ]
+    for item in items:
+        segment = next((candidate for candidate in segments if candidate.id == item["segment_id"]), None)
+        if segment is None:
+            continue
+        message = (
+            "ASR translation backcheck flagged possible source transcription issue: "
+            f"source_hits={item['source_hits']} translation_hits={item['translation_hits']}"
+        )
+        if message not in segment.errors:
+            segment.errors.append(message)
+        if cfg.asr_translation_backcheck_mark_manual_review:
+            segment.status = "needs_manual_review"
+    return items
+
+
+def _attach_asr_backcheck_to_translation_rows(
+    rows: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+) -> None:
+    by_segment_id = {str(item["segment_id"]): item for item in items}
+    for row in rows:
+        item = by_segment_id.get(str(row.get("segment_id") or ""))
+        if item is not None:
+            row["asr_backcheck"] = item
 
 
 def _translation_context_segments(
@@ -1893,10 +2323,16 @@ def transcribe_step(
     project_dir: Path,
     asr_backend: str | None = None,
     confirm_rights: bool = False,
+    asr_text_review: bool | None = None,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
     cfg = manifest.project_config
+    if asr_text_review is not None:
+        cfg = type(cfg).model_validate(
+            {**cfg.model_dump(mode="json"), "asr_text_review_enabled": asr_text_review}
+        )
+        manifest.project_config = cfg
     backend_kind = asr_backend or cfg.asr_backend
     total = len(manifest.segments)
     _log_stage_start("transcribe", f"backend={backend_kind}, segments={total}")
@@ -1905,6 +2341,11 @@ def transcribe_step(
         manifest = source_separation_step(project_dir, confirm_rights=confirm_rights)
         _load_config_into_manifest(project_dir, manifest)
         cfg = manifest.project_config
+        if asr_text_review is not None:
+            cfg = type(cfg).model_validate(
+                {**cfg.model_dump(mode="json"), "asr_text_review_enabled": asr_text_review}
+            )
+            manifest.project_config = cfg
         total = len(manifest.segments)
     if backend_kind != "mock" and "source_vocals_mono_16k" not in manifest.artifacts:
         raise ValueError(
@@ -1941,6 +2382,18 @@ def transcribe_step(
         "skipped": 0,
         "items": [],
     }
+    text_review_summary: dict[str, Any] = {
+        "enabled": bool(cfg.asr_text_review_enabled),
+        "backend": cfg.asr_text_review_backend,
+        "attempted": 0,
+        "reviewed": 0,
+        "replaced": 0,
+        "manual_review": 0,
+        "skipped": 0,
+        "generated_candidates": 0,
+        "error": None,
+        "items": [],
+    }
     if backend_kind != "mock":
         repair_audio_path = Path(manifest.artifacts.get("gemma_mono_16k", audio_path))
         chunks, repair_summary = _repair_asr_chunks(
@@ -1954,6 +2407,17 @@ def transcribe_step(
         repair_summary_path = project_dir / "work" / "transcribe" / "asr_repair_summary.json"
         write_json_atomic(repair_summary_path, repair_summary)
         manifest.artifacts["asr_repair_summary"] = str(repair_summary_path)
+        chunks, text_review_summary = _review_asr_chunks_with_text_model(
+            chunks,
+            backend=backend,
+            project_dir=project_dir,
+            review_audio_path=repair_audio_path,
+            audio_duration_sec=audio_duration,
+            cfg=cfg,
+        )
+        text_review_summary_path = project_dir / "work" / "transcribe" / "asr_text_review_summary.json"
+        write_json_atomic(text_review_summary_path, text_review_summary)
+        manifest.artifacts["asr_text_review_summary"] = str(text_review_summary_path)
         chunks, asr_text_replacement_count = _apply_asr_text_replacements_to_chunks(
             chunks,
             cfg.asr_text_replacements,
@@ -2030,6 +2494,10 @@ def transcribe_step(
         asr_chunk_count=len(chunks),
         asr_repair_attempted=repair_summary.get("attempted", 0),
         asr_repair_repaired=repair_summary.get("repaired", 0),
+        asr_text_review_attempted=text_review_summary.get("attempted", 0),
+        asr_text_review_replaced=text_review_summary.get("replaced", 0),
+        asr_text_review_manual_review=text_review_summary.get("manual_review", 0),
+        asr_text_review_error=text_review_summary.get("error"),
         asr_text_replacements=asr_text_replacement_count,
         seeded_for_transcribe=seeded_for_transcribe,
         resegmented_from_chunks=resegmented_from_chunks,
@@ -2152,6 +2620,7 @@ def translate_ko_step(
     needs_manual_review = 0
     colloquialized = 0
     numeric_counting_postprocessed = 0
+    asr_backcheck_count = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
     for segment in manifest.segments:
@@ -2259,6 +2728,7 @@ def translate_ko_step(
                 "needs_manual_review": needs_manual_review,
                 "colloquialized": colloquialized,
                 "numeric_counting_postprocessed": numeric_counting_postprocessed,
+                "asr_backcheck_count": asr_backcheck_count,
                 "concurrency": translation_worker_count,
                 "context_radius": cfg.gemma_text_context_radius,
                 "span_size": cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
@@ -2461,8 +2931,21 @@ def translate_ko_step(
 
     colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
     numeric_counting_postprocessed = _apply_korean_numeric_counting_postprocess(manifest.segments)
+    asr_backcheck_items = _apply_translation_asr_backcheck(manifest.segments, cfg)
+    asr_backcheck_count = len(asr_backcheck_items)
     _refresh_translation_rows(rows, manifest.segments)
+    _attach_asr_backcheck_to_translation_rows(rows, asr_backcheck_items)
     _write_jsonl_atomic(jsonl_path, rows)
+    asr_backcheck_summary_path = project_dir / "work" / "translate_ko" / "asr_backcheck_summary.json"
+    write_json_atomic(
+        asr_backcheck_summary_path,
+        {
+            "enabled": cfg.asr_translation_backcheck_enabled,
+            "flagged": asr_backcheck_count,
+            "mark_manual_review": cfg.asr_translation_backcheck_mark_manual_review,
+            "items": asr_backcheck_items,
+        },
+    )
     summary = {
         "backend": backend_kind,
         "model": model_name,
@@ -2471,6 +2954,7 @@ def translate_ko_step(
         "needs_manual_review": needs_manual_review,
         "colloquialized": colloquialized,
         "numeric_counting_postprocessed": numeric_counting_postprocessed,
+        "asr_backcheck_count": asr_backcheck_count,
         "concurrency": translation_worker_count,
         "context_radius": cfg.gemma_text_context_radius,
         "span_size": cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
@@ -2484,6 +2968,7 @@ def translate_ko_step(
     write_json_atomic(summary_path, summary)
     manifest.artifacts["translation_bundles"] = str(jsonl_path)
     manifest.artifacts["translation_summary"] = str(summary_path)
+    manifest.artifacts["translation_asr_backcheck_summary"] = str(asr_backcheck_summary_path)
     server_metadata = None
     if backend_kind == "llama_server":
         instances = [
@@ -2519,6 +3004,7 @@ def translate_ko_step(
         needs_manual_review=needs_manual_review,
         colloquialized=colloquialized,
         numeric_counting_postprocessed=numeric_counting_postprocessed,
+        asr_backcheck_count=asr_backcheck_count,
         concurrency=translation_worker_count,
         context_radius=cfg.gemma_text_context_radius,
         span_size=cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,

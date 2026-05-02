@@ -57,6 +57,9 @@ AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".mp4", ".mkv", ".mov"}
 DEFAULT_VOICE_BANK_PROJECT_NAME = "voice_bank_all"
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
+    "asr_text_review_enabled": True,
+    "asr_text_review_generate_candidates": True,
+    "asr_translation_backcheck_enabled": True,
     "candidate_count": 3,
     "duration_tolerance": 0.25,
     "gemma_llama_cpp_ctx_size": 16384,
@@ -466,11 +469,21 @@ def analyze(
 def transcribe(
     project: Path = typer.Option(..., "--project", "-p"),
     asr_backend: str = typer.Option("faster_whisper", "--asr-backend", help="faster_whisper|qwen_asr|mock"),
+    asr_text_review: bool = typer.Option(
+        False,
+        "--asr-text-review",
+        help="Use the configured Gemma text model to review suspicious ASR candidate text.",
+    ),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
 ) -> None:
     """Create segment-level source scripts with local ASR."""
     try:
-        transcribe_step(project.expanduser().resolve(), asr_backend, confirm_rights=confirm_rights)
+        transcribe_step(
+            project.expanduser().resolve(),
+            asr_backend,
+            confirm_rights=confirm_rights,
+            asr_text_review=True if asr_text_review else None,
+        )
     except Exception as exc:
         _handle_error(exc)
     console.print("Transcription complete.")

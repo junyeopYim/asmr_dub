@@ -14,6 +14,7 @@ from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.gemma.text_translate import (
     LlamaServerTranslationClient,
+    parse_asr_text_review_response,
     parse_translation_response,
 )
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
@@ -149,6 +150,124 @@ def test_asr_resegment_drops_sparse_hallucinated_long_chunks(tmp_project_dir: Pa
         "おやすみなさい",
         "ゆっくり聞いてください",
     ]
+
+
+def test_transcribe_asr_text_review_mock_selects_domain_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_text_review_enabled=True,
+            asr_text_review_backend="mock",
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text="もっと大きな手帳が来る",
+                    language="ja",
+                    confidence=0.99,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+
+    assert manifest.segments[0].source_script is not None
+    assert manifest.segments[0].source_script.text == "もっと大きな絶頂が来る"
+    summary = json.loads(Path(manifest.artifacts["asr_text_review_summary"]).read_text("utf-8"))
+    assert summary["attempted"] == 1
+    assert summary["replaced"] == 1
+
+
+def test_asr_text_review_generates_retranscribe_candidates(
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(
+        project_name=tmp_project_dir.name,
+        asr_text_review_candidate_padding_sec=[0.1],
+        asr_text_review_initial_prompt="絶頂 媚薬 耳舐め",
+    )
+    item = {
+        "chunk_id": "chunk_0001",
+        "start": 0.0,
+        "end": 0.8,
+        "candidates": [{"candidate_id": "original", "text": "もっと大きな手帳が来る"}],
+    }
+    calls: list[dict[str, object]] = []
+
+    class FakeASRBackend:
+        def transcribe_with_options(
+            self,
+            _audio_path: Path,
+            _segments: list[Segment],
+            **overrides: object,
+        ) -> list[ASRChunk]:
+            calls.append(overrides)
+            text = "もっと大きな絶頂が来る" if "initial_prompt" in overrides else "もっと大きな手帳が来る"
+            return [ASRChunk(start=0.0, end=0.8, text=text, language="ja", confidence=0.95)]
+
+    generated = pipeline_steps._add_generated_asr_review_candidates(
+        [item],
+        backend=FakeASRBackend(),
+        project_dir=tmp_project_dir,
+        review_audio_path=tiny_wav_path,
+        audio_duration_sec=duration_sec(tiny_wav_path),
+        cfg=cfg,
+    )
+
+    assert generated == 1
+    assert len(calls) == 2
+    assert any(candidate["text"] == "もっと大きな絶頂が来る" for candidate in item["candidates"])
+
+
+def test_translation_asr_backcheck_flags_suspicious_korean_smell() -> None:
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="会館に飲み込まれて",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=1.0,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="회관에 삼켜져",
+        ko_natural="회관에 삼켜져요.",
+        model="mock",
+        batch_id="batch_0001",
+    )
+
+    items = pipeline_steps._apply_translation_asr_backcheck(
+        [segment],
+        ProjectConfig(project_name="test"),
+    )
+
+    assert items
+    assert items[0]["source_hits"] == ["会館"]
+    assert items[0]["translation_hits"] == ["회관"]
+    assert segment.status == "raw"
+    assert any("ASR translation backcheck" in error for error in segment.errors)
 
 
 def test_asr_resegment_splits_dense_long_chunks(tmp_project_dir: Path) -> None:
@@ -1199,6 +1318,118 @@ def test_translation_parser_accepts_minimal_model_output() -> None:
     assert translation.confidence is None
     assert translation.model == "gemma4"
     assert translation.batch_id == "batch_0001"
+
+
+def test_asr_text_review_parser_accepts_candidate_selection() -> None:
+    parsed = parse_asr_text_review_response(
+        json.dumps(
+            [
+                {
+                    "chunk_id": "chunk_0001",
+                    "decision": "replace",
+                    "selected_candidate_id": "domain_replacement",
+                    "confidence": "92%",
+                    "reason": "ASMR context points to 絶頂.",
+                    "risk_terms": ["手帳"],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        batch_id="asr_review_0001",
+        model="gemma4",
+    )
+
+    assert parsed["chunk_0001"]["decision"] == "replace"
+    assert parsed["chunk_0001"]["selected_candidate_id"] == "domain_replacement"
+    assert parsed["chunk_0001"]["confidence"] == pytest.approx(0.92)
+    assert parsed["chunk_0001"]["risk_terms"] == ["手帳"]
+
+
+def test_llama_server_translation_client_reviews_asr_candidates() -> None:
+    requests: list[dict[str, object]] = []
+    response = [
+        {
+            "chunk_id": "chunk_0001",
+            "decision": "replace",
+            "selected_candidate_id": "domain_replacement",
+            "confidence": 0.94,
+            "reason": "Adjacent ASMR context supports 絶頂.",
+            "risk_terms": ["手帳"],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]},
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=0,
+        n_predict=128,
+    )
+    reviews = client.review_asr_candidates(
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "context_before": [{"text": "もっと大きな"}],
+                "context_after": [{"text": "行く"}],
+                "candidates": [
+                    {"candidate_id": "original", "text": "もっと大きな手帳が来る"},
+                    {"candidate_id": "domain_replacement", "text": "もっと大きな絶頂が来る"},
+                ],
+            }
+        ],
+        "asr_review_0001",
+    )
+
+    assert reviews["chunk_0001"]["selected_candidate_id"] == "domain_replacement"
+    prompt = requests[0]["messages"][0]["content"]
+    assert "japanese_asr_candidate_review" in prompt
+    assert "もっと大きな絶頂が来る" in prompt
+
+
+def test_llama_server_translation_client_rejects_non_candidate_asr_text() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = [
+            {
+                "chunk_id": "chunk_0001",
+                "decision": "replace",
+                "selected_candidate_id": "invented_text",
+                "confidence": 0.99,
+                "reason": "bad",
+                "risk_terms": [],
+            }
+        ]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response)}}]},
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retries=0,
+        n_predict=128,
+    )
+
+    with pytest.raises(Exception, match="invalid selected_candidate_id"):
+        client.review_asr_candidates(
+            [
+                {
+                    "chunk_id": "chunk_0001",
+                    "candidates": [
+                        {"candidate_id": "original", "text": "手帳が来る"},
+                        {"candidate_id": "domain_replacement", "text": "絶頂が来る"},
+                    ],
+                }
+            ],
+            "asr_review_0001",
+        )
 
 
 def test_llama_server_translation_client_uses_literal_then_natural_pass() -> None:

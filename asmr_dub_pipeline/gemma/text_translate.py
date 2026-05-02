@@ -154,6 +154,44 @@ def parse_translation_response(
     return parsed
 
 
+def _coerce_review_decision(value: Any) -> str:
+    decision = str(value or "").strip().lower().replace("-", "_")
+    if decision in {"replace", "keep", "manual_review"}:
+        return decision
+    if decision in {"manual", "review", "needs_manual_review"}:
+        return "manual_review"
+    return "manual_review"
+
+
+def parse_asr_text_review_response(
+    text: str,
+    *,
+    batch_id: str,
+    model: str,
+) -> dict[str, dict[str, Any]]:
+    parsed: dict[str, dict[str, Any]] = {}
+    for item in _load_translation_items(text):
+        chunk_id = str(item.get("chunk_id") or item.get("segment_id") or "").strip()
+        if not chunk_id:
+            raise GemmaTextTranslationError("ASR review item missing chunk_id.")
+        selected_candidate_id = str(
+            item.get("selected_candidate_id") or item.get("selected_id") or item.get("candidate_id") or ""
+        ).strip()
+        if not selected_candidate_id:
+            raise GemmaTextTranslationError(f"ASR review item missing selected_candidate_id: {chunk_id}")
+        parsed[chunk_id] = {
+            "chunk_id": chunk_id,
+            "decision": _coerce_review_decision(item.get("decision")),
+            "selected_candidate_id": selected_candidate_id,
+            "confidence": _coerce_confidence(item.get("confidence")),
+            "reason": str(item.get("reason") or "").strip(),
+            "risk_terms": _coerce_notes(item.get("risk_terms")),
+            "model": str(item.get("model") or model),
+            "batch_id": str(item.get("batch_id") or batch_id),
+        }
+    return parsed
+
+
 def _parse_literal_response(
     text: str,
     *,
@@ -395,6 +433,46 @@ def build_repair_prompt(
     )
 
 
+def build_asr_text_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: str) -> str:
+    payload = {
+        "batch_id": batch_id,
+        "task": "japanese_asr_candidate_review",
+        "domain": "user-authorized Japanese ASMR transcription",
+        "items": list(items),
+    }
+    return (
+        "Return exactly one valid JSON array and no markdown. You are reviewing Japanese ASR "
+        "text candidates for a user-authorized ASMR dubbing workflow. You cannot hear the audio; "
+        "judge only from candidates, adjacent context, timing, and the ASMR glossary. Never invent "
+        "new Japanese text. For each input item, choose only one candidate_id from candidates. "
+        "Use decision='replace' only when a non-original candidate is clearly better in this "
+        "ASMR context; use decision='keep' when original is best; use decision='manual_review' "
+        "when candidates are insufficient or ambiguous. Each output item must contain only "
+        "chunk_id, decision, selected_candidate_id, confidence, reason, and risk_terms. "
+        "confidence must be 0.0 to 1.0. risk_terms must be a short array of suspicious source "
+        "terms, or an empty array. Prefer ASMR-domain readings such as 絶頂, 媚薬, 耳舐め, 暗示, "
+        "快感, and 10数える when the surrounding context clearly supports them.\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_asr_text_review_repair_prompt(
+    bad_response: str,
+    error: str,
+    batch_id: str,
+    items: Sequence[Mapping[str, Any]],
+) -> str:
+    return (
+        "Repair the previous ASR review response into exactly one valid JSON array. Each item "
+        "must contain only chunk_id, decision, selected_candidate_id, confidence, reason, and "
+        "risk_terms. selected_candidate_id must exactly match one candidate_id from the original "
+        "input item. Do not invent candidate text. "
+        f"Batch id: {batch_id}. Validation error: {error}\nOriginal input:\n"
+        f"{json.dumps({'items': list(items)}, ensure_ascii=False)}\nPrevious response:\n"
+        f"{bad_response[:6000]}"
+    )
+
+
 class LlamaServerTranslationClient:
     def __init__(
         self,
@@ -578,6 +656,64 @@ class LlamaServerTranslationClient:
             return self._translate_batch_single_pass(segments, batch_id, context_segments)
         return self._translate_batch_two_pass(segments, batch_id, context_segments)
 
+    def review_asr_candidates(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        batch_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        candidate_ids_by_chunk = {
+            str(item.get("chunk_id")): {
+                str(candidate.get("candidate_id"))
+                for candidate in item.get("candidates", [])
+                if isinstance(candidate, Mapping)
+            }
+            for item in items
+        }
+        prompt = build_asr_text_review_prompt(items, batch_id)
+        raw_response = ""
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                raw_response = self._complete(
+                    prompt
+                    if attempt == 0
+                    else build_asr_text_review_repair_prompt(
+                        raw_response,
+                        str(last_error),
+                        batch_id,
+                        items,
+                    )
+                )
+                reviews = parse_asr_text_review_response(
+                    raw_response,
+                    batch_id=batch_id,
+                    model=self.model,
+                )
+                invalid = [
+                    f"{chunk_id}: invalid selected_candidate_id {review['selected_candidate_id']}"
+                    for chunk_id, review in reviews.items()
+                    if review["selected_candidate_id"] not in candidate_ids_by_chunk.get(chunk_id, set())
+                ]
+                if invalid:
+                    raise GemmaTextTranslationError("; ".join(invalid[:5]))
+                return {
+                    chunk_id: review
+                    for chunk_id, review in reviews.items()
+                    if chunk_id in candidate_ids_by_chunk
+                }
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                break
+            except (ValueError, GemmaTextTranslationError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    continue
+                break
+        raise GemmaTextTranslationError(f"Gemma ASR text review failed: {last_error}")
+
 
 class MockTranslationClient:
     def __init__(self, model: str = "mock") -> None:
@@ -600,3 +736,35 @@ class MockTranslationClient:
                 batch_id=batch_id,
             )
         return result
+
+    def review_asr_candidates(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        batch_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        reviews: dict[str, dict[str, Any]] = {}
+        for item in items:
+            chunk_id = str(item.get("chunk_id") or "")
+            candidates = [
+                candidate for candidate in item.get("candidates", []) if isinstance(candidate, Mapping)
+            ]
+            selected = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if str(candidate.get("candidate_id")) != "original"
+                ),
+                candidates[0] if candidates else {},
+            )
+            selected_id = str(selected.get("candidate_id") or "original")
+            reviews[chunk_id] = {
+                "chunk_id": chunk_id,
+                "decision": "replace" if selected_id != "original" else "keep",
+                "selected_candidate_id": selected_id,
+                "confidence": 0.99,
+                "reason": "mock ASR review selected the first non-original candidate.",
+                "risk_terms": [],
+                "model": self.model,
+                "batch_id": batch_id,
+            }
+        return reviews

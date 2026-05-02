@@ -348,6 +348,98 @@ class ProjectConfig(StrictBaseModel):
             "微薬": "媚薬",
         }
     )
+    asr_text_review_enabled: bool = False
+    asr_text_review_backend: Literal["llama_server", "mock"] = "llama_server"
+    asr_text_review_batch_size: int = Field(default=8, ge=1, le=50)
+    asr_text_review_max_chunks: int = Field(default=160, ge=0)
+    asr_text_review_context_radius: int = Field(default=2, ge=0, le=8)
+    asr_text_review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    asr_text_review_generate_candidates: bool = True
+    asr_text_review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
+    asr_text_review_initial_prompt: str = (
+        "Japanese ASMR hypnosis dialogue vocabulary: 絶頂, 媚薬, 耳舐め, 耳なめ, "
+        "暗示, 快感, 10数える, 飛んじゃってください."
+    )
+    asr_text_review_suspicious_text_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "釣り",
+            "手帳",
+            "手頂",
+            "銃数える",
+            "10数数える",
+            "会館",
+            "開館",
+            "解凍",
+            "体感に飲み込",
+            "大根に飲み込",
+            "怪コン",
+            "美やく",
+            "美よく",
+            "びよく",
+            "耳な目",
+            "稲目",
+            "あんじゅ",
+            "暗ん示",
+        ]
+    )
+    asr_text_review_candidate_replacements: dict[str, str] = Field(
+        default_factory=lambda: {
+            "釣りが来ちゃう": "絶頂が来ちゃう",
+            "釣りが来る": "絶頂が来る",
+            "手帳が来る": "絶頂が来る",
+            "手頂が来る": "絶頂が来る",
+            "銃数える": "10数える",
+            "10数数える": "10数える",
+            "会館に飲み込": "快感に飲み込",
+            "開館に飲み込": "快感に飲み込",
+            "解凍に飲み込": "快感に飲み込",
+            "体感に飲み込": "快感に飲み込",
+            "大根に飲み込": "快感に飲み込",
+            "怪コンに飲み込": "快感に飲み込",
+            "耳な目": "耳なめ",
+            "稲目": "耳なめ",
+            "美やく": "媚薬",
+            "美よく": "媚薬",
+            "びよく": "媚薬",
+            "あんじゅ": "暗示",
+            "暗ん示": "暗示",
+        }
+    )
+    asr_translation_backcheck_enabled: bool = True
+    asr_translation_backcheck_mark_manual_review: bool = False
+    asr_translation_backcheck_source_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "釣り",
+            "手帳",
+            "手頂",
+            "銃数える",
+            "会館",
+            "開館",
+            "解凍",
+            "耳な目",
+            "稲目",
+            "美やく",
+            "美よく",
+            "あんじゅ",
+            "暗ん示",
+        ]
+    )
+    asr_translation_backcheck_ko_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "낚시",
+            "수첩",
+            "회관",
+            "개관",
+            "해동",
+            "체감",
+            "대근",
+            "괴콘",
+            "미약",
+            "비약",
+            "총 세",
+            "총을",
+        ]
+    )
     source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "demucs"
     source_separation_model: str = "htdemucs"
     source_separation_device: str | None = None

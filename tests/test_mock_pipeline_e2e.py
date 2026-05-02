@@ -131,6 +131,9 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert result.exit_code == 0, result.output
     cfg = load_project_config(project)
     assert cfg.target_language == "ko"
+    assert cfg.asr_text_review_enabled is True
+    assert cfg.asr_text_review_generate_candidates is True
+    assert cfg.asr_translation_backcheck_enabled is True
     assert cfg.candidate_count == 3
     assert cfg.duration_tolerance == 0.25
     assert cfg.gsv_few_shot_target_sec == 180.0
