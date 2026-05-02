@@ -150,8 +150,12 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gsv_min_chunk_length == 8
     assert cfg.gemma_llama_cpp_ctx_size == 16384
     assert cfg.gemma_text_batch_size == 1
+    assert cfg.gemma_text_context_radius == 8
     assert cfg.gemma_text_concurrency == 4
-    assert cfg.gemma_text_n_predict == 8192
+    assert cfg.gemma_text_n_predict == 2048
+    assert cfg.gemma_text_span_size == 8
+    assert cfg.gemma_text_span_max_sec == 45.0
+    assert cfg.gemma_text_span_max_gap_sec == 3.0
     assert cfg.mix_allow_korean_timing_draft is False
     assert cfg.rvc_required is True
     assert cfg.rvc_backend == "command"

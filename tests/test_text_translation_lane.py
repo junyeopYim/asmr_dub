@@ -128,6 +128,198 @@ def test_asr_resegment_groups_short_adjacent_chunks_for_tts(tmp_project_dir: Pat
     assert segments[1].source_script.text == "ゆっくり聞いてください"
 
 
+def test_asr_resegment_drops_sparse_hallucinated_long_chunks(tmp_project_dir: Path) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(start=0.0, end=4.0, text="おやすみなさい", language="ja", confidence=0.9),
+            ASRChunk(start=10.0, end=80.0, text="気持ちいいですね", language="ja", confidence=0.95),
+            ASRChunk(start=81.0, end=86.0, text="ゆっくり聞いてください", language="ja", confidence=0.9),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=90.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        sparse_chunk_max_sec=30.0,
+        sparse_chunk_min_chars_per_sec=0.5,
+    )
+
+    assert [segment.source_script.text for segment in segments if segment.source_script] == [
+        "おやすみなさい",
+        "ゆっくり聞いてください",
+    ]
+
+
+def test_asr_resegment_splits_dense_long_chunks(tmp_project_dir: Path) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(
+                start=0.0,
+                end=31.0,
+                text="催眠じゃないなんて思う人もいるかもしれませんが",
+                language="ja",
+                confidence=0.9,
+            ),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=40.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        max_segment_sec=20.0,
+        sparse_chunk_max_sec=30.0,
+        sparse_chunk_min_chars_per_sec=0.5,
+    )
+
+    assert len(segments) == 2
+    assert all(segment.duration <= 20.0 for segment in segments)
+    assert " ".join(segment.source_script.text for segment in segments if segment.source_script) == (
+        "催眠じゃないなんて思う人 もいるかもしれませんが"
+    )
+
+
+def test_asr_repair_flags_low_confidence_and_sparse_chunks() -> None:
+    assert pipeline_steps._asr_chunk_needs_repair(
+        ASRChunk(start=0.0, end=2.0, text="少し近づきますね", language="ja", confidence=0.91),
+        confidence_threshold=0.94,
+        sparse_min_sec=12.0,
+        sparse_min_chars_per_sec=1.0,
+    )
+    assert pipeline_steps._asr_chunk_needs_repair(
+        ASRChunk(start=10.0, end=30.0, text="鉄柱", language="ja", confidence=0.98),
+        confidence_threshold=0.94,
+        sparse_min_sec=12.0,
+        sparse_min_chars_per_sec=1.0,
+    )
+    assert pipeline_steps._asr_chunk_needs_repair(
+        ASRChunk(start=0.0, end=3.0, text="もちなとい", language="ja", confidence=0.99),
+        confidence_threshold=0.94,
+        sparse_min_sec=12.0,
+        sparse_min_chars_per_sec=1.0,
+        suspicious_text_patterns=["もちなとい"],
+    )
+    assert not pipeline_steps._asr_chunk_needs_repair(
+        ASRChunk(start=0.0, end=0.8, text="10", language="ja", confidence=0.7),
+        confidence_threshold=0.94,
+        sparse_min_sec=12.0,
+        sparse_min_chars_per_sec=1.0,
+    )
+    assert not pipeline_steps._asr_chunk_needs_repair(
+        ASRChunk(start=0.0, end=3.0, text="ゆっくり聞いてください", language="ja", confidence=0.98),
+        confidence_threshold=0.94,
+        sparse_min_sec=12.0,
+        sparse_min_chars_per_sec=1.0,
+    )
+
+
+def test_asr_repair_replaces_suspicious_chunk_with_no_vad_candidate(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((16_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+    sliced_paths: list[Path] = []
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        assert input_path == repair_audio
+        assert start == pytest.approx(9.0)
+        assert end == pytest.approx(16.0)
+        assert sample_rate == 16_000
+        assert channels == 1
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        sliced_paths.append(output_path)
+        return output_path
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, dict[str, object]]] = []
+
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            self.calls.append((audio_path, kwargs))
+            assert segments == []
+            return [
+                ASRChunk(
+                    start=1.0,
+                    end=5.0,
+                    text="ゾクゾクしますね",
+                    language="ja",
+                    confidence=0.93,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    backend = FakeBackend()
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [
+            ASRChunk(
+                start=10.0,
+                end=15.0,
+                text="付属しますね",
+                language="ja",
+                confidence=0.83,
+            )
+        ],
+        backend=backend,
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=30.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+    )
+
+    assert summary["attempted"] == 1
+    assert summary["repaired"] == 1
+    assert summary["items"][0]["accepted"] is True
+    assert repaired[0].text == "ゾクゾクしますね"
+    assert repaired[0].start == pytest.approx(10.0)
+    assert repaired[0].end == pytest.approx(14.0)
+    assert sliced_paths
+    assert backend.calls[0][1]["vad_filter"] is False
+    assert backend.calls[0][1]["vad_parameters"] is None
+
+
+def test_asr_text_replacements_normalize_known_domain_mishears() -> None:
+    chunks, replaced = pipeline_steps._apply_asr_text_replacements_to_chunks(
+        [
+            ASRChunk(
+                start=0.0,
+                end=3.0,
+                text="あっという間に釣りが来ちゃう",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=3.0,
+                end=6.0,
+                text="媚薬を塗り込んで",
+                language="ja",
+                confidence=0.95,
+            ),
+        ],
+        ProjectConfig().asr_text_replacements,
+    )
+
+    assert replaced == 1
+    assert chunks[0].text == "あっという間に絶頂が来ちゃう"
+    assert chunks[1].text == "媚薬を塗り込んで"
+
+
 def test_source_script_and_korean_translation_schema_round_trip() -> None:
     segment = sample_segment()
     segment.source_script = SourceScript(
@@ -168,8 +360,21 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().target_language == "ko"
     assert ProjectConfig(target_language="kr").target_language == "ko"
     assert ProjectConfig().asr_resegment_from_chunks is True
-    assert ProjectConfig().asr_resegment_min_sec == pytest.approx(1.0)
-    assert ProjectConfig().asr_resegment_merge_gap_sec == pytest.approx(0.6)
+    assert ProjectConfig().asr_resegment_min_sec == pytest.approx(3.0)
+    assert ProjectConfig().asr_resegment_max_sec == pytest.approx(20.0)
+    assert ProjectConfig().asr_resegment_merge_gap_sec == pytest.approx(1.0)
+    assert ProjectConfig().asr_word_timestamps is False
+    assert ProjectConfig().asr_hallucination_silence_threshold is None
+    assert ProjectConfig().asr_sparse_chunk_max_sec == pytest.approx(30.0)
+    assert ProjectConfig().asr_sparse_chunk_min_chars_per_sec == pytest.approx(0.5)
+    assert ProjectConfig().asr_repair_enabled is True
+    assert ProjectConfig().asr_repair_confidence_threshold == pytest.approx(0.94)
+    assert ProjectConfig().asr_repair_sparse_min_sec == pytest.approx(12.0)
+    assert ProjectConfig().asr_repair_sparse_min_chars_per_sec == pytest.approx(1.0)
+    assert ProjectConfig().asr_repair_padding_sec == pytest.approx(1.0)
+    assert ProjectConfig().asr_repair_max_chunks == 160
+    assert "もちなとい" in ProjectConfig().asr_repair_suspicious_text_patterns
+    assert ProjectConfig().asr_text_replacements["釣りが来ちゃう"] == "絶頂が来ちゃう"
     assert ProjectConfig().source_separation_backend == "demucs"
     assert ProjectConfig().source_separation_model == "htdemucs"
     assert ProjectConfig().gsv_trim_edge_silence is True
@@ -500,6 +705,316 @@ def test_translate_ko_groups_adjacent_segments_into_contextual_spans(
     assert manifest.stage_state["translate-ko"]["span_count"] == 1
 
 
+def test_translate_ko_batches_numeric_source_segments_with_context(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_span_size=3,
+            gemma_text_span_max_sec=30.0,
+            gemma_text_span_max_gap_sec=1.0,
+            gemma_text_concurrency=1,
+            gemma_text_context_radius=1,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+    manifest = load_manifest(tmp_project_dir)
+    base = manifest.segments[0]
+    manifest.segments = [
+        Segment(
+            id="seg_0001",
+            start=0.0,
+            end=1.0,
+            duration=1.0,
+            audio_for_gemma=base.audio_for_gemma,
+            audio_for_mix=base.audio_for_mix,
+            source_script=SourceScript(
+                text="2014",
+                language="ja",
+                confidence=0.99,
+                backend="mock",
+                start=0.0,
+                end=1.0,
+            ),
+        ),
+        Segment(
+            id="seg_0002",
+            start=1.0,
+            end=2.0,
+            duration=1.0,
+            audio_for_gemma=base.audio_for_gemma,
+            audio_for_mix=base.audio_for_mix,
+            source_script=SourceScript(
+                text="耳元です",
+                language="ja",
+                confidence=0.99,
+                backend="mock",
+                start=1.0,
+                end=2.0,
+            ),
+        ),
+        Segment(
+            id="seg_0003",
+            start=2.0,
+            end=3.0,
+            duration=1.0,
+            audio_for_gemma=base.audio_for_gemma,
+            audio_for_mix=base.audio_for_mix,
+            source_script=SourceScript(
+                text="2",
+                language="ja",
+                confidence=0.99,
+                backend="mock",
+                start=2.0,
+                end=3.0,
+            ),
+        ),
+    ]
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[tuple[str, list[str], list[str]]] = []
+
+    class FakeServer:
+        started = False
+        reused_existing = True
+        log_path = None
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+            context_segments: list[Segment] | None = None,
+        ) -> dict[str, KoreanTranslation]:
+            calls.append(
+                (
+                    batch_id,
+                    [segment.id for segment in segments],
+                    [segment.id for segment in (context_segments or [])],
+                )
+            )
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal=f"직역 {segment.id}",
+                    ko_natural=f"자연 {segment.id}",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="llama_server")
+
+    manifest = load_manifest(tmp_project_dir)
+    assert calls == [
+        (
+            "batch_0001",
+            ["seg_0001", "seg_0002", "seg_0003"],
+            ["seg_0001", "seg_0002", "seg_0003"],
+        )
+    ]
+    assert all(segment.translation_ko is not None for segment in manifest.segments)
+    assert all(
+        "deterministic_numeric_source" not in segment.translation_ko.notes
+        for segment in manifest.segments
+        if segment.translation_ko is not None
+    )
+    assert manifest.stage_state["translate-ko"]["translated"] == 3
+    assert manifest.stage_state["translate-ko"]["span_count"] == 1
+
+
+def test_numeric_counting_postprocess_normalizes_counting_runs() -> None:
+    def translated_segment(segment_id: str, source: str, ko: str, start: float) -> Segment:
+        segment = sample_segment(segment_id, start=start, end=start + 1.0)
+        segment.source_script = SourceScript(
+            text=source,
+            language="ja",
+            confidence=0.99,
+            backend="mock",
+            start=segment.start,
+            end=segment.end,
+        )
+        segment.translation_ko = KoreanTranslation(
+            ko_literal=ko,
+            ko_natural=ko,
+            notes=[],
+            confidence=0.9,
+            model="fake",
+            batch_id="batch_0001",
+        )
+        return segment
+
+    segments = [
+        translated_segment("seg_0001", "4 5", "네, 다섯", 0.0),
+        translated_segment("seg_0002", "6 7", "육, 칠", 1.0),
+        translated_segment("seg_0003", "8", "여덟", 2.0),
+        translated_segment("seg_0004", "808", "팔공팔", 20.0),
+        translated_segment("seg_0005", "80", "팔십", 21.0),
+        translated_segment("seg_0006", "60", "육십", 22.0),
+        translated_segment("seg_0007", "80", "팔십", 23.0),
+    ]
+
+    rewritten = pipeline_steps._apply_korean_numeric_counting_postprocess(segments)
+
+    assert rewritten == 2
+    assert segments[0].translation_ko is not None
+    assert segments[0].translation_ko.ko_natural == "넷, 다섯"
+    assert segments[1].translation_ko is not None
+    assert segments[1].translation_ko.ko_natural == "여섯, 일곱"
+    assert segments[3].translation_ko is not None
+    assert segments[3].translation_ko.ko_natural == "팔공팔"
+    assert segments[4].translation_ko is not None
+    assert segments[4].translation_ko.ko_natural == "팔십"
+    assert "numeric_counting_postprocess" in segments[0].translation_ko.notes
+
+
+def test_numeric_counting_postprocess_handles_interleaved_countdown() -> None:
+    def translated_segment(segment_id: str, source: str, ko: str, start: float) -> Segment:
+        segment = sample_segment(segment_id, start=start, end=start + 1.0)
+        segment.source_script = SourceScript(
+            text=source,
+            language="ja",
+            confidence=0.99,
+            backend="mock",
+            start=segment.start,
+            end=segment.end,
+        )
+        segment.translation_ko = KoreanTranslation(
+            ko_literal=ko,
+            ko_natural=ko,
+            notes=[],
+            confidence=0.9,
+            model="fake",
+            batch_id="batch_0001",
+        )
+        return segment
+
+    phrase = sample_segment("seg_0004", start=3.0, end=4.0)
+    phrase.source_script = SourceScript(
+        text="気持ちいいのが止まらない",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=3.0,
+        end=4.0,
+    )
+    phrase.translation_ko = KoreanTranslation(
+        ko_literal="기분 좋은 게 멈추질 않아요",
+        ko_natural="기분 좋은 게 멈추질 않아요",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+    segments = [
+        translated_segment("seg_0001", "10", "십", 0.0),
+        translated_segment("seg_0002", "9", "아홉", 1.0),
+        translated_segment("seg_0003", "8", "여덟", 2.0),
+        phrase,
+        translated_segment("seg_0005", "7 6", "칠, 육", 4.0),
+        translated_segment("seg_0006", "5", "다섯", 5.0),
+        translated_segment("seg_0007", "4", "사", 6.0),
+        translated_segment("seg_0008", "3", "셋", 7.0),
+        translated_segment("seg_0009", "2", "둘", 8.0),
+        translated_segment("seg_0010", "1", "일", 9.0),
+        translated_segment("seg_0011", "0", "영", 10.0),
+    ]
+
+    rewritten = pipeline_steps._apply_korean_numeric_counting_postprocess(segments)
+
+    assert rewritten == 4
+    assert segments[0].translation_ko is not None
+    assert segments[0].translation_ko.ko_natural == "열"
+    assert segments[4].translation_ko is not None
+    assert segments[4].translation_ko.ko_natural == "일곱, 여섯"
+    assert segments[6].translation_ko is not None
+    assert segments[6].translation_ko.ko_natural == "넷"
+    assert segments[9].translation_ko is not None
+    assert segments[9].translation_ko.ko_natural == "하나"
+
+
+def test_translate_ko_retranslates_legacy_deterministic_numeric_results(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    segment.source_script = SourceScript(
+        text="1",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="일",
+        ko_natural="일",
+        notes=["deterministic_numeric_source"],
+        confidence=1.0,
+        model="deterministic:numeric-source",
+        batch_id=f"numeric_{segment.id}",
+    )
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            calls.append(batch_id)
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal="하나",
+                    ko_natural="하나",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+
+    manifest = load_manifest(tmp_project_dir)
+    translation = manifest.segments[0].translation_ko
+    assert calls == ["batch_0001"]
+    assert translation is not None
+    assert translation.ko_natural == "하나"
+    assert "deterministic_numeric_source" not in translation.notes
+
+
 def test_translate_ko_force_retranslate_ignores_resumed_translations(
     monkeypatch,
     tiny_wav_path: Path,
@@ -794,11 +1309,11 @@ def test_llama_server_translation_client_repairs_low_quality_translation() -> No
     assert "だって" in second_prompt
 
 
-def test_llama_server_translation_client_repairs_numeric_count_mistranslated_as_year() -> None:
+def test_llama_server_translation_client_repairs_numeric_raw_digits() -> None:
     requests: list[dict[str, object]] = []
     responses = [
         [{"segment_id": "seg_0001", "ko_literal": "2014"}],
-        [{"segment_id": "seg_0001", "ko_natural": "이천십사년"}],
+        [{"segment_id": "seg_0001", "ko_natural": "2014"}],
         [{"segment_id": "seg_0001", "ko_natural": "이천십사"}],
     ]
 
@@ -835,8 +1350,8 @@ def test_llama_server_translation_client_repairs_numeric_count_mistranslated_as_
     assert translations["seg_0001"].ko_natural == "이천십사"
     assert len(requests) == 3
     repair_prompt = requests[2]["messages"][0]["content"]
-    assert "pure numeric source segments" in repair_prompt
-    assert "year" in repair_prompt
+    assert "numeric-only or digit-heavy" in repair_prompt
+    assert "context" in repair_prompt
 
 
 def test_llama_server_translation_client_repairs_tts_unsafe_korean_punctuation() -> None:

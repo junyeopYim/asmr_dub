@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from asmr_dub_pipeline.schemas import Segment
 
@@ -59,13 +60,27 @@ class FasterWhisperASRBackend(ASRBackend):
         model_id: str,
         language: str = "ja",
         local_files_only: bool = True,
+        beam_size: int = 5,
+        best_of: int = 5,
+        condition_on_previous_text: bool = False,
+        vad_filter: bool = True,
+        vad_parameters: dict[str, object] | None = None,
+        word_timestamps: bool = False,
+        hallucination_silence_threshold: float | None = None,
     ) -> None:
         self.model_id = model_id
         self.language = language
         self.local_files_only = local_files_only
+        self.beam_size = beam_size
+        self.best_of = best_of
+        self.condition_on_previous_text = condition_on_previous_text
+        self.vad_filter = vad_filter
+        self.vad_parameters = vad_parameters or {}
+        self.word_timestamps = word_timestamps
+        self.hallucination_silence_threshold = hallucination_silence_threshold
+        self._model: Any | None = None
 
-    def transcribe(self, audio_path: Path, segments: Sequence[Segment]) -> list[ASRChunk]:
-        _ = segments
+    def _get_model(self) -> Any:
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:
@@ -74,14 +89,43 @@ class FasterWhisperASRBackend(ASRBackend):
                 "python -m pip install -e .[asr], or use --asr-backend mock for tests."
             ) from exc
 
+        if self._model is not None:
+            return self._model
         model_size_or_path = str(_ctranslate2_snapshot_for_model(self.model_id) or self.model_id)
         try:
-            model = WhisperModel(
+            self._model = WhisperModel(
                 model_size_or_path,
                 device="auto",
                 local_files_only=self.local_files_only,
             )
-            raw_segments, info = model.transcribe(str(audio_path), language=self.language)
+        except Exception as exc:
+            raise ASRUnavailableError(f"faster-whisper model load failed: {exc}") from exc
+        return self._model
+
+    def transcribe_with_options(
+        self,
+        audio_path: Path,
+        segments: Sequence[Segment],
+        **overrides: Any,
+    ) -> list[ASRChunk]:
+        _ = segments
+        options = {
+            "language": self.language,
+            "beam_size": self.beam_size,
+            "best_of": self.best_of,
+            "condition_on_previous_text": self.condition_on_previous_text,
+            "vad_filter": self.vad_filter,
+            "vad_parameters": self.vad_parameters or None,
+            "word_timestamps": self.word_timestamps,
+            "hallucination_silence_threshold": self.hallucination_silence_threshold,
+        }
+        options.update(overrides)
+        try:
+            model = self._get_model()
+            raw_segments, info = model.transcribe(
+                str(audio_path),
+                **options,
+            )
         except Exception as exc:
             raise ASRUnavailableError(f"faster-whisper transcription failed: {exc}") from exc
 
@@ -102,3 +146,6 @@ class FasterWhisperASRBackend(ASRBackend):
                 )
             )
         return chunks
+
+    def transcribe(self, audio_path: Path, segments: Sequence[Segment]) -> list[ASRChunk]:
+        return self.transcribe_with_options(audio_path, segments)

@@ -96,6 +96,13 @@ def create_asr_backend(kind: str, config: Mapping[str, Any] | None = None) -> AS
             model_id=str(config.get("model_id", "Systran/faster-whisper-large-v3")),
             language=str(config.get("language", "ja")),
             local_files_only=bool(config.get("local_files_only", True)),
+            beam_size=int(config.get("beam_size", 5)),
+            best_of=int(config.get("best_of", 5)),
+            condition_on_previous_text=bool(config.get("condition_on_previous_text", False)),
+            vad_filter=bool(config.get("vad_filter", True)),
+            vad_parameters=dict(config.get("vad_parameters") or {}),
+            word_timestamps=bool(config.get("word_timestamps", False)),
+            hallucination_silence_threshold=config.get("hallucination_silence_threshold"),
         )
     if normalized == "qwen_asr":
         from .qwen_asr import QwenASRBackend

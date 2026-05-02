@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shlex
 import shutil
@@ -148,11 +149,37 @@ GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
     "Server disconnected",
     "All connection attempts failed",
 )
-TRANSLATION_NUMERIC_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
+LEGACY_DETERMINISTIC_NUMERIC_TRANSLATION_NOTE = "deterministic_numeric_source"
+NUMERIC_COUNTING_POSTPROCESS_NOTE = "numeric_counting_postprocess"
+NUMERIC_ONLY_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
+NUMERIC_TOKEN_RE = re.compile(r"\d+")
 KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES = {"duration_ratio_out_of_range", "too_much_silence"}
 PROGRESS_LOG_SECONDS = 30.0
 JAPANESE_TTS_LANGUAGES = {"ja", "jp", "jpn", "japanese"}
 KOREAN_TTS_LANGUAGES = {"ko", "kr", "kor", "korean"}
+NATIVE_KOREAN_COUNT_ONES = {
+    0: "영",
+    1: "하나",
+    2: "둘",
+    3: "셋",
+    4: "넷",
+    5: "다섯",
+    6: "여섯",
+    7: "일곱",
+    8: "여덟",
+    9: "아홉",
+}
+NATIVE_KOREAN_COUNT_TENS = {
+    10: "열",
+    20: "스물",
+    30: "서른",
+    40: "마흔",
+    50: "쉰",
+    60: "예순",
+    70: "일흔",
+    80: "여든",
+    90: "아흔",
+}
 RVC_REQUIRED_MESSAGE = (
     "RVC is required but has not completed. Run `asmr-dub rvc --project ... "
     "--confirm-rights` or use `asmr-dub full --real ...`."
@@ -499,6 +526,10 @@ def _can_rewrite_script_for_duration(script: JapaneseScript) -> bool:
 def _valid_asr_chunks(
     chunks: list[ASRChunk],
     audio_duration_sec: float | None,
+    *,
+    max_chunk_sec: float,
+    sparse_chunk_max_sec: float,
+    sparse_chunk_min_chars_per_sec: float,
 ) -> list[ASRChunk]:
     valid: list[ASRChunk] = []
     for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
@@ -511,8 +542,38 @@ def _valid_asr_chunks(
             end = min(float(audio_duration_sec), end)
         if end - start <= 0.05:
             continue
-        valid.append(chunk.model_copy(update={"start": start, "end": end, "text": text}))
+        duration = end - start
+        if (
+            duration > sparse_chunk_max_sec
+            and sparse_chunk_min_chars_per_sec > 0
+            and len(text) / duration < sparse_chunk_min_chars_per_sec
+        ):
+            continue
+        normalized = chunk.model_copy(update={"start": start, "end": end, "text": text})
+        valid.extend(_split_long_asr_chunk(normalized, max_chunk_sec=max_chunk_sec))
     return valid
+
+
+def _split_long_asr_chunk(chunk: ASRChunk, *, max_chunk_sec: float) -> list[ASRChunk]:
+    duration = chunk.end - chunk.start
+    if duration <= max_chunk_sec:
+        return [chunk]
+    part_count = max(1, int(math.ceil(duration / max_chunk_sec)))
+    text = chunk.text.strip()
+    if not text:
+        return []
+    chars_per_part = max(1, int(math.ceil(len(text) / part_count)))
+    parts = [text[index : index + chars_per_part].strip() for index in range(0, len(text), chars_per_part)]
+    parts = [part for part in parts if part]
+    if len(parts) <= 1:
+        return [chunk]
+    part_duration = duration / len(parts)
+    split_chunks: list[ASRChunk] = []
+    for index, part in enumerate(parts):
+        start = chunk.start + part_duration * index
+        end = chunk.end if index == len(parts) - 1 else chunk.start + part_duration * (index + 1)
+        split_chunks.append(chunk.model_copy(update={"start": start, "end": end, "text": part}))
+    return split_chunks
 
 
 def _group_asr_chunks_for_tts(
@@ -548,9 +609,18 @@ def _segments_from_asr_chunks(
     audio_duration_sec: float | None,
     min_segment_sec: float,
     merge_gap_sec: float,
+    max_segment_sec: float = 20.0,
+    sparse_chunk_max_sec: float = 30.0,
+    sparse_chunk_min_chars_per_sec: float = 0.5,
 ) -> list[Segment]:
     groups = _group_asr_chunks_for_tts(
-        _valid_asr_chunks(chunks, audio_duration_sec),
+        _valid_asr_chunks(
+            chunks,
+            audio_duration_sec,
+            max_chunk_sec=max_segment_sec,
+            sparse_chunk_max_sec=sparse_chunk_max_sec,
+            sparse_chunk_min_chars_per_sec=sparse_chunk_min_chars_per_sec,
+        ),
         min_segment_sec=min_segment_sec,
         merge_gap_sec=merge_gap_sec,
     )
@@ -602,6 +672,276 @@ def _asr_group_confidence(group: list[ASRChunk]) -> float | None:
     if total <= 0:
         return None
     return sum(confidence * duration for confidence, duration in weighted) / total
+
+
+def _asr_text_density(chunk: ASRChunk) -> float:
+    duration = max(0.001, chunk.end - chunk.start)
+    return len(chunk.text.strip()) / duration
+
+
+def _asr_text_matches_suspicious_pattern(
+    text: str,
+    suspicious_text_patterns: list[str] | tuple[str, ...],
+) -> bool:
+    for pattern in suspicious_text_patterns:
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        try:
+            if re.search(pattern, text):
+                return True
+        except re.error:
+            if pattern in text:
+                return True
+    return False
+
+
+def _asr_chunk_needs_repair(
+    chunk: ASRChunk,
+    *,
+    confidence_threshold: float,
+    sparse_min_sec: float,
+    sparse_min_chars_per_sec: float,
+    suspicious_text_patterns: list[str] | tuple[str, ...] = (),
+) -> bool:
+    text = chunk.text.strip()
+    if NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
+        return False
+    if _asr_text_matches_suspicious_pattern(text, suspicious_text_patterns):
+        return True
+    if chunk.confidence is not None and chunk.confidence < confidence_threshold:
+        return True
+    duration = chunk.end - chunk.start
+    return duration >= sparse_min_sec and _asr_text_density(chunk) < sparse_min_chars_per_sec
+
+
+def _asr_candidate_confidence(chunks: list[ASRChunk]) -> float | None:
+    weighted = [
+        (float(chunk.confidence), max(0.0, chunk.end - chunk.start))
+        for chunk in chunks
+        if chunk.confidence is not None
+    ]
+    total = sum(duration for _, duration in weighted)
+    if total <= 0:
+        return None
+    return sum(confidence * duration for confidence, duration in weighted) / total
+
+
+def _asr_candidate_text(chunks: list[ASRChunk]) -> str:
+    return " ".join(chunk.text.strip() for chunk in chunks if chunk.text.strip()).strip()
+
+
+def _apply_asr_text_replacements_to_chunks(
+    chunks: list[ASRChunk],
+    replacements: dict[str, str],
+) -> tuple[list[ASRChunk], int]:
+    if not replacements:
+        return chunks, 0
+    replaced_count = 0
+    normalized_chunks: list[ASRChunk] = []
+    for chunk in chunks:
+        text = chunk.text
+        normalized = text
+        for source, target in replacements.items():
+            if source:
+                normalized = normalized.replace(source, target)
+        if normalized != text:
+            replaced_count += 1
+            normalized_chunks.append(chunk.model_copy(update={"text": normalized}))
+        else:
+            normalized_chunks.append(chunk)
+    return normalized_chunks, replaced_count
+
+
+def _asr_repair_candidate_is_better(
+    original: ASRChunk,
+    candidate_chunks: list[ASRChunk],
+    *,
+    confidence_threshold: float,
+    sparse_min_sec: float,
+    sparse_min_chars_per_sec: float,
+    suspicious_text_patterns: list[str] | tuple[str, ...] = (),
+) -> bool:
+    candidate_text = _asr_candidate_text(candidate_chunks)
+    original_text = original.text.strip()
+    if not candidate_text:
+        return False
+    if NUMERIC_ONLY_SOURCE_RE.fullmatch(original_text):
+        return False
+    candidate_confidence = _asr_candidate_confidence(candidate_chunks)
+    original_confidence = original.confidence
+    if (
+        original_confidence is not None
+        and candidate_confidence is not None
+        and candidate_confidence + 0.12 < original_confidence
+    ):
+        return False
+    if len(candidate_text) < max(2, int(len(original_text) * 0.6)):
+        return False
+
+    original_needs_repair = _asr_chunk_needs_repair(
+        original,
+        confidence_threshold=confidence_threshold,
+        sparse_min_sec=sparse_min_sec,
+        sparse_min_chars_per_sec=sparse_min_chars_per_sec,
+        suspicious_text_patterns=suspicious_text_patterns,
+    )
+    if not original_needs_repair:
+        return False
+
+    if _asr_text_matches_suspicious_pattern(original_text, suspicious_text_patterns):
+        return candidate_text != original_text
+    if original_confidence is not None and original_confidence < confidence_threshold:
+        return True
+    original_density = _asr_text_density(original)
+    candidate_duration = max(0.001, candidate_chunks[-1].end - candidate_chunks[0].start)
+    candidate_density = len(candidate_text) / candidate_duration
+    return candidate_density > max(original_density * 1.2, sparse_min_chars_per_sec)
+
+
+def _transcribe_with_backend_options(
+    backend: Any,
+    audio_path: Path,
+    segments: list[Segment],
+    **overrides: Any,
+) -> list[ASRChunk]:
+    method = getattr(backend, "transcribe_with_options", None)
+    if callable(method):
+        return method(audio_path, segments, **overrides)
+    return backend.transcribe(audio_path, segments)
+
+
+def _repair_asr_chunks(
+    chunks: list[ASRChunk],
+    *,
+    backend: Any,
+    project_dir: Path,
+    repair_audio_path: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> tuple[list[ASRChunk], dict[str, Any]]:
+    summary: dict[str, Any] = {
+        "enabled": bool(cfg.asr_repair_enabled),
+        "attempted": 0,
+        "repaired": 0,
+        "skipped": 0,
+        "audio_path": str(repair_audio_path),
+        "items": [],
+    }
+    if not cfg.asr_repair_enabled or not chunks or not repair_audio_path.exists():
+        return chunks, summary
+    if not callable(getattr(backend, "transcribe_with_options", None)):
+        summary["skipped"] = len(chunks)
+        return chunks, summary
+
+    repair_groups: list[tuple[bool, list[ASRChunk]]] = []
+    current_repair_group: list[ASRChunk] = []
+    repair_group_gap_sec = max(1.0, float(getattr(cfg, "asr_resegment_merge_gap_sec", 1.0)))
+    for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
+        needs_repair = _asr_chunk_needs_repair(
+            chunk,
+            confidence_threshold=cfg.asr_repair_confidence_threshold,
+            sparse_min_sec=cfg.asr_repair_sparse_min_sec,
+            sparse_min_chars_per_sec=cfg.asr_repair_sparse_min_chars_per_sec,
+            suspicious_text_patterns=cfg.asr_repair_suspicious_text_patterns,
+        )
+        if needs_repair:
+            if current_repair_group and chunk.start - current_repair_group[-1].end > repair_group_gap_sec:
+                repair_groups.append((True, current_repair_group))
+                current_repair_group = []
+            current_repair_group.append(chunk)
+            continue
+        if current_repair_group:
+            repair_groups.append((True, current_repair_group))
+            current_repair_group = []
+        repair_groups.append((False, [chunk]))
+    if current_repair_group:
+        repair_groups.append((True, current_repair_group))
+
+    repaired_chunks: list[ASRChunk] = []
+    repair_dir = project_dir / "work" / "transcribe" / "repair_clips"
+    attempted = 0
+    for should_repair, group in repair_groups:
+        if not should_repair:
+            repaired_chunks.extend(group)
+            continue
+        if attempted >= cfg.asr_repair_max_chunks:
+            repaired_chunks.extend(group)
+            summary["skipped"] += len(group)
+            continue
+
+        attempted += 1
+        group_start = group[0].start
+        group_end = group[-1].end
+        clip_start = max(0.0, group_start - cfg.asr_repair_padding_sec)
+        clip_end = min(audio_duration_sec, group_end + cfg.asr_repair_padding_sec)
+        clip_path = repair_dir / f"repair_{attempted:04d}.wav"
+        ffmpeg.slice_audio(
+            repair_audio_path,
+            clip_start,
+            clip_end,
+            clip_path,
+            sample_rate=cfg.gemma_sample_rate,
+            channels=1,
+        )
+        candidate_local = _transcribe_with_backend_options(
+            backend,
+            clip_path,
+            [],
+            vad_filter=False,
+            vad_parameters=None,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+            hallucination_silence_threshold=None,
+        )
+        candidate_abs = [
+            candidate.model_copy(
+                update={
+                    "start": max(group_start, min(group_end, clip_start + candidate.start)),
+                    "end": max(group_start, min(group_end, clip_start + candidate.end)),
+                }
+            )
+            for candidate in candidate_local
+        ]
+        candidate_abs = _valid_asr_chunks(
+            candidate_abs,
+            audio_duration_sec,
+            max_chunk_sec=cfg.asr_resegment_max_sec,
+            sparse_chunk_max_sec=cfg.asr_sparse_chunk_max_sec,
+            sparse_chunk_min_chars_per_sec=cfg.asr_sparse_chunk_min_chars_per_sec,
+        )
+        original = ASRChunk(
+            start=group_start,
+            end=group_end,
+            text=_asr_candidate_text(group),
+            language=group[0].language,
+            confidence=_asr_candidate_confidence(group),
+        )
+        accepted = _asr_repair_candidate_is_better(
+            original,
+            candidate_abs,
+            confidence_threshold=cfg.asr_repair_confidence_threshold,
+            sparse_min_sec=cfg.asr_repair_sparse_min_sec,
+            sparse_min_chars_per_sec=cfg.asr_repair_sparse_min_chars_per_sec,
+            suspicious_text_patterns=cfg.asr_repair_suspicious_text_patterns,
+        )
+        summary["items"].append(
+            {
+                "start": round(group_start, 3),
+                "end": round(group_end, 3),
+                "accepted": accepted,
+                "original_text": original.text,
+                "candidate_text": _asr_candidate_text(candidate_abs),
+            }
+        )
+        if accepted:
+            repaired_chunks.extend(candidate_abs)
+            summary["repaired"] += 1
+        else:
+            repaired_chunks.extend(group)
+
+    summary["attempted"] = attempted
+    return sorted(repaired_chunks, key=lambda item: (item.start, item.end)), summary
 
 
 def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> Path:
@@ -745,6 +1085,111 @@ def _apply_korean_colloquial_postprocess(segments: list[Segment]) -> int:
     return rewritten_count
 
 
+def _native_korean_count_number(value: int) -> str | None:
+    if value in NATIVE_KOREAN_COUNT_ONES:
+        return NATIVE_KOREAN_COUNT_ONES[value]
+    if value in NATIVE_KOREAN_COUNT_TENS:
+        return NATIVE_KOREAN_COUNT_TENS[value]
+    if 10 < value < 100:
+        tens, ones = divmod(value, 10)
+        tens_text = NATIVE_KOREAN_COUNT_TENS.get(tens * 10)
+        ones_text = NATIVE_KOREAN_COUNT_ONES.get(ones)
+        if tens_text and ones_text:
+            return tens_text + ones_text
+    return None
+
+
+def _numeric_source_values(segment: Segment) -> list[int] | None:
+    source_text = _translation_source_text(segment)
+    if not NUMERIC_ONLY_SOURCE_RE.fullmatch(source_text):
+        return None
+    tokens = NUMERIC_TOKEN_RE.findall(source_text)
+    if not tokens:
+        return None
+    values: list[int] = []
+    for token in tokens:
+        if len(token) > 2:
+            return None
+        value = int(token)
+        if not 0 <= value <= 99:
+            return None
+        values.append(value)
+    return values
+
+
+def _numeric_group_is_counting(group: list[tuple[Segment, list[int]]]) -> bool:
+    values = [value for _, segment_values in group for value in segment_values]
+    if len(values) < 4:
+        return False
+    transitions = [right - left for left, right in zip(values, values[1:], strict=False)]
+    if not transitions:
+        return False
+    step_like = sum(1 for diff in transitions if 0 < abs(diff) <= 3)
+    repeats = sum(1 for diff in transitions if diff == 0)
+    large_jumps = sum(1 for diff in transitions if abs(diff) > 10)
+    if large_jumps:
+        return False
+    if step_like < max(3, len(transitions) // 2):
+        return False
+    return repeats <= max(2, len(transitions) // 2)
+
+
+def _numeric_counting_groups(segments: list[Segment]) -> list[list[tuple[Segment, list[int]]]]:
+    groups: list[list[tuple[Segment, list[int]]]] = []
+    current: list[tuple[Segment, list[int]]] = []
+    last_numeric_segment: Segment | None = None
+    last_numeric_value: int | None = None
+
+    def flush_current() -> None:
+        nonlocal current, last_numeric_segment, last_numeric_value
+        if _numeric_group_is_counting(current):
+            groups.append(current)
+        current = []
+        last_numeric_segment = None
+        last_numeric_value = None
+
+    for segment in segments:
+        values = _numeric_source_values(segment)
+        if values is None:
+            continue
+        if last_numeric_segment is not None and segment.start - last_numeric_segment.end > 8.0:
+            flush_current()
+        if last_numeric_value is not None and abs(values[0] - last_numeric_value) > 10:
+            flush_current()
+        current.append((segment, values))
+        last_numeric_segment = segment
+        last_numeric_value = values[-1]
+    flush_current()
+    return groups
+
+
+def _apply_korean_numeric_counting_postprocess(segments: list[Segment]) -> int:
+    rewritten_count = 0
+    for group in _numeric_counting_groups(segments):
+        for segment, values in group:
+            translation = segment.translation_ko
+            if translation is None or not translation.ko_natural.strip():
+                continue
+            spoken_values = [_native_korean_count_number(value) for value in values]
+            if any(value is None for value in spoken_values):
+                continue
+            ko_natural = ", ".join(value for value in spoken_values if value is not None)
+            if translation.ko_natural.strip() == ko_natural and translation.ko_literal.strip() == ko_natural:
+                continue
+            notes = list(translation.notes)
+            if NUMERIC_COUNTING_POSTPROCESS_NOTE not in notes:
+                notes.append(NUMERIC_COUNTING_POSTPROCESS_NOTE)
+            segment.translation_ko = translation.model_copy(
+                update={
+                    "ko_literal": ko_natural,
+                    "ko_natural": ko_natural,
+                    "notes": notes,
+                }
+            )
+            rewritten_count += 1
+    return rewritten_count
+
+
 def _refresh_translation_rows(rows: list[dict[str, Any]], segments: list[Segment]) -> None:
     by_segment_id = {segment.id: segment for segment in segments}
     for row in rows:
@@ -755,6 +1200,9 @@ def _refresh_translation_rows(rows: list[dict[str, Any]], segments: list[Segment
             continue
         row["translation_ko"] = segment.translation_ko.model_dump(mode="json")
         row["colloquialized"] = COLLOQUIAL_REWRITE_NOTE in segment.translation_ko.notes
+        row["numeric_counting_postprocessed"] = (
+            NUMERIC_COUNTING_POSTPROCESS_NOTE in segment.translation_ko.notes
+        )
 
 
 def _translation_context_segments(
@@ -791,6 +1239,15 @@ def _translation_source_text(segment: Segment) -> str:
     return segment.source_script.text.strip() if segment.source_script else ""
 
 
+def _clear_korean_translation_errors(segment: Segment) -> None:
+    segment.errors = [
+        error
+        for error in segment.errors
+        if not error.startswith("Korean translation retry failed")
+        and not error.startswith("Korean translation batch failed")
+    ]
+
+
 def _translation_span_batches(
     segments: list[Segment],
     *,
@@ -808,11 +1265,6 @@ def _translation_span_batches(
             current = []
 
     for segment in segments:
-        source_text = _translation_source_text(segment)
-        if TRANSLATION_NUMERIC_SOURCE_RE.fullmatch(source_text):
-            flush_current()
-            batches.append([segment])
-            continue
         if current:
             gap = max(0.0, segment.start - current[-1].end)
             span_duration = max(segment.end, current[-1].end) - current[0].start
@@ -1357,6 +1809,13 @@ def _asr_backend_config(cfg: Any) -> dict[str, Any]:
         "model_id": cfg.asr_model_id,
         "language": cfg.asr_language,
         "local_files_only": cfg.asr_local_files_only,
+        "beam_size": cfg.asr_beam_size,
+        "best_of": cfg.asr_best_of,
+        "condition_on_previous_text": cfg.asr_condition_on_previous_text,
+        "vad_filter": cfg.asr_vad_filter,
+        "vad_parameters": cfg.asr_vad_parameters,
+        "word_timestamps": cfg.asr_word_timestamps,
+        "hallucination_silence_threshold": cfg.asr_hallucination_silence_threshold,
         "qwen_model_id": cfg.qwen_asr_model_id,
         "qwen_forced_aligner_model_id": cfg.qwen_asr_forced_aligner_model_id,
         "qwen_device_map": cfg.qwen_asr_device_map,
@@ -1445,7 +1904,34 @@ def transcribe_step(
     seeded_for_transcribe = _seed_segments_for_transcribe(project_dir, manifest, audio_path, mix_audio_path)
     total = len(manifest.segments)
     backend = create_asr_backend(backend_kind, _asr_backend_config(cfg))
+    audio_duration = duration_sec(audio_path)
     chunks = backend.transcribe(audio_path, manifest.segments)
+    raw_asr_chunk_count = len(chunks)
+    asr_text_replacement_count = 0
+    repair_summary: dict[str, Any] = {
+        "enabled": False,
+        "attempted": 0,
+        "repaired": 0,
+        "skipped": 0,
+        "items": [],
+    }
+    if backend_kind != "mock":
+        repair_audio_path = Path(manifest.artifacts.get("gemma_mono_16k", audio_path))
+        chunks, repair_summary = _repair_asr_chunks(
+            chunks,
+            backend=backend,
+            project_dir=project_dir,
+            repair_audio_path=repair_audio_path,
+            audio_duration_sec=audio_duration,
+            cfg=cfg,
+        )
+        repair_summary_path = project_dir / "work" / "transcribe" / "asr_repair_summary.json"
+        write_json_atomic(repair_summary_path, repair_summary)
+        manifest.artifacts["asr_repair_summary"] = str(repair_summary_path)
+        chunks, asr_text_replacement_count = _apply_asr_text_replacements_to_chunks(
+            chunks,
+            cfg.asr_text_replacements,
+        )
     resegmented_from_chunks = False
     previous_segment_count = len(manifest.segments)
     manual_segments_path = project_dir / "work" / "segments" / "manifests" / "segments_manual.json"
@@ -1455,9 +1941,12 @@ def transcribe_step(
             project_dir=project_dir,
             backend=backend.name,
             fallback_language=cfg.asr_language,
-            audio_duration_sec=duration_sec(audio_path),
+            audio_duration_sec=audio_duration,
             min_segment_sec=cfg.asr_resegment_min_sec,
             merge_gap_sec=cfg.asr_resegment_merge_gap_sec,
+            max_segment_sec=cfg.asr_resegment_max_sec,
+            sparse_chunk_max_sec=cfg.asr_sparse_chunk_max_sec,
+            sparse_chunk_min_chars_per_sec=cfg.asr_sparse_chunk_min_chars_per_sec,
         )
         if resegmented:
             write_segment_audio_clips(resegmented, audio_path, mix_audio_path, project_dir)
@@ -1511,7 +2000,11 @@ def transcribe_step(
         backend=backend_kind,
         segment_count=total,
         previous_segment_count=previous_segment_count,
+        raw_asr_chunk_count=raw_asr_chunk_count,
         asr_chunk_count=len(chunks),
+        asr_repair_attempted=repair_summary.get("attempted", 0),
+        asr_repair_repaired=repair_summary.get("repaired", 0),
+        asr_text_replacements=asr_text_replacement_count,
         seeded_for_transcribe=seeded_for_transcribe,
         resegmented_from_chunks=resegmented_from_chunks,
         transcribed=with_text,
@@ -1632,23 +2125,34 @@ def translate_ko_step(
     translated = 0
     needs_manual_review = 0
     colloquialized = 0
+    numeric_counting_postprocessed = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
     for segment in manifest.segments:
-        if segment.translation_ko and segment.translation_ko.ko_natural.strip() and not force_retranslate:
+        translation = segment.translation_ko
+        legacy_numeric_translation = bool(
+            translation
+            and LEGACY_DETERMINISTIC_NUMERIC_TRANSLATION_NOTE in translation.notes
+        )
+        if (
+            translation
+            and translation.ko_natural.strip()
+            and not force_retranslate
+            and not legacy_numeric_translation
+        ):
             translated += 1
             rows.append(
                 {
-                    "batch_id": segment.translation_ko.batch_id,
+                    "batch_id": translation.batch_id,
                     "segment_id": segment.id,
                     "status": "translated",
                     "source_text": segment.source_script.text if segment.source_script else "",
-                    "translation_ko": segment.translation_ko.model_dump(mode="json"),
+                    "translation_ko": translation.model_dump(mode="json"),
                     "resumed": True,
                 }
             )
         elif segment.source_script and segment.source_script.text.strip():
-            if force_retranslate:
+            if force_retranslate or legacy_numeric_translation:
                 segment.translation_ko = None
             translatable.append(segment)
         else:
@@ -1728,6 +2232,7 @@ def translate_ko_step(
                 "translated": translated,
                 "needs_manual_review": needs_manual_review,
                 "colloquialized": colloquialized,
+                "numeric_counting_postprocessed": numeric_counting_postprocessed,
                 "concurrency": translation_worker_count,
                 "context_radius": cfg.gemma_text_context_radius,
                 "span_size": cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
@@ -1743,6 +2248,9 @@ def translate_ko_step(
         manifest.artifacts["translation_bundles"] = str(jsonl_path)
         manifest.artifacts["translation_summary"] = str(summary_path)
         save_manifest(project_dir, manifest)
+
+    if rows:
+        persist_partial()
 
     def translate_batch_with_retries(
         batch: list[Segment],
@@ -1865,12 +2373,7 @@ def translate_ko_step(
                 )
                 continue
             segment.translation_ko = translation
-            segment.errors = [
-                error
-                for error in segment.errors
-                if not error.startswith("Korean translation retry failed")
-                and not error.startswith("Korean translation batch failed")
-            ]
+            _clear_korean_translation_errors(segment)
             translated += 1
             processed += 1
             source_text = segment.source_script.text if segment.source_script else ""
@@ -1931,6 +2434,7 @@ def translate_ko_step(
             server_manager.stop()
 
     colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
+    numeric_counting_postprocessed = _apply_korean_numeric_counting_postprocess(manifest.segments)
     _refresh_translation_rows(rows, manifest.segments)
     _write_jsonl_atomic(jsonl_path, rows)
     summary = {
@@ -1940,6 +2444,7 @@ def translate_ko_step(
         "translated": translated,
         "needs_manual_review": needs_manual_review,
         "colloquialized": colloquialized,
+        "numeric_counting_postprocessed": numeric_counting_postprocessed,
         "concurrency": translation_worker_count,
         "context_radius": cfg.gemma_text_context_radius,
         "span_size": cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
@@ -1987,6 +2492,7 @@ def translate_ko_step(
         translated=translated,
         needs_manual_review=needs_manual_review,
         colloquialized=colloquialized,
+        numeric_counting_postprocessed=numeric_counting_postprocessed,
         concurrency=translation_worker_count,
         context_radius=cfg.gemma_text_context_radius,
         span_size=cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,

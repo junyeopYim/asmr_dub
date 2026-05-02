@@ -269,14 +269,6 @@ def _translation_quality_error_map(
                 errors.setdefault(segment.id, []).append(
                     f"{segment.id}: {field} contains TTS-unsafe punctuation"
                 )
-            if is_numeric_source and "년" in natural:
-                errors.setdefault(segment.id, []).append(
-                    f"{segment.id}: pure numeric count was mistranslated as a year"
-                )
-            if is_numeric_source and "번째" in natural:
-                errors.setdefault(segment.id, []).append(
-                    f"{segment.id}: pure numeric count was mistranslated as an ordinal"
-                )
         if (
             (field == "ko_natural" and is_numeric_source)
             or not _NON_SPEECH_SOURCE_RE.fullmatch(source)
@@ -308,10 +300,12 @@ def build_translate_ko_prompt(
         "resolve names, pronouns, omitted subjects, and tone. Read target_span.combined_source_text "
         "first to understand the discourse across adjacent segments, but keep exactly one output "
         "item per input segment_id; do not merge, split, omit, duplicate, or move content between "
-        "segment_ids. Spell numbers and acronyms in Hangul for Korean TTS. Treat pure numeric "
-        "source segments as spoken counts; do not preserve raw digits or add year/ordinal wording "
-        "unless the source explicitly says year or ordinal. Translate the full source text without "
-        "summarizing or dropping clauses.\n"
+        "segment_ids. Spell numbers and acronyms in Hangul for Korean TTS. For numeric-only "
+        "or digit-heavy source segments, infer the intended reading from target_span and context: "
+        "natural counting may use 하나, 둘, 셋; digit/code/phone-like reading may use 일, 이, "
+        "삼 or 공; quantities, years, ordinals, time, and measurements should use the idiomatic "
+        "Korean form for that context. Never leave raw digits. Translate the full source text "
+        "without summarizing or dropping clauses.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -359,9 +353,12 @@ def build_naturalize_ko_prompt(
         "spoken Korean that can be read aloud naturally; split stiff written phrasing into "
         "short breath-friendly wording when useful. Keep the meaning of ko_literal and the "
         "source text; do not add new events, omit clauses, or leave Japanese kana. Spell "
-        "numbers and acronyms in Hangul for TTS. Pure numeric source segments are counts, "
-        "not years or ordinals, unless the source explicitly says so. Translate "
-        "only the items in literal_translations; use target_span.combined_source_text and context "
+        "numbers and acronyms in Hangul for TTS. For numeric-only or digit-heavy source segments, "
+        "infer the intended reading from target_span and context: natural counting may use 하나, "
+        "둘, 셋; digit/code/phone-like reading may use 일, 이, 삼 or 공; quantities, years, "
+        "ordinals, time, and measurements should use the idiomatic Korean form for that context. "
+        "Never leave raw digits. Translate only the items in literal_translations; use "
+        "target_span.combined_source_text and context "
         "only for continuity of names, pronouns, register, and tone. Keep exactly one output item "
         "per input segment_id; do not merge, split, omit, duplicate, or move content between "
         "segment_ids.\n"
@@ -388,8 +385,9 @@ def build_repair_prompt(
         f"only segment_id and {output_field}. {output_field} must be Korean Hangul prose in polite "
         "spoken conversational style with no Japanese kana, untranslated CJK, raw Latin letters, "
         "raw digits, or long dash/quote punctuation. Spell acronyms and numbers in Hangul. "
-        "For pure numeric source segments, write a spoken count and do not add year or ordinal "
-        "wording unless the original source explicitly includes it. Translate the full source "
+        "For numeric-only or digit-heavy source segments, infer the intended reading from the "
+        "original input context, choosing natural counting, digit/code reading, quantity, year, "
+        "ordinal, time, or measurement wording as appropriate. Translate the full source "
         "text without summarizing. Preserve the input segment_id boundaries exactly; do not merge, "
         "split, omit, duplicate, or move content between segment_ids. "
         f"Batch id: {batch_id}. Validation error: {error}{input_text}\nPrevious response:\n"

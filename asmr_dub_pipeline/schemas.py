@@ -260,6 +260,15 @@ class ProjectConfig(StrictBaseModel):
     asr_model_id: str = "Systran/faster-whisper-large-v3"
     asr_language: str = "ja"
     asr_local_files_only: bool = True
+    asr_beam_size: int = Field(default=5, ge=1)
+    asr_best_of: int = Field(default=5, ge=1)
+    asr_condition_on_previous_text: bool = False
+    asr_vad_filter: bool = True
+    asr_vad_parameters: dict[str, Any] = Field(
+        default_factory=lambda: {"min_silence_duration_ms": 300, "speech_pad_ms": 200}
+    )
+    asr_word_timestamps: bool = False
+    asr_hallucination_silence_threshold: float | None = Field(default=None, gt=0)
     qwen_asr_model_id: str = "Qwen/Qwen3-ASR-1.7B"
     qwen_asr_forced_aligner_model_id: str | None = "Qwen/Qwen3-ForcedAligner-0.6B"
     qwen_asr_device_map: str = "cuda:0"
@@ -282,8 +291,44 @@ class ProjectConfig(StrictBaseModel):
     qwen_tts_max_new_tokens: int = Field(default=2048, ge=1)
     qwen_tts_x_vector_only_mode: bool = False
     asr_resegment_from_chunks: bool = True
-    asr_resegment_min_sec: float = Field(default=1.0, gt=0)
-    asr_resegment_merge_gap_sec: float = Field(default=0.6, ge=0)
+    asr_resegment_min_sec: float = Field(default=3.0, gt=0)
+    asr_resegment_max_sec: float = Field(default=20.0, gt=0)
+    asr_resegment_merge_gap_sec: float = Field(default=1.0, ge=0)
+    asr_sparse_chunk_max_sec: float = Field(default=30.0, gt=0)
+    asr_sparse_chunk_min_chars_per_sec: float = Field(default=0.5, ge=0)
+    asr_repair_enabled: bool = True
+    asr_repair_confidence_threshold: float = Field(default=0.94, ge=0.0, le=1.0)
+    asr_repair_sparse_min_sec: float = Field(default=12.0, gt=0)
+    asr_repair_sparse_min_chars_per_sec: float = Field(default=1.0, ge=0)
+    asr_repair_padding_sec: float = Field(default=1.0, ge=0)
+    asr_repair_max_chunks: int = Field(default=160, ge=0)
+    asr_repair_suspicious_text_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "もちなとい",
+            "耳強く",
+            "強くたま",
+            "釣りが来",
+            "膨れ起こ",
+            "触れおご",
+            "溢れおご",
+            "そんなお腹",
+        ]
+    )
+    asr_text_replacements: dict[str, str] = Field(
+        default_factory=lambda: {
+            "釣りが来ちゃう": "絶頂が来ちゃう",
+            "釣りが来ちゃえ": "絶頂が来ちゃう",
+            "銃数える": "10数える",
+            "膨れ起こって": "膨れ上がって",
+            "触れおごって": "膨れ上がって",
+            "溢れおごって": "膨れ上がって",
+            "そんな無理に": "そんなあなたに",
+            "そんなお腹に": "そんなあなたに",
+            "体幹が弾ける": "快感が弾ける",
+            "美薬": "媚薬",
+            "微薬": "媚薬",
+        }
+    )
     source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "demucs"
     source_separation_model: str = "htdemucs"
     source_separation_device: str | None = None
