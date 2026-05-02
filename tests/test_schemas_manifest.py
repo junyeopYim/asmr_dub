@@ -65,6 +65,12 @@ def test_project_config_requires_rvc_by_default() -> None:
     assert cfg.rvc_train_save_every_epoch == 50
     assert cfg.rvc_train_reuse_intermediate_cache is True
     assert cfg.rvc_concurrency == 1
+    assert cfg.source_separation_backend == "demucs"
+    assert cfg.source_separation_model == "htdemucs"
+    assert cfg.qwen_tts_candidate_batch_size == 4
+    assert cfg.qwen_tts_max_new_tokens == 2048
+    assert cfg.qwen_tts_segment_batch_size == 8
+    assert cfg.qwen_tts_target_vram_gb == 14.0
     assert [profile.name for profile in cfg.rvc_auto_profiles] == [
         "rmvpe_index045",
         "rmvpe_index035_safer",

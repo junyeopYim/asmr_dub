@@ -4,12 +4,19 @@ import json
 import shutil
 from pathlib import Path
 
+from asmr_dub_pipeline.asr.base import ASRChunk
 from asmr_dub_pipeline.audio import separation as separation_module
 from asmr_dub_pipeline.audio.separation import separate_source_audio
 from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import create_project_structure, save_project_config
+from asmr_dub_pipeline.pipeline import steps as pipeline_steps
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest
-from asmr_dub_pipeline.pipeline.steps import extract_step, segment_step, source_separation_step
+from asmr_dub_pipeline.pipeline.steps import (
+    extract_step,
+    segment_step,
+    source_separation_step,
+    transcribe_step,
+)
 from asmr_dub_pipeline.schemas import ProjectConfig
 
 
@@ -40,6 +47,50 @@ def test_source_separation_mock_writes_stems_and_segments_from_vocals(
     assert manifest.segments
     assert Path(manifest.segments[0].audio_for_mix).exists()
     assert Path(manifest.segments[0].audio_for_gemma).exists()
+
+
+def test_real_transcribe_runs_source_separation_and_uses_vocal_mono(
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "transcribe_uses_vocals"
+    create_project_structure(project)
+    save_project_config(
+        ProjectConfig(
+            project_name=project.name,
+            source_separation_backend="mock",
+            asr_resegment_from_chunks=False,
+        ),
+        project / "pipeline.yaml",
+    )
+    extract_step(tiny_wav_path, project, confirm_rights=True)
+    segment_step(project)
+    captured: dict[str, Path] = {}
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, audio_path: Path, segments: list[object]) -> list[ASRChunk]:
+            captured["audio_path"] = Path(audio_path)
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text="テスト",
+                    language="ja",
+                    confidence=0.9,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert manifest.stage_state["source-separation"]["status"] == "completed"
+    assert captured["audio_path"] == Path(manifest.artifacts["source_vocals_mono_16k"])
+    assert captured["audio_path"].name == "source_vocals_mono_16k.wav"
+    assert manifest.stage_state["transcribe"]["status"] == "completed"
 
 
 def test_source_separation_auto_reuses_existing_outputs_without_demucs(

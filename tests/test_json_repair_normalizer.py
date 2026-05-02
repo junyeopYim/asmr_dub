@@ -75,6 +75,20 @@ def test_korean_normalizer_spells_risky_tokens_and_splits_long_clauses() -> None
         target_language="ko",
     ).blocked
 
+    speech_safe = normalize_tts_text("지금은요— '에?' 2014 BGM", language="ko")
+    assert speech_safe.text == "지금은요… 에? 이천십사 비지엠"
+    assert "normalized_latin_token" in speech_safe.risk_flags
+    assert "normalized_numeric_token" in speech_safe.risk_flags
+    assert "normalized_symbol_token" in speech_safe.risk_flags
+    assert not preflight_tts_text(
+        JapaneseScript(
+            ja_text=speech_safe.text,
+            tts_text=speech_safe.text,
+            tts_language="ko",
+        ),
+        target_language="ko",
+    ).blocked
+
     raw_risky = JapaneseScript(
         ja_text="테스트",
         tts_text="오늘은 GPT-SoVITS 3%로 갈게요",

@@ -89,12 +89,24 @@ KOREAN_SYMBOL_REPLACEMENTS = {
     "°": " 도 ",
     "~": " ",
     "-": " ",
+    "—": "…",
+    "–": "…",
+    "―": "…",
+    "−": " ",
     "_": " ",
     "|": " ",
     ":": ", ",
     ";": ", ",
     '"': " ",
     "'": " ",
+    "“": " ",
+    "”": " ",
+    "‘": " ",
+    "’": " ",
+    "「": " ",
+    "」": " ",
+    "『": " ",
+    "』": " ",
     "*": " ",
     "`": " ",
     "<": " ",
@@ -137,7 +149,7 @@ KOREAN_PUNCT_TRANSLATION = str.maketrans(
 )
 SPACE_RE = re.compile(r"[\s\u3000]+")
 JAPANESE_PUNCT_RE = re.compile(r"\s*([、。！？])\s*")
-KOREAN_PUNCT_RE = re.compile(r"\s*([,.!?])\s*")
+KOREAN_PUNCT_RE = re.compile(r"\s*([,.!?…])\s*")
 KOREAN_LATIN_TOKEN_RE = re.compile(r"[A-Za-z]+(?:[-_][A-Za-z]+)*")
 KOREAN_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 KOREAN_LONG_CLAUSE_MAX_CHARS = 44
@@ -380,7 +392,7 @@ def _normalize_punctuation_and_space(text: str) -> str:
 def _normalize_korean_punctuation_and_space(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = SPACE_RE.sub(" ", text)
-    text = re.sub(r"(?:\.{3,}|…+|⋯+)", "...", text)
+    text = re.sub(r"(?:\.{3,}|…+|⋯+)", "…", text)
     text = text.translate(KOREAN_PUNCT_TRANSLATION)
     text = re.sub(r"\.{4,}", "...", text)
     text = re.sub(r",{2,}", ",", text)
@@ -388,6 +400,7 @@ def _normalize_korean_punctuation_and_space(text: str) -> str:
     text = re.sub(r"\?{2,}", "?", text)
     text = KOREAN_PUNCT_RE.sub(r"\1", text)
     text = re.sub(r"([,.!?])([,.!?])+", r"\1", text)
+    text = re.sub(r"([,.!?…])(?=[^\s,.!?…])", r"\1 ", text)
     return SPACE_RE.sub(" ", text).strip()
 
 

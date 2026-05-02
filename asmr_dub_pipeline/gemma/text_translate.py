@@ -18,8 +18,13 @@ class GemmaTextTranslationError(RuntimeError):
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", flags=re.IGNORECASE | re.DOTALL)
 _KANA_RE = re.compile(r"[\u3040-\u30ffー]")
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_DIGIT_RE = re.compile(r"\d")
 _NON_SPEECH_SOURCE_RE = re.compile(r"^[\d\s,.;:!?！？、。・ー~〜…]+$")
+_NUMERIC_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
+_UNSAFE_TTS_SYMBOL_RE = re.compile(r"[—–―“”‘’「」『』]")
 
 
 def _strip_fence(text: str) -> str:
@@ -191,6 +196,14 @@ def _translation_prompt_payload(
     payload: dict[str, Any] = {
         "batch_id": batch_id,
         "segments": [_segment_prompt_item(segment) for segment in segments],
+        "target_span": {
+            "segment_ids": [segment.id for segment in segments],
+            "combined_source_text": "\n".join(
+                f"{segment.id}: {segment.source_script.text.strip()}"
+                for segment in segments
+                if segment.source_script and segment.source_script.text.strip()
+            ),
+        },
     }
     if context_segments:
         target_ids = {segment.id for segment in segments}
@@ -238,7 +251,36 @@ def _translation_quality_error_map(
             errors.setdefault(segment.id, []).append(
                 f"{segment.id}: {field} still contains Japanese kana"
             )
-        if not _NON_SPEECH_SOURCE_RE.fullmatch(source) and not _HANGUL_RE.search(natural):
+        if _CJK_RE.search(natural):
+            errors.setdefault(segment.id, []).append(
+                f"{segment.id}: {field} still contains untranslated CJK characters"
+            )
+        is_numeric_source = bool(_NUMERIC_SOURCE_RE.fullmatch(source))
+        if field == "ko_natural":
+            if _LATIN_RE.search(natural):
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: {field} contains Latin letters; spell acronyms in Hangul"
+                )
+            if _DIGIT_RE.search(natural):
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: {field} contains raw digits; spell numbers in Korean"
+                )
+            if _UNSAFE_TTS_SYMBOL_RE.search(natural):
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: {field} contains TTS-unsafe punctuation"
+                )
+            if is_numeric_source and "년" in natural:
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: pure numeric count was mistranslated as a year"
+                )
+            if is_numeric_source and "번째" in natural:
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: pure numeric count was mistranslated as an ordinal"
+                )
+        if (
+            (field == "ko_natural" and is_numeric_source)
+            or not _NON_SPEECH_SOURCE_RE.fullmatch(source)
+        ) and not _HANGUL_RE.search(natural):
             errors.setdefault(segment.id, []).append(
                 f"{segment.id}: {field} has no Hangul for Japanese source text"
             )
@@ -263,8 +305,12 @@ def build_translate_ko_prompt(
         "Japanese kana or untranslated Japanese particles in ko_natural. Do not include "
         "explanations, reasoning, analysis, notes, confidence, model, batch_id, or any text "
         "outside the JSON array. Translate only the items in segments; use context only to "
-        "resolve names, pronouns, omitted subjects, and tone. For pure counts or non-speech "
-        "tokens, preserving digits is allowed. Translate the full source text without "
+        "resolve names, pronouns, omitted subjects, and tone. Read target_span.combined_source_text "
+        "first to understand the discourse across adjacent segments, but keep exactly one output "
+        "item per input segment_id; do not merge, split, omit, duplicate, or move content between "
+        "segment_ids. Spell numbers and acronyms in Hangul for Korean TTS. Treat pure numeric "
+        "source segments as spoken counts; do not preserve raw digits or add year/ordinal wording "
+        "unless the source explicitly says year or ordinal. Translate the full source text without "
         "summarizing or dropping clauses.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
@@ -282,7 +328,10 @@ def build_literal_translate_prompt(
         "must contain only segment_id and ko_literal. ko_literal must be Korean Hangul prose; "
         "do not leave Japanese kana or untranslated Japanese particles. Do not polish into "
         "final TTS copy yet. Translate only the items in segments; use context only to resolve "
-        "names, pronouns, omitted subjects, and tone. Preserve all clauses without summary.\n"
+        "names, pronouns, omitted subjects, and tone. Read target_span.combined_source_text "
+        "first for adjacent-segment context, but keep exactly one output item per input "
+        "segment_id; do not merge, split, omit, duplicate, or move content between segment_ids. "
+        "Preserve all clauses without summary.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -309,9 +358,13 @@ def build_naturalize_ko_prompt(
         "must contain only segment_id and ko_natural. ko_natural must be gentle, polite, "
         "spoken Korean that can be read aloud naturally; split stiff written phrasing into "
         "short breath-friendly wording when useful. Keep the meaning of ko_literal and the "
-        "source text; do not add new events, omit clauses, or leave Japanese kana. Translate "
-        "only the items in literal_translations; use context only for continuity of names, "
-        "pronouns, register, and tone.\n"
+        "source text; do not add new events, omit clauses, or leave Japanese kana. Spell "
+        "numbers and acronyms in Hangul for TTS. Pure numeric source segments are counts, "
+        "not years or ordinals, unless the source explicitly says so. Translate "
+        "only the items in literal_translations; use target_span.combined_source_text and context "
+        "only for continuity of names, pronouns, register, and tone. Keep exactly one output item "
+        "per input segment_id; do not merge, split, omit, duplicate, or move content between "
+        "segment_ids.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -333,8 +386,12 @@ def build_repair_prompt(
     return (
         "Repair the previous response into exactly one valid JSON array. Each item must contain "
         f"only segment_id and {output_field}. {output_field} must be Korean Hangul prose in polite "
-        "spoken conversational style with no Japanese kana unless the source is only numbers "
-        "or non-speech tokens. Translate the full source text without summarizing. "
+        "spoken conversational style with no Japanese kana, untranslated CJK, raw Latin letters, "
+        "raw digits, or long dash/quote punctuation. Spell acronyms and numbers in Hangul. "
+        "For pure numeric source segments, write a spoken count and do not add year or ordinal "
+        "wording unless the original source explicitly includes it. Translate the full source "
+        "text without summarizing. Preserve the input segment_id boundaries exactly; do not merge, "
+        "split, omit, duplicate, or move content between segment_ids. "
         f"Batch id: {batch_id}. Validation error: {error}{input_text}\nPrevious response:\n"
         f"{bad_response[:6000]}"
     )

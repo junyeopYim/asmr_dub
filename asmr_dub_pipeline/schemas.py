@@ -274,20 +274,26 @@ class ProjectConfig(StrictBaseModel):
     qwen_tts_dtype: str = "bfloat16"
     qwen_tts_attn_implementation: str = "flash_attention_2"
     qwen_tts_local_files_only: bool = True
+    qwen_tts_candidate_batch_size: int = Field(default=4, ge=1, le=8)
+    qwen_tts_segment_batch_size: int = Field(default=8, ge=1, le=16)
+    qwen_tts_target_vram_gb: float | None = Field(default=14.0, gt=0)
     qwen_tts_temperature: float = Field(default=0.65, ge=0.0, le=2.0)
     qwen_tts_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
-    qwen_tts_max_new_tokens: int = Field(default=4096, ge=1)
+    qwen_tts_max_new_tokens: int = Field(default=2048, ge=1)
     qwen_tts_x_vector_only_mode: bool = False
     asr_resegment_from_chunks: bool = True
-    asr_resegment_min_sec: float = Field(default=0.8, gt=0)
-    asr_resegment_merge_gap_sec: float = Field(default=0.45, ge=0)
-    source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "auto"
+    asr_resegment_min_sec: float = Field(default=1.0, gt=0)
+    asr_resegment_merge_gap_sec: float = Field(default=0.6, ge=0)
+    source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "demucs"
     source_separation_model: str = "htdemucs"
     source_separation_device: str | None = None
     gemma_text_server_url: str = "http://127.0.0.1:8080"
     gemma_text_server_auto_start: bool = True
     gemma_text_server_command: list[str] = Field(default_factory=list)
     gemma_text_batch_size: int = Field(default=12, ge=1, le=200)
+    gemma_text_span_size: int = Field(default=4, ge=1, le=20)
+    gemma_text_span_max_sec: float = Field(default=18.0, gt=0)
+    gemma_text_span_max_gap_sec: float = Field(default=1.2, ge=0)
     gemma_text_context_radius: int = Field(default=4, ge=0, le=20)
     gemma_text_two_pass: bool = True
     gemma_text_concurrency: int = Field(default=4, ge=1, le=8)

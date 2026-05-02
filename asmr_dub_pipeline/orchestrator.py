@@ -65,9 +65,18 @@ def run_pipeline(
     if normalized_asr_backend is not None:
         cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "asr_backend": normalized_asr_backend})
         save_project_config(cfg, project_dir / "pipeline.yaml")
-    if mock and cfg.rvc_backend != "mock":
+    if mock and (
+        cfg.rvc_backend != "mock"
+        or cfg.rvc_train_backend != "mock"
+        or cfg.source_separation_backend != "mock"
+    ):
         cfg = type(cfg).model_validate(
-            {**cfg.model_dump(mode="json"), "rvc_backend": "mock", "rvc_train_backend": "mock"}
+            {
+                **cfg.model_dump(mode="json"),
+                "rvc_backend": "mock",
+                "rvc_train_backend": "mock",
+                "source_separation_backend": "mock",
+            }
         )
         save_project_config(cfg, project_dir / "pipeline.yaml")
     use_voice_bank = require_voice_bank or voice_bank_path is not None

@@ -560,6 +560,26 @@ def synth_qwen(
         max=8,
         help="Number of Qwen candidates per segment. Defaults to qwen_tts_candidate_count.",
     ),
+    candidate_batch_size: int | None = typer.Option(
+        None,
+        "--candidate-batch-size",
+        min=1,
+        max=8,
+        help="Number of Qwen candidates to synthesize in one GPU batch.",
+    ),
+    segment_batch_size: int | None = typer.Option(
+        None,
+        "--segment-batch-size",
+        min=1,
+        max=16,
+        help="Number of scripted segments to synthesize in one Qwen GPU batch.",
+    ),
+    target_vram_gb: float | None = typer.Option(
+        None,
+        "--target-vram-gb",
+        min=0.1,
+        help="Approximate CUDA VRAM budget for Qwen TTS. Defaults to qwen_tts_target_vram_gb.",
+    ),
     promote: bool = typer.Option(
         False,
         "--promote/--compare-only",
@@ -579,6 +599,9 @@ def synth_qwen(
             confirm_rights=confirm_rights,
             model_id=model_id,
             candidate_count=candidate_count,
+            candidate_batch_size=candidate_batch_size,
+            segment_batch_size=segment_batch_size,
+            target_vram_gb=target_vram_gb,
             promote=promote,
             local_files_only=False if allow_download else None,
         )

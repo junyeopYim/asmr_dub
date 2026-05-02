@@ -158,6 +158,9 @@ def test_source_script_and_korean_translation_schema_round_trip() -> None:
 def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None:
     assert ProjectConfig().gemma_text_batch_size == 12
     assert ProjectConfig().gemma_text_context_radius == 4
+    assert ProjectConfig().gemma_text_span_size == 4
+    assert ProjectConfig().gemma_text_span_max_sec == pytest.approx(18.0)
+    assert ProjectConfig().gemma_text_span_max_gap_sec == pytest.approx(1.2)
     assert ProjectConfig().gemma_text_two_pass is True
     assert ProjectConfig().gemma_text_concurrency == 4
     assert ProjectConfig().gsv_concurrency == 3
@@ -165,7 +168,10 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().target_language == "ko"
     assert ProjectConfig(target_language="kr").target_language == "ko"
     assert ProjectConfig().asr_resegment_from_chunks is True
-    assert ProjectConfig().asr_resegment_min_sec == pytest.approx(0.8)
+    assert ProjectConfig().asr_resegment_min_sec == pytest.approx(1.0)
+    assert ProjectConfig().asr_resegment_merge_gap_sec == pytest.approx(0.6)
+    assert ProjectConfig().source_separation_backend == "demucs"
+    assert ProjectConfig().source_separation_model == "htdemucs"
     assert ProjectConfig().gsv_trim_edge_silence is True
     assert ProjectConfig().gsv_ref_min_sec == pytest.approx(3.0)
     assert ProjectConfig().gsv_ref_max_sec == pytest.approx(10.0)
@@ -306,6 +312,7 @@ def test_translate_ko_passes_neighbor_context_to_context_aware_clients(
         ProjectConfig(
             project_name=tmp_project_dir.name,
             gemma_text_batch_size=1,
+            gemma_text_span_size=1,
             gemma_text_concurrency=1,
             gemma_text_context_radius=1,
         ),
@@ -389,6 +396,108 @@ def test_translate_ko_passes_neighbor_context_to_context_aware_clients(
     manifest = load_manifest(tmp_project_dir)
     assert manifest.stage_state["translate-ko"]["context_radius"] == 1
     assert manifest.stage_state["translate-ko"]["two_pass"] is True
+
+
+def test_translate_ko_groups_adjacent_segments_into_contextual_spans(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_batch_size=1,
+            gemma_text_span_size=3,
+            gemma_text_span_max_sec=30.0,
+            gemma_text_span_max_gap_sec=1.0,
+            gemma_text_concurrency=1,
+            gemma_text_context_radius=1,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+    manifest = load_manifest(tmp_project_dir)
+    base = manifest.segments[0]
+    for index in range(2, 4):
+        start = base.end + (index - 2) * 0.2
+        manifest.segments.append(
+            Segment(
+                id=f"seg_{index:04d}",
+                start=start,
+                end=start + base.duration,
+                duration=base.duration,
+                audio_for_gemma=base.audio_for_gemma,
+                audio_for_mix=base.audio_for_mix,
+                source_script=SourceScript(
+                    text=f"続きの台詞です {index}",
+                    language="ja",
+                    confidence=0.99,
+                    backend="mock",
+                    start=start,
+                    end=start + base.duration,
+                ),
+            )
+        )
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[tuple[str, list[str], list[str]]] = []
+
+    class FakeServer:
+        started = False
+        reused_existing = True
+        log_path = None
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+            context_segments: list[Segment] | None = None,
+        ) -> dict[str, KoreanTranslation]:
+            calls.append(
+                (
+                    batch_id,
+                    [segment.id for segment in segments],
+                    [segment.id for segment in (context_segments or [])],
+                )
+            )
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal=f"직역 {segment.id}",
+                    ko_natural=f"자연 {segment.id}",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="llama_server")
+
+    assert calls == [
+        (
+            "batch_0001",
+            ["seg_0001", "seg_0002", "seg_0003"],
+            ["seg_0001", "seg_0002", "seg_0003"],
+        )
+    ]
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["translate-ko"]["span_size"] == 3
+    assert manifest.stage_state["translate-ko"]["span_count"] == 1
 
 
 def test_translate_ko_force_retranslate_ignores_resumed_translations(
@@ -622,6 +731,8 @@ def test_llama_server_translation_client_uses_literal_then_natural_pass() -> Non
     assert "First pass" in first_prompt
     assert "Second pass" in second_prompt
     assert "ko_literal" in second_prompt
+    assert "target_span" in first_prompt
+    assert "combined_source_text" in first_prompt
 
 
 def test_llama_server_translation_client_repairs_low_quality_translation() -> None:
@@ -681,6 +792,94 @@ def test_llama_server_translation_client_repairs_low_quality_translation() -> No
     second_prompt = requests[1]["messages"][0]["content"]
     assert "Original input" in second_prompt
     assert "だって" in second_prompt
+
+
+def test_llama_server_translation_client_repairs_numeric_count_mistranslated_as_year() -> None:
+    requests: list[dict[str, object]] = []
+    responses = [
+        [{"segment_id": "seg_0001", "ko_literal": "2014"}],
+        [{"segment_id": "seg_0001", "ko_natural": "이천십사년"}],
+        [{"segment_id": "seg_0001", "ko_natural": "이천십사"}],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(responses[len(requests) - 1], ensure_ascii=False)}}
+                ]
+            },
+        )
+
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="2014",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=0.0,
+        end=1.0,
+    )
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=128,
+    )
+
+    translations = client.translate_batch([segment], "batch_0001")
+
+    assert translations["seg_0001"].ko_natural == "이천십사"
+    assert len(requests) == 3
+    repair_prompt = requests[2]["messages"][0]["content"]
+    assert "pure numeric source segments" in repair_prompt
+    assert "year" in repair_prompt
+
+
+def test_llama_server_translation_client_repairs_tts_unsafe_korean_punctuation() -> None:
+    requests: list[dict[str, object]] = []
+    responses = [
+        [{"segment_id": "seg_0001", "ko_literal": "지금은-"}],
+        [{"segment_id": "seg_0001", "ko_natural": "지금은요—"}],
+        [{"segment_id": "seg_0001", "ko_natural": "지금은요..."}],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(responses[len(requests) - 1], ensure_ascii=False)}}
+                ]
+            },
+        )
+
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="今はー",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=0.0,
+        end=1.0,
+    )
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=128,
+    )
+
+    translations = client.translate_batch([segment], "batch_0001")
+
+    assert translations["seg_0001"].ko_natural == "지금은요..."
+    assert len(requests) == 3
+    assert "TTS-unsafe punctuation" in requests[2]["messages"][0]["content"]
 
 
 def test_llama_server_translation_client_keeps_valid_items_from_mixed_batch() -> None:
@@ -1201,6 +1400,7 @@ def test_translate_ko_uses_single_llama_server_slot_workers(
         ProjectConfig(
             project_name=tmp_project_dir.name,
             gemma_text_batch_size=1,
+            gemma_text_span_size=1,
             gemma_text_concurrency=2,
         ),
         tmp_project_dir / "pipeline.yaml",
