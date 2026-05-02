@@ -71,6 +71,11 @@ def test_project_config_requires_rvc_by_default() -> None:
     assert cfg.qwen_tts_max_new_tokens == 2048
     assert cfg.qwen_tts_segment_batch_size == 8
     assert cfg.qwen_tts_target_vram_gb == 14.0
+    assert cfg.fish_tts_repo_dir == ".cache/tts_backends/fish-speech"
+    assert cfg.fish_tts_base_url == "http://127.0.0.1:8080"
+    assert cfg.cosyvoice_repo_dir == ".cache/tts_backends/CosyVoice"
+    assert cfg.cosyvoice_model_dir.endswith("CosyVoice2-0.5B")
+    assert cfg.cosyvoice_base_url == "http://127.0.0.1:50000"
     assert [profile.name for profile in cfg.rvc_auto_profiles] == [
         "rmvpe_index045",
         "rmvpe_index035_safer",

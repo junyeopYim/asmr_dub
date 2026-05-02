@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from asmr_dub_pipeline.asr import qwen_asr as qwen_module
-from asmr_dub_pipeline.asr.base import create_asr_backend
+from asmr_dub_pipeline.asr.base import ASRChunk, create_asr_backend
 from asmr_dub_pipeline.asr.qwen_asr import (
     QwenASRBackend,
+    _coalesce_qwen_timestamp_chunks,
     _hf_snapshot_for_model,
     _qwen_language,
 )
@@ -107,8 +108,7 @@ def test_qwen_asr_backend_converts_timestamps_to_chunks(monkeypatch: pytest.Monk
     chunks = backend.transcribe(Path("dummy.wav"), segments)
 
     assert [(chunk.start, chunk.end, chunk.text) for chunk in chunks] == [
-        (0.0, 0.8, "いらっしゃいませ"),
-        (0.8, 1.4, "お兄さん"),
+        (0.0, 1.4, "いらっしゃいませお兄さん"),
         (0.0, 1.8, "またね"),
     ]
     assert chunks[0].language == "Japanese"
@@ -117,3 +117,37 @@ def test_qwen_asr_backend_converts_timestamps_to_chunks(monkeypatch: pytest.Monk
     assert transcribe_call["language"] == "Japanese"
     assert transcribe_call["context"] == "固有名詞: 鳥桜"
     assert transcribe_call["return_time_stamps"] is True
+
+
+def test_qwen_asr_coalesces_japanese_word_timestamps() -> None:
+    chunks = _coalesce_qwen_timestamp_chunks(
+        [
+            ASRChunk(start=1.52, end=1.84, text="深", language="Japanese"),
+            ASRChunk(start=2.0, end=2.4, text="呼吸", language="Japanese"),
+            ASRChunk(start=2.4, end=2.48, text="や", language="Japanese"),
+            ASRChunk(start=2.72, end=3.52, text="リラックス", language="Japanese"),
+            ASRChunk(start=3.52, end=3.6, text="で", language="Japanese"),
+            ASRChunk(start=3.84, end=4.48, text="も", language="Japanese"),
+        ],
+        language="Japanese",
+    )
+
+    assert [(chunk.start, chunk.end, chunk.text) for chunk in chunks] == [
+        (1.52, 4.48, "深呼吸やリラックスでも")
+    ]
+
+
+def test_qwen_asr_coalescing_splits_on_large_gaps() -> None:
+    chunks = _coalesce_qwen_timestamp_chunks(
+        [
+            ASRChunk(start=0.0, end=0.5, text="hello", language="English"),
+            ASRChunk(start=0.6, end=1.0, text="there", language="English"),
+            ASRChunk(start=4.0, end=4.5, text="again", language="English"),
+        ],
+        language="English",
+    )
+
+    assert [(chunk.start, chunk.end, chunk.text) for chunk in chunks] == [
+        (0.0, 1.0, "hello there"),
+        (4.0, 4.5, "again"),
+    ]

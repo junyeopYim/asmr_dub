@@ -34,6 +34,7 @@ from .pipeline.steps import (
     script_step,
     segment_step,
     source_separation_step,
+    synth_experimental_tts_step,
     synth_qwen_step,
     synth_step,
     transcribe_step,
@@ -164,6 +165,14 @@ def _configure_local_model_cache() -> list[str]:
     )
     rvc_assets = REPO_ROOT / ".cache" / "rvc" / "assets"
     lines.append(f"RVC local assets: {'found' if rvc_assets.exists() else 'missing'}")
+    fish_root = REPO_ROOT / ".cache" / "tts_backends" / "fish-speech"
+    fish_weights = fish_root / "checkpoints" / "s2-pro"
+    lines.append(f"Fish Speech repo: {'found' if fish_root.exists() else 'missing'}")
+    lines.append(f"Fish Speech s2-pro weights: {'found' if fish_weights.exists() else 'missing'}")
+    cosy_root = REPO_ROOT / ".cache" / "tts_backends" / "CosyVoice"
+    cosy_weights = cosy_root / "pretrained_models" / "CosyVoice2-0.5B"
+    lines.append(f"CosyVoice repo: {'found' if cosy_root.exists() else 'missing'}")
+    lines.append(f"CosyVoice2 weights: {'found' if cosy_weights.exists() else 'missing'}")
     llama_model = REPO_ROOT / DEFAULT_LLAMA_CPP_MODEL
     llama_mmproj = REPO_ROOT / DEFAULT_LLAMA_CPP_MMPROJ
     llama_cli = REPO_ROOT / DEFAULT_LLAMA_CPP_CLI
@@ -616,11 +625,85 @@ def synth_qwen(
     console.print(f"Qwen synthesis complete: {manifest.artifacts.get('qwen_tts')}")
 
 
+@app.command(name="synth-fish")
+def synth_fish(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    base_url: str | None = typer.Option(None, "--base-url", help="Fish Speech API server URL."),
+    candidate_count: int | None = typer.Option(
+        None,
+        "--candidate-count",
+        min=1,
+        max=8,
+        help="Number of Fish Speech candidates per segment. Defaults to fish_tts_candidate_count.",
+    ),
+    promote: bool = typer.Option(
+        False,
+        "--promote/--compare-only",
+        help="Replace selected TTS with the best Fish Speech candidate and invalidate downstream RVC/QC/mix.",
+    ),
+) -> None:
+    """Generate experimental Fish Speech candidates from an existing scripted manifest."""
+    try:
+        manifest = synth_experimental_tts_step(
+            project.expanduser().resolve(),
+            refs,
+            backend="fish",
+            confirm_rights=confirm_rights,
+            base_url=base_url,
+            candidate_count=candidate_count,
+            promote=promote,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Fish synthesis complete: {manifest.artifacts.get('fish_tts')}")
+
+
+@app.command(name="synth-cosyvoice")
+def synth_cosyvoice(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    base_url: str | None = typer.Option(None, "--base-url", help="CosyVoice FastAPI server URL."),
+    candidate_count: int | None = typer.Option(
+        None,
+        "--candidate-count",
+        min=1,
+        max=8,
+        help="Number of CosyVoice candidates per segment. Defaults to cosyvoice_candidate_count.",
+    ),
+    promote: bool = typer.Option(
+        False,
+        "--promote/--compare-only",
+        help="Replace selected TTS with the best CosyVoice candidate and invalidate downstream RVC/QC/mix.",
+    ),
+) -> None:
+    """Generate experimental CosyVoice candidates from an existing scripted manifest."""
+    try:
+        manifest = synth_experimental_tts_step(
+            project.expanduser().resolve(),
+            refs,
+            backend="cosyvoice",
+            confirm_rights=confirm_rights,
+            base_url=base_url,
+            candidate_count=candidate_count,
+            promote=promote,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"CosyVoice synthesis complete: {manifest.artifacts.get('cosyvoice_tts')}")
+
+
 @app.command(name="regenerate")
 def regenerate(
     project: Path = typer.Option(..., "--project", "-p"),
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
-    tts_backend: str = typer.Option("gpt-sovits", "--tts-backend", help="gpt-sovits|qwen|mock"),
+    tts_backend: str = typer.Option("gpt-sovits", "--tts-backend", help="gpt-sovits|qwen|fish|cosyvoice|mock"),
     gemma_backend: str = typer.Option("mock", "--gemma-backend", help="mock|hf|http|llama_cpp"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
     gsv_url: str | None = typer.Option(None, "--gsv-url"),
@@ -650,6 +733,18 @@ def regenerate(
         "--qwen-allow-download/--qwen-local-files-only",
         help="Allow qwen-tts to resolve a remote Hugging Face model id.",
     ),
+    experimental_tts_base_url: str | None = typer.Option(
+        None,
+        "--experimental-tts-base-url",
+        help="Override Fish Speech or CosyVoice local server URL during regeneration.",
+    ),
+    experimental_tts_candidate_count: int | None = typer.Option(
+        None,
+        "--experimental-tts-candidate-count",
+        min=1,
+        max=8,
+        help="Override Fish Speech or CosyVoice candidate count during regeneration.",
+    ),
 ) -> None:
     """Regenerate QC-flagged segments, then rerun RVC and QC before mix."""
     try:
@@ -668,6 +763,8 @@ def regenerate(
             qwen_model_id=qwen_model_id,
             qwen_candidate_count=qwen_candidate_count,
             qwen_local_files_only=False if qwen_allow_download else None,
+            experimental_tts_base_url=experimental_tts_base_url,
+            experimental_tts_candidate_count=experimental_tts_candidate_count,
         )
     except RightsError as exc:
         _handle_error(exc)

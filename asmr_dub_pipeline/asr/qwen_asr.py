@@ -123,6 +123,61 @@ def _dtype_from_name(torch_module: Any, dtype_name: str) -> Any:
     return dtype
 
 
+def _is_japanese_language(language: str | None) -> bool:
+    return str(language or "").strip().lower() in {"ja", "japanese"}
+
+
+def _join_qwen_timestamp_text(parts: list[str], *, language: str | None) -> str:
+    cleaned = [part.strip() for part in parts if part.strip()]
+    if not cleaned:
+        return ""
+    if _is_japanese_language(language):
+        return "".join(cleaned)
+    return " ".join(cleaned)
+
+
+def _coalesce_qwen_timestamp_chunks(
+    chunks: list[ASRChunk],
+    *,
+    language: str | None,
+    max_gap_sec: float = 2.25,
+    max_duration_sec: float = 18.0,
+) -> list[ASRChunk]:
+    if not chunks:
+        return []
+    coalesced: list[ASRChunk] = []
+    current: list[ASRChunk] = []
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        text = _join_qwen_timestamp_text([chunk.text for chunk in current], language=language)
+        if text:
+            coalesced.append(
+                ASRChunk(
+                    start=current[0].start,
+                    end=current[-1].end,
+                    text=text,
+                    language=current[0].language,
+                    confidence=None,
+                )
+            )
+        current = []
+
+    for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
+        if current:
+            gap = max(0.0, chunk.start - current[-1].end)
+            duration = chunk.end - current[0].start
+            if gap > max_gap_sec or duration > max_duration_sec:
+                flush()
+        current.append(chunk)
+        if chunk.text.endswith(("。", "！", "？", ".", "!", "?")):
+            flush()
+    flush()
+    return coalesced
+
+
 class QwenASRBackend(ASRBackend):
     name = "qwen_asr"
 
@@ -223,7 +278,7 @@ class QwenASRBackend(ASRBackend):
                         )
                     )
             if result_chunks:
-                chunks.extend(result_chunks)
+                chunks.extend(_coalesce_qwen_timestamp_chunks(result_chunks, language=language))
             elif text:
                 chunks.append(
                     ASRChunk(

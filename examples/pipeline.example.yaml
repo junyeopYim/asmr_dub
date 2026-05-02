@@ -23,6 +23,15 @@ qwen_tts_candidate_batch_size: 4
 qwen_tts_max_new_tokens: 2048
 qwen_tts_segment_batch_size: 8
 qwen_tts_target_vram_gb: 14.0
+fish_tts_repo_dir: .cache/tts_backends/fish-speech
+fish_tts_base_url: http://127.0.0.1:8080
+fish_tts_candidate_count: 2
+fish_tts_max_new_tokens: 1024
+cosyvoice_repo_dir: .cache/tts_backends/CosyVoice
+cosyvoice_model_dir: .cache/tts_backends/CosyVoice/pretrained_models/CosyVoice2-0.5B
+cosyvoice_base_url: http://127.0.0.1:50000
+cosyvoice_candidate_count: 2
+cosyvoice_mode: zero_shot
 default_gemma_backend: mock
 duration_tolerance: 0.2
 gemma_http_send_audio: false

@@ -290,6 +290,25 @@ class ProjectConfig(StrictBaseModel):
     qwen_tts_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
     qwen_tts_max_new_tokens: int = Field(default=2048, ge=1)
     qwen_tts_x_vector_only_mode: bool = False
+    fish_tts_repo_dir: str = ".cache/tts_backends/fish-speech"
+    fish_tts_base_url: str = "http://127.0.0.1:8080"
+    fish_tts_candidate_count: int = Field(default=2, ge=1, le=8)
+    fish_tts_timeout_sec: float = Field(default=240.0, gt=0)
+    fish_tts_chunk_length: int = Field(default=200, ge=100, le=1000)
+    fish_tts_temperature: float = Field(default=0.8, ge=0.1, le=1.0)
+    fish_tts_top_p: float = Field(default=0.8, ge=0.1, le=1.0)
+    fish_tts_repetition_penalty: float = Field(default=1.1, ge=0.9, le=2.0)
+    fish_tts_max_new_tokens: int = Field(default=1024, ge=1)
+    fish_tts_normalize: bool = True
+    fish_tts_latency: Literal["normal", "balanced"] = "normal"
+    cosyvoice_repo_dir: str = ".cache/tts_backends/CosyVoice"
+    cosyvoice_model_dir: str = ".cache/tts_backends/CosyVoice/pretrained_models/CosyVoice2-0.5B"
+    cosyvoice_base_url: str = "http://127.0.0.1:50000"
+    cosyvoice_candidate_count: int = Field(default=2, ge=1, le=8)
+    cosyvoice_timeout_sec: float = Field(default=240.0, gt=0)
+    cosyvoice_mode: Literal["zero_shot", "cross_lingual", "instruct2"] = "zero_shot"
+    cosyvoice_sample_rate: int = Field(default=22_050, ge=8_000)
+    cosyvoice_instruct_text: str = ""
     asr_resegment_from_chunks: bool = True
     asr_resegment_min_sec: float = Field(default=3.0, gt=0)
     asr_resegment_max_sec: float = Field(default=20.0, gt=0)
@@ -618,7 +637,7 @@ class TTSCandidate(StrictBaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     output_path: str
     duration_sec: float | None = Field(default=None, ge=0)
-    backend: Literal["mock", "gpt-sovits", "qwen-tts"] = "mock"
+    backend: Literal["mock", "gpt-sovits", "qwen-tts", "fish-tts", "cosyvoice"] = "mock"
     selected: bool = False
     error: str | None = None
     duration_ratio: float | None = Field(default=None, ge=0)
@@ -630,7 +649,7 @@ class TTSCandidate(StrictBaseModel):
 
 
 class TTSMetadata(StrictBaseModel):
-    backend: Literal["mock", "gpt-sovits", "qwen-tts"] = "mock"
+    backend: Literal["mock", "gpt-sovits", "qwen-tts", "fish-tts", "cosyvoice"] = "mock"
     ref_style: str = "whisper_close"
     speed_factor: float = Field(default=1.0, gt=0)
     candidate_count: int = Field(default=1, ge=1)
