@@ -2752,12 +2752,12 @@ def _effective_asr_config(
     asr_batch_size: int | None = None,
 ) -> Any:
     payload = cfg.model_dump(mode="json")
-    preset = (asr_preset or payload.get("asr_preset") or "default").replace("-", "_")
+    preset = (asr_preset or getattr(cfg, "asr_preset", None) or "default").replace("-", "_")
     payload["asr_preset"] = preset
     overrides = ASR_PRESET_OVERRIDES.get(preset, {})
     for key, value in overrides.items():
         if key == "asr_vad_parameters":
-            payload[key] = {**dict(payload.get(key) or {}), **dict(value)}
+            payload[key] = {**dict(getattr(cfg, "asr_vad_parameters", {}) or {}), **dict(value)}
         else:
             payload[key] = value
     if asr_vad_off:
@@ -2773,7 +2773,9 @@ def _effective_asr_config(
         payload["asr_batched_inference"] = bool(asr_batched_inference)
     if asr_batch_size is not None:
         payload["asr_batch_size"] = int(asr_batch_size)
-    return type(cfg).model_validate(payload)
+    next_cfg = type(cfg).model_validate(payload)
+    next_cfg.asr.correction_profile = cfg.asr.correction_profile
+    return next_cfg
 
 
 def _asr_backend_config(cfg: Any) -> dict[str, Any]:
@@ -3793,4 +3795,3 @@ def _include_segment_in_mix(segment: Segment, *, allow_korean_timing_draft: bool
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

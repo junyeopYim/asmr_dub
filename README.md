@@ -71,8 +71,8 @@ hashes, durations, and selected input in the manifest. It does not concatenate
 video streams; final export from a merged source is WAV-first.
 
 Use `--real --gemma-backend hf` only after installing the optional HF dependencies.
-Use `--real --gemma-backend llama_cpp` to run the Hugging Face cached
-OBLITERATUS Gemma 4 E4B Q8 GGUF through `llama-mtmd-cli`. Real GPT-SoVITS
+Use `--real --gemma-backend llama_cpp` to run the configured local GGUF
+Gemma model through `llama-mtmd-cli`. Real GPT-SoVITS
 synthesis needs project-local voice references you have rights/consent to use; `full --real`
 now defaults to GPT-SoVITS few-shot training from source segments before
 synthesis and can auto-start repo-local GPT-SoVITS installs such as
@@ -83,16 +83,16 @@ RVC-WebUI checkout exists at
 `.cache/third_party/Retrieval-based-Voice-Conversion-WebUI`, `full --real`
 auto-populates command templates that first train a project-local RVC model and
 then convert the selected GPT-SoVITS WAVs. Otherwise configure
-`rvc_train_command` and `rvc_command` in `pipeline.yaml`; the pipeline fails
+`rvc.train_command` and `rvc.command` in `pipeline.yaml`; the pipeline fails
 early if they are missing.
 If GPT-SoVITS dependencies are installed in a different Python than this
 project's `.venv`, set `ASMR_DUB_GSV_PYTHON=/path/to/python`.
 The real llama.cpp Korean lane defaults to one `llama-server` and sends
 concurrent text requests to its slots, while real GPT-SoVITS synthesis defaults
-to three `api_v2` instances on incrementing ports. Tune `gemma_text_concurrency`
-and `gsv_concurrency` in `pipeline.yaml` to match available GPU memory. Real
+to three `api_v2` instances on incrementing ports. Tune `gemma.text_concurrency`
+and `gsv.concurrency` in `pipeline.yaml` to match available GPU memory. Real
 faster-whisper transcription also defaults to rebuilding TTS segments from ASR
-chunks (`asr_resegment_from_chunks: true`) so long ASR sentences are not copied
+chunks (`asr.resegment_from_chunks: true`) so long ASR sentences are not copied
 onto many tiny energy segments.
 
 ## ASR Debugging
@@ -200,7 +200,7 @@ a different cache project, or `--no-source-separation-cache` to force normal
 separation behavior.
 
 If GPT-SoVITS is installed outside the known repo-local paths, add a server
-command. When `gsv_concurrency` is greater than 1, use `{host}` and `{port}`
+command. When `gsv.concurrency` is greater than 1, use `{host}` and `{port}`
 placeholders so each auto-started instance gets its own port:
 
 ```bash
@@ -240,115 +240,117 @@ asmr-dub rvc-validate --project ./project
 Generic command-template example:
 
 ```yaml
-rvc_required: true
-rvc_train_required: true
-rvc_train_backend: command
-rvc_train_batch_size: 0  # auto from GPU memory; set a positive value to pin it
-rvc_train_command:
-  - "/path/to/rvc-train-wrapper"
-  - "--dataset"
-  - "{dataset}"
-  - "--output-model"
-  - "{output_model}"
-  - "--output-index"
-  - "{output_index}"
-rvc_backend: command
-rvc_working_dir: ".cache/third_party/Retrieval-based-Voice-Conversion"
-rvc_command:
-  - ".cache/rvc_venv/bin/rvc"
-  - "infer"
-  - "-m"
-  - "{model}"
-  - "-i"
-  - "{input}"
-  - "-o"
-  - "{output}"
-  - "-fu"
-  - "{f0_up_key}"
-  - "-fm"
-  - "{f0_method}"
-  - "-if"
-  - "{index}"
-  - "-fr"
-  - "{filter_radius}"
-  - "-rsr"
-  - "{resample_sr}"
-  - "-rmr"
-  - "{rms_mix_rate}"
-  - "-p"
-  - "{protect}"
-rvc_device: "cuda:0"
-rvc_failure_policy: "retry_then_error"
-rvc_allow_pre_rvc_fallback: false
-rvc_duration_tolerance: null
+rvc:
+  required: true
+  train_required: true
+  train_backend: command
+  train_batch_size: 0  # auto from GPU memory; set a positive value to pin it
+  train_command:
+    - "/path/to/rvc-train-wrapper"
+    - "--dataset"
+    - "{dataset}"
+    - "--output-model"
+    - "{output_model}"
+    - "--output-index"
+    - "{output_index}"
+  backend: command
+  working_dir: ".cache/third_party/Retrieval-based-Voice-Conversion"
+  command:
+    - ".cache/rvc_venv/bin/rvc"
+    - "infer"
+    - "-m"
+    - "{model}"
+    - "-i"
+    - "{input}"
+    - "-o"
+    - "{output}"
+    - "-fu"
+    - "{f0_up_key}"
+    - "-fm"
+    - "{f0_method}"
+    - "-if"
+    - "{index}"
+    - "-fr"
+    - "{filter_radius}"
+    - "-rsr"
+    - "{resample_sr}"
+    - "-rmr"
+    - "{rms_mix_rate}"
+    - "-p"
+    - "{protect}"
+  device: "cuda:0"
+  failure_policy: "retry_then_error"
+  allow_pre_rvc_fallback: false
+  duration_tolerance: null
 ```
 
 RVC-WebUI `infer_cli.py` style example:
 
 ```yaml
-rvc_required: true
-rvc_train_required: true
-rvc_train_backend: command
-rvc_train_command:
-  - ".cache/rvc_venv/bin/python"
-  - "asmr_dub_pipeline/rvc/webui_train.py"
-  - "--rvc-root"
-  - ".cache/third_party/Retrieval-based-Voice-Conversion-WebUI"
-  - "--dataset"
-  - "{dataset}"
-  - "--experiment-name"
-  - "{experiment_name}"
-  - "--output-model"
-  - "{output_model}"
-  - "--output-index"
-  - "{output_index}"
-  - "--sample-rate"
-  - "48k"
-  - "--device"
-  - "{device}"
-  - "--epochs"
-  - "200"
-  - "--batch-size"
-  - "{batch_size}"
-rvc_backend: command
-rvc_command:
-  - ".cache/rvc_venv/bin/python"
-  - "asmr_dub_pipeline/rvc/webui_infer.py"
-  - "--rvc-root"
-  - ".cache/third_party/Retrieval-based-Voice-Conversion-WebUI"
-  - "--input"
-  - "{input}"
-  - "--output"
-  - "{output}"
-  - "--model"
-  - "{model}"
-  - "--index"
-  - "{index}"
-  - "--f0-method"
-  - "{f0_method}"
-  - "--f0-up-key"
-  - "{f0_up_key}"
-  - "--index-rate"
-  - "{index_rate}"
-  - "--filter-radius"
-  - "{filter_radius}"
-  - "--resample-sr"
-  - "{resample_sr}"
-  - "--rms-mix-rate"
-  - "{rms_mix_rate}"
-  - "--protect"
-  - "{protect}"
-  - "--device"
-  - "{device}"
-rvc_device: "cuda:0"
-rvc_failure_policy: "retry_then_error"
-rvc_allow_pre_rvc_fallback: false
+rvc:
+  required: true
+  train_required: true
+  train_backend: command
+  train_command:
+    - ".cache/rvc_venv/bin/python"
+    - "asmr_dub_pipeline/rvc/webui_train.py"
+    - "--rvc-root"
+    - ".cache/third_party/Retrieval-based-Voice-Conversion-WebUI"
+    - "--dataset"
+    - "{dataset}"
+    - "--experiment-name"
+    - "{experiment_name}"
+    - "--output-model"
+    - "{output_model}"
+    - "--output-index"
+    - "{output_index}"
+    - "--sample-rate"
+    - "48k"
+    - "--device"
+    - "{device}"
+    - "--epochs"
+    - "200"
+    - "--batch-size"
+    - "{batch_size}"
+  backend: command
+  command:
+    - ".cache/rvc_venv/bin/python"
+    - "asmr_dub_pipeline/rvc/webui_infer.py"
+    - "--rvc-root"
+    - ".cache/third_party/Retrieval-based-Voice-Conversion-WebUI"
+    - "--input"
+    - "{input}"
+    - "--output"
+    - "{output}"
+    - "--model"
+    - "{model}"
+    - "--index"
+    - "{index}"
+    - "--f0-method"
+    - "{f0_method}"
+    - "--f0-up-key"
+    - "{f0_up_key}"
+    - "--index-rate"
+    - "{index_rate}"
+    - "--filter-radius"
+    - "{filter_radius}"
+    - "--resample-sr"
+    - "{resample_sr}"
+    - "--rms-mix-rate"
+    - "{rms_mix_rate}"
+    - "--protect"
+    - "{protect}"
+    - "--device"
+    - "{device}"
+  device: "cuda:0"
+  failure_policy: "retry_then_error"
+  allow_pre_rvc_fallback: false
 ```
 
 RVC implementations differ, so verify exact flags against your installed RVC
 tool. Real RVC support assets and dependencies must be supplied externally; this
 project does not download or install them. The project-local voice model is
-created by `train-rvc`. To strengthen timbre, tune `rvc_index_rate` or profile
+created by `train-rvc`. To strengthen timbre, tune `rvc.index_rate` or profile
 `index_rate` upward. To reduce artifacts, try lower `index_rate`. For
 ASMR/whisper-like material, compare the default `rmvpe` and `crepe` profile
 attempts.
@@ -359,13 +361,13 @@ attempts.
 yet, it creates a single temporary transcription seed, then `segment` finalizes
 the ASR timestamps into TTS-ready segment clips. `translate-ko` then sends only text to Gemma4 through
 `llama-server`; it never uses the unsupported `llama-mtmd-cli --audio` path.
-By default it starts one text model server and uses `gemma_text_concurrency`
+By default it starts one text model server and uses `gemma.text_concurrency`
 slot workers against the same endpoint instead of duplicating the model across
 ports.
 For real GPT-SoVITS Korean output, the client sends pure-language api_v2 codes
 (`all_ko` text with `all_ja` reference prompts), preserves the Japanese
 reference prompt text, and trims generated edge silence by default
-(`gsv_trim_edge_silence: true`).
+(`gsv.trim_edge_silence: true`).
 Korean translations are stored separately from Japanese GPT-SoVITS scripts:
 
 ```bash

@@ -5,7 +5,11 @@ from typing import Any
 
 import yaml
 
-from .schemas import ProjectConfig
+from .schemas import (
+    BUILTIN_ASR_CORRECTION_PROFILE,
+    ProjectConfig,
+    load_asr_correction_profile,
+)
 
 STANDARD_DIRS = [
     "input",
@@ -56,6 +60,7 @@ DEFAULT_REFS = {
         "prompt_lang": "ja",
     },
 }
+PROJECT_ASR_PROFILE_PATH = "profiles/asr/project.yaml"
 
 
 def project_path(project_dir: Path | str, *parts: str) -> Path:
@@ -84,10 +89,35 @@ def load_project_config(project_dir: Path | str) -> ProjectConfig:
     data = yaml.safe_load(path.read_text("utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Project config must be a mapping: {path}")
-    return ProjectConfig.model_validate(data)
+    config = ProjectConfig.model_validate(data)
+    config.asr.correction_profile = load_asr_correction_profile(
+        config.asr.correction_profile_path,
+        base_dir=path.parent,
+    )
+    return config
 
 
 def save_project_config(config: ProjectConfig, path: Path) -> None:
-    payload: dict[str, Any] = config.model_dump(mode="json")
+    dump_config = config.model_copy(deep=True)
+    profile_payload = dump_config.asr.correction_profile.model_dump(mode="json")
+    default_profile_payload = load_asr_correction_profile(
+        BUILTIN_ASR_CORRECTION_PROFILE
+    ).model_dump(mode="json")
+    if profile_payload != default_profile_payload:
+        raw_profile_path = dump_config.asr.correction_profile_path
+        if raw_profile_path and not str(raw_profile_path).startswith("builtin:"):
+            rel_profile_path = str(raw_profile_path)
+        else:
+            rel_profile_path = PROJECT_ASR_PROFILE_PATH
+        profile_path = Path(rel_profile_path).expanduser()
+        if not profile_path.is_absolute():
+            profile_path = path.parent / profile_path
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(
+            yaml.safe_dump(profile_payload, allow_unicode=True, sort_keys=True),
+            "utf-8",
+        )
+        dump_config.asr.correction_profile_path = rel_profile_path
+    payload: dict[str, Any] = dump_config.model_dump(mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=True), "utf-8")

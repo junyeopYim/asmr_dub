@@ -33,9 +33,10 @@ Korean text lane uses the GGUF model path through `llama-server`; multimodal
 audio tasks also require a compatible projector.
 
 ```yaml
-gemma_llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli
-gemma_llama_cpp_model_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-Q8_0.gguf
-gemma_llama_cpp_mmproj_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf
+gemma:
+  llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli
+  llama_cpp_model_path: /home/junyeop/projects/ASMR/.cache/llama_cpp/models/mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF/gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf
+  llama_cpp_mmproj_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf
 ```
 
 Run it with:
@@ -64,7 +65,7 @@ asmr-dub synth --project ./project --gsv-url http://127.0.0.1:9880 --refs refs/r
 ```
 
 For one-command real runs, `full --real` can manage a local GPT-SoVITS server
-for the duration of the pipeline. It first checks whether `gsv_url` is already
+for the duration of the pipeline. It first checks whether `gsv.url` is already
 HTTP-ready; if so, it reuses that process and does not shut it down. If the
 port is open but the HTTP API is not ready, it waits up to the configured
 startup timeout and reports the server log tail on failure. If not, it starts
@@ -100,25 +101,26 @@ exists.
 If GPT-SoVITS is installed somewhere else, store the command in `pipeline.yaml`:
 
 ```yaml
-gsv_auto_start: true
-gsv_server_command:
-  - python
-  - /path/to/GPT-SoVITS/api_v2.py
-  - -a
-  - 127.0.0.1
-  - -p
-  - "9880"
-  - -c
-  - /path/to/GPT-SoVITS/GPT_SoVITS/configs/tts_infer.yaml
-gsv_server_cwd: /path/to/GPT-SoVITS
-gsv_server_startup_timeout_sec: 120.0
-gsv_server_shutdown_timeout_sec: 10.0
-gsv_few_shot_enabled: true
-gsv_few_shot_target_sec: 60.0
-gsv_few_shot_min_clip_sec: 1.0
-gsv_few_shot_max_clip_sec: 10.0
-gsv_few_shot_force: false
-gsv_few_shot_version: auto
+gsv:
+  auto_start: true
+  server_command:
+    - python
+    - /path/to/GPT-SoVITS/api_v2.py
+    - -a
+    - 127.0.0.1
+    - -p
+    - "9880"
+    - -c
+    - /path/to/GPT-SoVITS/GPT_SoVITS/configs/tts_infer.yaml
+  server_cwd: /path/to/GPT-SoVITS
+  server_startup_timeout_sec: 120.0
+  server_shutdown_timeout_sec: 10.0
+  few_shot_enabled: true
+  few_shot_target_sec: 60.0
+  few_shot_min_clip_sec: 1.0
+  few_shot_max_clip_sec: 10.0
+  few_shot_force: false
+  few_shot_version: auto
 ```
 
 Few-shot training runs the GPT-SoVITS prepare/train scripts with a Python that
@@ -128,7 +130,7 @@ wrong environment, set `ASMR_DUB_GSV_PYTHON=/path/to/python` before running
 
 If no command is supplied and no known `api_v2.py` exists, it fails before
 synthesis with a message telling you to install GPT-SoVITS or set
-`gsv_server_command`.
+`gsv.server_command`.
 
 Cached GPT-SoVITS weights under `.cache/gpt_sovits` are not an in-process
 backend. They are available for a GPT-SoVITS `api_v2` server that you start
@@ -140,8 +142,9 @@ still connects to that server over HTTP.
 Optional model switching can be configured in `pipeline.yaml` or passed on the CLI:
 
 ```yaml
-gsv_gpt_weights_path: null
-gsv_sovits_weights_path: null
+gsv:
+  gpt_weights_path: null
+  sovits_weights_path: null
 ```
 
 ```bash
@@ -159,7 +162,7 @@ Remote endpoints may receive text/audio metadata and must be explicitly configur
 
 ### `/tts` payload contract
 
-The client posts JSON to `POST {gsv_url}/tts` and expects WAV bytes back. JSON
+The client posts JSON to `POST {gsv.url}/tts` and expects WAV bytes back. JSON
 responses, empty bodies, and non-audio bodies are treated as errors and are not
 saved as WAV files.
 
@@ -191,7 +194,7 @@ Generation fields sent explicitly for deterministic records:
 
 Each manifest candidate records the exact payload plus retry metadata. If a
 candidate is too long for the source segment, synthesis first retries with a
-higher `speed_factor` capped by `gsv_tts_max_speed_factor`; if it is still too
+higher `speed_factor` capped by `gsv.tts_max_speed_factor`; if it is still too
 long, it retries after requesting the existing script-duration rewrite hook.
 This prevents Korean or whisper-heavy lines from being compressed until
 pronunciation collapses. If a previous QC pass flagged repetition or omission

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from importlib import resources
+from pathlib import Path
 from typing import Any, Literal
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SCHEMA_VERSION = "1.0"
@@ -226,102 +229,201 @@ class VoiceBankManifest(StrictBaseModel):
         self.updated_at = utc_now()
 
 
-class ProjectConfig(StrictBaseModel):
-    project_name: str = "asmr-dub-project"
-    source_language: SourceLanguage = "ja"
-    target_language: TargetLanguage = "ko"
-    candidate_count: int = Field(default=1, ge=1, le=8)
-    base_seed: int = 12345
-    mix_sample_rate: int = 48_000
-    gemma_sample_rate: int = 16_000
-    default_gemma_backend: Literal["mock", "hf", "http", "llama_cpp"] = "mock"
-    gemma_model_id: str = "google/gemma-4-E4B-it"
-    gemma_http_url: str | None = None
-    gemma_http_send_audio: bool = False
-    hf_local_files_only: bool = True
-    gemma_llama_cpp_cli_path: str = (
-        ".cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli"
+BUILTIN_ASR_CORRECTION_PROFILE = "builtin:asmr_ja"
+
+
+class ASRCorrectionProfile(StrictBaseModel):
+    hotwords: str = ""
+    repair_suspicious_text_patterns: list[str] = Field(default_factory=list)
+    text_replacements: dict[str, str] = Field(default_factory=dict)
+    review_suspicious_text_patterns: list[str] = Field(default_factory=list)
+    review_candidate_replacements: dict[str, str] = Field(default_factory=dict)
+    translation_backcheck_source_patterns: list[str] = Field(default_factory=list)
+    translation_backcheck_ko_patterns: list[str] = Field(default_factory=list)
+
+
+def _read_asr_profile_payload(profile_path: str | Path | None, base_dir: Path | None = None) -> dict[str, Any]:
+    raw_profile = str(profile_path or BUILTIN_ASR_CORRECTION_PROFILE).strip()
+    if not raw_profile or raw_profile == BUILTIN_ASR_CORRECTION_PROFILE:
+        raw_profile = BUILTIN_ASR_CORRECTION_PROFILE
+    if raw_profile.startswith("builtin:"):
+        profile_name = raw_profile.removeprefix("builtin:").strip() or "asmr_ja"
+        resource = resources.files("asmr_dub_pipeline.config_profiles.asr").joinpath(
+            f"{profile_name}.yaml"
+        )
+        payload = yaml.safe_load(resource.read_text(encoding="utf-8")) or {}
+    else:
+        path = Path(raw_profile).expanduser()
+        if not path.is_absolute() and base_dir is not None:
+            path = base_dir / path
+        payload = yaml.safe_load(path.read_text("utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"ASR correction profile must be a mapping: {raw_profile}")
+    return payload
+
+
+def load_asr_correction_profile(
+    profile_path: str | Path | None = BUILTIN_ASR_CORRECTION_PROFILE,
+    base_dir: Path | None = None,
+) -> ASRCorrectionProfile:
+    return ASRCorrectionProfile.model_validate(_read_asr_profile_payload(profile_path, base_dir))
+
+
+def default_asr_correction_profile() -> ASRCorrectionProfile:
+    return load_asr_correction_profile(BUILTIN_ASR_CORRECTION_PROFILE)
+
+
+class ASRConfig(StrictBaseModel):
+    backend: Literal["mock", "faster_whisper", "qwen_asr"] = "faster_whisper"
+    preset: ASRPreset = "default"
+    model_id: str = "Systran/faster-whisper-large-v3"
+    language: str = "ja"
+    local_files_only: bool = True
+    device: str = "auto"
+    compute_type: str = "default"
+    batched_inference: bool = False
+    batch_size: int = Field(default=8, ge=1)
+    beam_size: int = Field(default=5, ge=1)
+    best_of: int = Field(default=5, ge=1)
+    condition_on_previous_text: bool = False
+    vad_filter: bool = True
+    vad_parameters: dict[str, Any] = Field(
+        default_factory=lambda: {"min_silence_duration_ms": 300, "speech_pad_ms": 200}
     )
-    gemma_llama_cpp_model_path: str = (
-        "~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/"
-        "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
-        "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf"
+    word_timestamps: bool = False
+    hallucination_silence_threshold: float | None = Field(default=None, gt=0)
+    initial_prompt: str = ""
+    diagnostics_enabled: bool = True
+    input_min_rms_dbfs: float = -75.0
+    input_min_peak_dbfs: float = -65.0
+    input_duration_tolerance: float = Field(default=0.08, ge=0.0, le=1.0)
+    qwen_model_id: str = "Qwen/Qwen3-ASR-1.7B"
+    qwen_forced_aligner_model_id: str | None = "Qwen/Qwen3-ForcedAligner-0.6B"
+    qwen_device_map: str = "cuda:0"
+    qwen_dtype: str = "bfloat16"
+    qwen_return_timestamps: bool = True
+    qwen_context: str = ""
+    qwen_max_inference_batch_size: int = Field(default=8, ge=1)
+    qwen_max_new_tokens: int = Field(default=4096, ge=1)
+    resegment_from_chunks: bool = True
+    resegment_min_sec: float = Field(default=3.0, gt=0)
+    resegment_max_sec: float = Field(default=20.0, gt=0)
+    resegment_merge_gap_sec: float = Field(default=1.0, ge=0)
+    sparse_chunk_max_sec: float = Field(default=30.0, gt=0)
+    sparse_chunk_min_chars_per_sec: float = Field(default=0.5, ge=0)
+    repair_enabled: bool = True
+    repair_confidence_threshold: float = Field(default=0.94, ge=0.0, le=1.0)
+    repair_sparse_min_sec: float = Field(default=12.0, gt=0)
+    repair_sparse_min_chars_per_sec: float = Field(default=1.0, ge=0)
+    repair_padding_sec: float = Field(default=1.0, ge=0)
+    repair_max_chunks: int = Field(default=160, ge=0)
+    qwen_repair_fallback_enabled: bool = False
+    review_enabled: bool = False
+    review_backend: Literal["llama_server_audio", "mock"] = "llama_server_audio"
+    review_batch_size: int = Field(default=8, ge=1, le=50)
+    review_max_chunks: int = Field(default=160, ge=0)
+    review_context_radius: int = Field(default=2, ge=0, le=8)
+    review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    review_generate_candidates: bool = True
+    review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
+    review_audio_padding_sec: float = Field(default=0.4, ge=0.0)
+    review_initial_prompt: str = ""
+    translation_backcheck_enabled: bool = True
+    translation_backcheck_mark_manual_review: bool = False
+    source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "demucs"
+    source_separation_model: str = "htdemucs"
+    source_separation_device: str | None = None
+    segmentation_min_segment_sec: float = Field(default=0.25, gt=0)
+    segmentation_max_segment_sec: float = Field(default=20.0, gt=0)
+    segmentation_silence_db: float = -45.0
+    segmentation_min_silence_sec: float = Field(default=0.30, ge=0)
+    correction_profile_path: str | None = BUILTIN_ASR_CORRECTION_PROFILE
+    correction_profile: ASRCorrectionProfile = Field(
+        default_factory=default_asr_correction_profile,
+        exclude=True,
+        repr=False,
     )
-    gemma_llama_cpp_mmproj_path: str = (
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_partial_correction_profile(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        profile = data.get("correction_profile")
+        if isinstance(profile, dict):
+            merged = default_asr_correction_profile().model_dump(mode="json")
+            merged.update(profile)
+            data["correction_profile"] = merged
+        return data
+
+
+class GemmaConfig(StrictBaseModel):
+    sample_rate: int = 16_000
+    default_backend: Literal["mock", "hf", "http", "llama_cpp"] = "mock"
+    model_id: str = "google/gemma-4-E4B-it"
+    http_url: str | None = None
+    http_send_audio: bool = False
+    llama_cpp_cli_path: str = ".cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli"
+    llama_cpp_model_path: str = (
+        "/home/junyeop/projects/ASMR/.cache/llama_cpp/models/mudler/"
+        "gemma-4-26B-A4B-it-heretic-APEX-GGUF/"
+        "gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf"
+    )
+    llama_cpp_mmproj_path: str = (
         "~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/"
         "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
         "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"
     )
-    gemma_llama_cpp_timeout_sec: float = Field(default=600.0, gt=0)
-    gemma_llama_cpp_ctx_size: int = Field(default=4096, ge=512)
-    gemma_llama_cpp_n_predict: int = Field(default=1024, ge=64)
-    gemma_llama_cpp_gpu_layers: int = Field(default=999, ge=0)
-    gemma_llama_cpp_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    gemma_llama_cpp_seed: int = 12345
-    gemma_llama_cpp_extra_args: list[str] = Field(default_factory=list)
-    asr_backend: Literal["mock", "faster_whisper", "qwen_asr"] = "faster_whisper"
-    asr_preset: ASRPreset = "default"
-    asr_model_id: str = "Systran/faster-whisper-large-v3"
-    asr_language: str = "ja"
-    asr_local_files_only: bool = True
-    asr_device: str = "auto"
-    asr_compute_type: str = "default"
-    asr_batched_inference: bool = False
-    asr_batch_size: int = Field(default=8, ge=1)
-    asr_beam_size: int = Field(default=5, ge=1)
-    asr_best_of: int = Field(default=5, ge=1)
-    asr_condition_on_previous_text: bool = False
-    asr_vad_filter: bool = True
-    asr_vad_parameters: dict[str, Any] = Field(
-        default_factory=lambda: {"min_silence_duration_ms": 300, "speech_pad_ms": 200}
-    )
-    asr_word_timestamps: bool = False
-    asr_hallucination_silence_threshold: float | None = Field(default=None, gt=0)
-    asr_initial_prompt: str = ""
-    asr_hotwords: str = (
-        "絶頂 媚薬 耳舐め 耳なめ 暗示 快感 10数える 飛んじゃってください "
-        "気持ちいい イっちゃう 18禁 さくら ジンジン 痺れる ザーメン 先走り液 "
-        "メスイキ クリトリス おまんこ おちんぽ 精液 潮吹き 出会いアプリ スケベ "
-        "女体化 性感帯 四肢 採集 デイドリーム 採集マシーン エネルギー不足 "
-        "疼いて 発情 発情中 尿意 従順 オスに犯される オナニー ゾクゾク 淫乱 "
-        "はしたなく 鼻鳴らして 嗅ぎなさい 投与 耳奥 ピストン グチュグチュ 中イキ"
-    )
-    asr_diagnostics_enabled: bool = True
-    asr_input_min_rms_dbfs: float = -75.0
-    asr_input_min_peak_dbfs: float = -65.0
-    asr_input_duration_tolerance: float = Field(default=0.08, ge=0.0, le=1.0)
-    qwen_asr_model_id: str = "Qwen/Qwen3-ASR-1.7B"
-    qwen_asr_forced_aligner_model_id: str | None = "Qwen/Qwen3-ForcedAligner-0.6B"
-    qwen_asr_device_map: str = "cuda:0"
-    qwen_asr_dtype: str = "bfloat16"
-    qwen_asr_return_timestamps: bool = True
-    qwen_asr_context: str = ""
-    qwen_asr_max_inference_batch_size: int = Field(default=8, ge=1)
-    qwen_asr_max_new_tokens: int = Field(default=4096, ge=1)
-    qwen_tts_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    qwen_tts_candidate_count: int = Field(default=4, ge=1, le=8)
-    qwen_tts_device_map: str = "cuda:0"
-    qwen_tts_dtype: str = "bfloat16"
-    qwen_tts_attn_implementation: str = "flash_attention_2"
-    qwen_tts_local_files_only: bool = True
-    qwen_tts_candidate_batch_size: int = Field(default=4, ge=1, le=8)
-    qwen_tts_segment_batch_size: int = Field(default=8, ge=1, le=16)
-    qwen_tts_target_vram_gb: float | None = Field(default=14.0, gt=0)
-    qwen_tts_temperature: float = Field(default=0.65, ge=0.0, le=2.0)
-    qwen_tts_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
-    qwen_tts_max_new_tokens: int = Field(default=2048, ge=1)
-    qwen_tts_x_vector_only_mode: bool = False
-    fish_tts_repo_dir: str = ".cache/tts_backends/fish-speech"
-    fish_tts_base_url: str = "http://127.0.0.1:8080"
-    fish_tts_candidate_count: int = Field(default=2, ge=1, le=8)
-    fish_tts_timeout_sec: float = Field(default=240.0, gt=0)
-    fish_tts_chunk_length: int = Field(default=200, ge=100, le=1000)
-    fish_tts_temperature: float = Field(default=0.8, ge=0.1, le=1.0)
-    fish_tts_top_p: float = Field(default=0.8, ge=0.1, le=1.0)
-    fish_tts_repetition_penalty: float = Field(default=1.1, ge=0.9, le=2.0)
-    fish_tts_max_new_tokens: int = Field(default=1024, ge=1)
-    fish_tts_normalize: bool = True
-    fish_tts_latency: Literal["normal", "balanced"] = "normal"
+    llama_cpp_timeout_sec: float = Field(default=600.0, gt=0)
+    llama_cpp_ctx_size: int = Field(default=4096, ge=512)
+    llama_cpp_n_predict: int = Field(default=1024, ge=64)
+    llama_cpp_gpu_layers: int = Field(default=999, ge=0)
+    llama_cpp_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    llama_cpp_seed: int = 12345
+    llama_cpp_extra_args: list[str] = Field(default_factory=list)
+    text_server_url: str = "http://127.0.0.1:8080"
+    text_server_auto_start: bool = True
+    text_server_command: list[str] = Field(default_factory=list)
+    text_batch_size: int = Field(default=12, ge=1, le=200)
+    text_span_size: int = Field(default=4, ge=1, le=20)
+    text_span_max_sec: float = Field(default=18.0, gt=0)
+    text_span_max_gap_sec: float = Field(default=1.2, ge=0)
+    text_context_radius: int = Field(default=4, ge=0, le=20)
+    text_two_pass: bool = True
+    text_concurrency: int = Field(default=4, ge=1, le=8)
+    text_n_predict: int = Field(default=2048, ge=64)
+    text_timeout_sec: float = Field(default=180.0, gt=0)
+    text_retries: int = Field(default=1, ge=0, le=5)
+    text_server_startup_timeout_sec: float = Field(default=120.0, gt=0)
+    text_server_shutdown_timeout_sec: float = Field(default=10.0, gt=0)
+
+
+class TTSConfig(StrictBaseModel):
+    qwen_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    qwen_candidate_count: int = Field(default=4, ge=1, le=8)
+    qwen_device_map: str = "cuda:0"
+    qwen_dtype: str = "bfloat16"
+    qwen_attn_implementation: str = "flash_attention_2"
+    qwen_local_files_only: bool = True
+    qwen_candidate_batch_size: int = Field(default=4, ge=1, le=8)
+    qwen_segment_batch_size: int = Field(default=8, ge=1, le=16)
+    qwen_target_vram_gb: float | None = Field(default=14.0, gt=0)
+    qwen_temperature: float = Field(default=0.65, ge=0.0, le=2.0)
+    qwen_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
+    qwen_max_new_tokens: int = Field(default=2048, ge=1)
+    qwen_x_vector_only_mode: bool = False
+    fish_repo_dir: str = ".cache/tts_backends/fish-speech"
+    fish_base_url: str = "http://127.0.0.1:8080"
+    fish_candidate_count: int = Field(default=2, ge=1, le=8)
+    fish_timeout_sec: float = Field(default=240.0, gt=0)
+    fish_chunk_length: int = Field(default=200, ge=100, le=1000)
+    fish_temperature: float = Field(default=0.8, ge=0.1, le=1.0)
+    fish_top_p: float = Field(default=0.8, ge=0.1, le=1.0)
+    fish_repetition_penalty: float = Field(default=1.1, ge=0.9, le=2.0)
+    fish_max_new_tokens: int = Field(default=1024, ge=1)
+    fish_normalize: bool = True
+    fish_latency: Literal["normal", "balanced"] = "normal"
     cosyvoice_repo_dir: str = ".cache/tts_backends/CosyVoice"
     cosyvoice_model_dir: str = ".cache/tts_backends/CosyVoice/pretrained_models/CosyVoice2-0.5B"
     cosyvoice_base_url: str = "http://127.0.0.1:50000"
@@ -330,320 +432,114 @@ class ProjectConfig(StrictBaseModel):
     cosyvoice_mode: Literal["zero_shot", "cross_lingual", "instruct2"] = "zero_shot"
     cosyvoice_sample_rate: int = Field(default=22_050, ge=8_000)
     cosyvoice_instruct_text: str = ""
-    asr_resegment_from_chunks: bool = True
-    asr_resegment_min_sec: float = Field(default=3.0, gt=0)
-    asr_resegment_max_sec: float = Field(default=20.0, gt=0)
-    asr_resegment_merge_gap_sec: float = Field(default=1.0, ge=0)
-    asr_sparse_chunk_max_sec: float = Field(default=30.0, gt=0)
-    asr_sparse_chunk_min_chars_per_sec: float = Field(default=0.5, ge=0)
-    asr_repair_enabled: bool = True
-    asr_repair_confidence_threshold: float = Field(default=0.94, ge=0.0, le=1.0)
-    asr_repair_sparse_min_sec: float = Field(default=12.0, gt=0)
-    asr_repair_sparse_min_chars_per_sec: float = Field(default=1.0, ge=0)
-    asr_repair_padding_sec: float = Field(default=1.0, ge=0)
-    asr_repair_max_chunks: int = Field(default=160, ge=0)
-    asr_qwen_repair_fallback_enabled: bool = False
-    asr_repair_suspicious_text_patterns: list[str] = Field(
-        default_factory=lambda: [
-            "もちなとい",
-            "耳強く",
-            "強くたま",
-            "釣りが来",
-            "膨れ起こ",
-            "触れおご",
-            "溢れおご",
-            "そんなお腹",
-            "チンジン",
-            "ビレる",
-            "アクラ",
-            "ネイジー",
-            "シャクラ",
-            "ツアメ",
-            "先走り駅",
-            "鷹…お顔",
-            "1個1個1個",
-            "めず行き",
-            "薄引き",
-            "グリドリス",
-            "グリドレス",
-            "グリトリス",
-            "クリキュス",
-            "チンポン",
-            "お孫",
-            "活アプリ",
-            "スケベン",
-            "ご処生",
-            "耳は長生き",
-            "耳は 長生き",
-        ]
-    )
-    asr_text_replacements: dict[str, str] = Field(
-        default_factory=lambda: {
-            "釣りが来ちゃう": "絶頂が来ちゃう",
-            "釣りが来ちゃえ": "絶頂が来ちゃう",
-            "銃数える": "10数える",
-            "中八菌催眠音声": "18禁催眠音声",
-            "膨れ起こって": "膨れ上がって",
-            "触れおごって": "膨れ上がって",
-            "溢れおごって": "膨れ上がって",
-            "そんな無理に": "そんなあなたに",
-            "そんなお腹に": "そんなあなたに",
-            "体幹が弾ける": "快感が弾ける",
-            "美薬": "媚薬",
-            "微薬": "媚薬",
-            "女体科": "女体化",
-            "生還体": "性感帯",
-            "君の志士": "君の四肢",
-            "君の獅子": "君の四肢",
-            "エネルギー速化しています": "エネルギー不足しています",
-            "ああ 速化": "ああ 不足",
-            "簡易版最終マシーン": "簡易版採集マシーン",
-            "ドリーム最終": "ドリーム採集",
-            "最終には必要": "採集には必要",
-            "最終に必要": "採集に必要",
-            "最終を継続": "採集を継続",
-            "親城": "神社",
-            "愛 催眠": "甘い催眠",
-            "血のお耳": "右のお耳",
-            "いいえ 気が揺らぐ": "意識が揺らぐ",
-            "ぶり気持ちよく": "たっぷり気持ちよく",
-            "薄いて": "疼いて",
-            "発症中": "発情中",
-            "発症した": "発情した",
-            "発症してる": "発情してる",
-            "発症する": "発情する",
-            "発症し": "発情し",
-            "お泣きして": "オナニーして",
-            "尿位": "尿意",
-            "中旬な": "従順な",
-            "お巣に侵される": "オスに犯される",
-            "巣に侵される": "オスに犯される",
-            "速速": "ゾクゾク",
-            "貧乱": "淫乱",
-            "端となく鼻ならして": "はしたなく鼻鳴らして",
-            "鼻ならしてかきなさい": "鼻鳴らして嗅ぎなさい",
-            "手帳が来る": "絶頂が来る",
-            "シャクラ": "さくら",
-            "インラン": "淫乱",
-            "おじさまのツアー": "おじさまのザーメン",
-            "媚薬スプレー 豆腐": "媚薬スプレー投与",
-            "ピスタン": "ピストン",
-            "ジュガジュガ": "グチュグチュ",
-            "魅力まで触手": "耳奥まで触手",
-            "ウニオクまで触手": "耳奥まで触手",
-            "ウニアクナで触手": "耳奥まで触手",
-        }
-    )
-    asr_review_enabled: bool = False
-    asr_review_backend: Literal["llama_server_audio", "mock"] = "llama_server_audio"
-    asr_review_batch_size: int = Field(default=8, ge=1, le=50)
-    asr_review_max_chunks: int = Field(default=160, ge=0)
-    asr_review_context_radius: int = Field(default=2, ge=0, le=8)
-    asr_review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
-    asr_review_generate_candidates: bool = True
-    asr_review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
-    asr_review_audio_padding_sec: float = Field(default=0.4, ge=0.0)
-    asr_review_initial_prompt: str = ""
-    asr_review_suspicious_text_patterns: list[str] = Field(
-        default_factory=lambda: [
-            "釣り",
-            "手帳",
-            "手頂",
-            "銃数える",
-            "10数数える",
-            "会館",
-            "開館",
-            "解凍",
-            "体感に飲み込",
-            "大根に飲み込",
-            "怪コン",
-            "美やく",
-            "美よく",
-            "びよく",
-            "耳な目",
-            "稲目",
-            "あんじゅ",
-            "暗ん示",
-            "チンジン",
-            "ビレる",
-            "アクラ",
-            "ネイジー",
-            "シャクラ",
-            "ツアメ",
-            "先走り駅",
-            "鷹…お顔",
-            "1個1個1個",
-            "めず行き",
-            "薄引き",
-            "グリドリス",
-            "グリドレス",
-            "グリトリス",
-            "クリキュス",
-            "チンポン",
-            "お孫",
-            "活アプリ",
-            "スケベン",
-        ]
-    )
-    asr_review_candidate_replacements: dict[str, str] = Field(
-        default_factory=lambda: {
-            "釣りが来ちゃう": "絶頂が来ちゃう",
-            "釣りが来る": "絶頂が来る",
-            "手帳が来る": "絶頂が来る",
-            "手頂が来る": "絶頂が来る",
-            "銃数える": "10数える",
-            "10数数える": "10数える",
-            "会館に飲み込": "快感に飲み込",
-            "開館に飲み込": "快感に飲み込",
-            "解凍に飲み込": "快感に飲み込",
-            "体感に飲み込": "快感に飲み込",
-            "大根に飲み込": "快感に飲み込",
-            "怪コンに飲み込": "快感に飲み込",
-            "耳な目": "耳なめ",
-            "稲目": "耳なめ",
-            "美やく": "媚薬",
-            "美よく": "媚薬",
-            "びよく": "媚薬",
-            "あんじゅ": "暗示",
-            "暗ん示": "暗示",
-            "チンジン": "ジンジン",
-            "ビレる": "痺れる",
-            "アクラ": "さくら",
-            "ネイジー": "イメージ",
-            "シャクラ": "さくら",
-            "ツアメ": "ザーメン",
-            "インラン": "淫乱",
-            "おじさまのツアー": "おじさまのザーメン",
-            "先走り駅": "先走り液",
-            "1個1個1個": "一滴一滴",
-            "めず行きセックス": "メスイキセックス",
-            "めず行き": "メスイキ",
-            "薄引きセックス": "メスイキセックス",
-            "薄引き": "メスイキ",
-            "グリドリス": "クリトリス",
-            "グリドレス": "クリトリス",
-            "グリトリス": "クリトリス",
-            "クリキュス": "クリトリス",
-            "チンポン": "チンポ",
-            "お孫": "おまんこ",
-            "活アプリ": "出会いアプリ",
-            "スケベン": "スケベ",
-        }
-    )
-    asr_translation_backcheck_enabled: bool = True
-    asr_translation_backcheck_mark_manual_review: bool = False
-    asr_translation_backcheck_source_patterns: list[str] = Field(
-        default_factory=lambda: [
-            "釣り",
-            "手帳",
-            "手頂",
-            "銃数える",
-            "会館",
-            "開館",
-            "解凍",
-            "耳な目",
-            "稲目",
-            "美やく",
-            "美よく",
-            "あんじゅ",
-            "暗ん示",
-            "チンジン",
-            "ビレる",
-            "アクラ",
-            "ネイジー",
-            "シャクラ",
-            "ツアメ",
-            "先走り駅",
-            "鷹…お顔",
-            "1個1個1個",
-            "めず行き",
-            "薄引き",
-            "グリドリス",
-            "グリドレス",
-            "グリトリス",
-            "クリキュス",
-            "チンポン",
-            "お孫",
-            "活アプリ",
-            "スケベン",
-        ]
-    )
-    asr_translation_backcheck_ko_patterns: list[str] = Field(
-        default_factory=lambda: [
-            "낚시",
-            "수첩",
-            "회관",
-            "개관",
-            "해동",
-            "체감",
-            "대근",
-            "괴콘",
-            "미약",
-            "비약",
-            "총 세",
-            "총을",
-        ]
-    )
-    source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "demucs"
-    source_separation_model: str = "htdemucs"
-    source_separation_device: str | None = None
-    gemma_text_server_url: str = "http://127.0.0.1:8080"
-    gemma_text_server_auto_start: bool = True
-    gemma_text_server_command: list[str] = Field(default_factory=list)
-    gemma_text_batch_size: int = Field(default=12, ge=1, le=200)
-    gemma_text_span_size: int = Field(default=4, ge=1, le=20)
-    gemma_text_span_max_sec: float = Field(default=18.0, gt=0)
-    gemma_text_span_max_gap_sec: float = Field(default=1.2, ge=0)
-    gemma_text_context_radius: int = Field(default=4, ge=0, le=20)
-    gemma_text_two_pass: bool = True
-    gemma_text_concurrency: int = Field(default=4, ge=1, le=8)
-    gemma_text_n_predict: int = Field(default=2048, ge=64)
-    gemma_text_timeout_sec: float = Field(default=180.0, gt=0)
-    gemma_text_retries: int = Field(default=1, ge=0, le=5)
-    gemma_text_server_startup_timeout_sec: float = Field(default=120.0, gt=0)
-    gemma_text_server_shutdown_timeout_sec: float = Field(default=10.0, gt=0)
-    gsv_url: str = "http://127.0.0.1:9880"
-    gsv_gpt_weights_path: str | None = None
-    gsv_sovits_weights_path: str | None = None
-    gsv_gpt_weights_policy: GSVGPTWeightsPolicy = "auto"
-    gsv_sovits_weights_policy: GSVSoVITSWeightsPolicy = "auto"
-    gsv_speaker_models: dict[str, GSVSpeakerConfig] = Field(default_factory=dict)
-    gsv_timeout_sec: float = Field(default=120.0, gt=0)
-    gsv_retries: int = Field(default=2, ge=0)
-    gsv_concurrency: int = Field(default=3, ge=1, le=8)
-    gsv_auto_start: bool = False
-    gsv_server_command: list[str] = Field(default_factory=list)
-    gsv_server_cwd: str | None = None
-    gsv_server_startup_timeout_sec: float = Field(default=120.0, gt=0)
-    gsv_server_shutdown_timeout_sec: float = Field(default=10.0, gt=0)
-    gsv_trim_edge_silence: bool = True
-    gsv_trim_silence_threshold_db: float = -50.0
-    gsv_trim_silence_keep_sec: float = Field(default=0.08, ge=0.0, le=1.0)
-    gsv_few_shot_enabled: bool = True
-    gsv_few_shot_target_sec: float = Field(default=60.0, gt=0)
-    gsv_few_shot_min_clip_sec: float = Field(default=1.0, gt=0)
-    gsv_few_shot_max_clip_sec: float = Field(default=10.0, gt=0)
-    gsv_few_shot_min_quality_score: float = Field(default=0.20, ge=0.0, le=1.0)
-    gsv_ref_min_sec: float = Field(default=3.0, gt=0)
-    gsv_ref_max_sec: float = Field(default=10.0, gt=0)
-    gsv_ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
-    gsv_ko_text_min_hangul_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
-    gsv_top_k: int = Field(default=15, ge=1)
-    gsv_top_p: float = Field(default=1.0, gt=0.0, le=1.0)
-    gsv_temperature: float = Field(default=1.0, ge=0.0, le=2.0)
-    gsv_text_split_method: str = Field(default="cut5", min_length=1)
-    gsv_parallel_infer: bool = True
-    gsv_repetition_penalty: float = Field(default=1.35, ge=0.0, le=5.0)
-    gsv_sample_steps: int = Field(default=32, ge=1)
-    gsv_super_sampling: bool = False
-    gsv_overlap_length: int = Field(default=2, ge=0)
-    gsv_min_chunk_length: int = Field(default=16, ge=1)
-    gsv_fragment_interval: float = Field(default=0.3, ge=0.0)
-    gsv_tts_min_speed_factor: float = Field(default=0.85, gt=0.0, le=1.0)
-    gsv_tts_max_speed_factor: float = Field(default=1.12, ge=1.0, le=1.35)
-    gsv_few_shot_force: bool = False
-    gsv_few_shot_version: Literal["auto", "v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"] = "auto"
-    voice_bank_path: str = "voice_bank/voice_bank_manifest.json"
+
+
+class GSVConfig(StrictBaseModel):
+    url: str = "http://127.0.0.1:9880"
+    gpt_weights_path: str | None = None
+    sovits_weights_path: str | None = None
+    gpt_weights_policy: GSVGPTWeightsPolicy = "auto"
+    sovits_weights_policy: GSVSoVITSWeightsPolicy = "auto"
+    speaker_models: dict[str, GSVSpeakerConfig] = Field(default_factory=dict)
+    timeout_sec: float = Field(default=120.0, gt=0)
+    retries: int = Field(default=2, ge=0)
+    concurrency: int = Field(default=3, ge=1, le=8)
+    auto_start: bool = False
+    server_command: list[str] = Field(default_factory=list)
+    server_cwd: str | None = None
+    server_startup_timeout_sec: float = Field(default=120.0, gt=0)
+    server_shutdown_timeout_sec: float = Field(default=10.0, gt=0)
+    trim_edge_silence: bool = True
+    trim_silence_threshold_db: float = -50.0
+    trim_silence_keep_sec: float = Field(default=0.08, ge=0.0, le=1.0)
+    few_shot_enabled: bool = True
+    few_shot_target_sec: float = Field(default=60.0, gt=0)
+    few_shot_min_clip_sec: float = Field(default=1.0, gt=0)
+    few_shot_max_clip_sec: float = Field(default=10.0, gt=0)
+    few_shot_min_quality_score: float = Field(default=0.20, ge=0.0, le=1.0)
+    ref_min_sec: float = Field(default=3.0, gt=0)
+    ref_max_sec: float = Field(default=10.0, gt=0)
+    ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
+    ko_text_min_hangul_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
+    top_k: int = Field(default=15, ge=1)
+    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    text_split_method: str = Field(default="cut5", min_length=1)
+    parallel_infer: bool = True
+    repetition_penalty: float = Field(default=1.35, ge=0.0, le=5.0)
+    sample_steps: int = Field(default=32, ge=1)
+    super_sampling: bool = False
+    overlap_length: int = Field(default=2, ge=0)
+    min_chunk_length: int = Field(default=16, ge=1)
+    fragment_interval: float = Field(default=0.3, ge=0.0)
+    tts_min_speed_factor: float = Field(default=0.85, gt=0.0, le=1.0)
+    tts_max_speed_factor: float = Field(default=1.12, ge=1.0, le=1.35)
+    few_shot_force: bool = False
+    few_shot_version: Literal["auto", "v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"] = "auto"
+
+
+class RVCConfig(StrictBaseModel):
+    required: bool = True
+    backend: Literal["command", "mock"] = "command"
+    train_required: bool = True
+    train_backend: Literal["command", "mock"] = "command"
+    train_command: list[str] = Field(default_factory=list)
+    train_working_dir: str | None = None
+    train_timeout_sec: float = Field(default=14400.0, gt=0)
+    train_experiment_name: str = "asmr-rvc-speaker-1"
+    train_sample_rate: int = Field(default=48_000, ge=0)
+    train_batch_size: int = Field(default=0, ge=0, le=64)
+    train_preprocess_processes: int = Field(default=0, ge=0)
+    train_f0_workers: int = Field(default=0, ge=0)
+    train_feature_workers: int = Field(default=0, ge=0)
+    train_save_every_epoch: int = Field(default=50, ge=1)
+    train_reuse_intermediate_cache: bool = True
+    train_output_model_path: str | None = None
+    train_output_index_path: str | None = None
+    command: list[str] = Field(default_factory=list)
+    batch_infer: bool = True
+    batch_command: list[str] = Field(default_factory=list)
+    batch_size: int = Field(default=200, ge=1, le=1000)
+    batch_concurrency: int = Field(default=1, ge=1, le=4)
+    working_dir: str | None = None
+    timeout_sec: float = Field(default=180.0, gt=0)
+    concurrency: int = Field(default=1, ge=1, le=8)
+    model_path: str | None = None
+    index_path: str | None = None
+    device: str = "cuda:0"
+    f0_up_key: int = 0
+    f0_method: str = "rmvpe"
+    index_rate: float = Field(default=0.45, ge=0.0, le=1.0)
+    filter_radius: int = Field(default=3, ge=0)
+    resample_sr: int = Field(default=48_000, ge=0)
+    rms_mix_rate: float = Field(default=0.25, ge=0.0, le=1.0)
+    protect: float = Field(default=0.33, ge=0.0, le=0.5)
+    failure_policy: Literal["retry_then_error", "error"] = "retry_then_error"
+    allow_pre_rvc_fallback: bool = False
+    duration_tolerance: float | None = Field(default=None, gt=0, lt=1)
+    auto_profiles: list[RVCProfile] = Field(default_factory=default_rvc_profiles)
+    speaker_models: dict[str, RVCSpeakerConfig] = Field(default_factory=dict)
+
+
+class MixConfig(StrictBaseModel):
+    sample_rate: int = 48_000
+    duration_tolerance: float = Field(default=0.20, gt=0, lt=1)
+    profile: MixProfile = "asmr_stereo"
+    background_bed: MixBackgroundBed = "preserve_original"
+    background_gain_db: float = Field(default=-18.0, ge=-60.0, le=6.0)
+    background_speech_suppression: bool = True
+    background_speech_suppression_db: float = Field(default=-42.0, ge=-80.0, le=0.0)
+    background_speech_suppression_pad_sec: float = Field(default=0.06, ge=0.0, le=1.0)
+    background_speech_suppression_fade_ms: float = Field(default=30.0, ge=0.0, le=500.0)
+    dialogue_gain_db: float = Field(default=0.0, ge=-60.0, le=12.0)
+    dialogue_fade_ms: float | None = Field(default=None, ge=0.0, le=250.0)
+    loudness_strategy: MixLoudnessStrategy = "peak_guard_only"
+    peak_limit_dbfs: float = Field(default=-1.0, ge=-24.0, le=0.0)
+    allow_korean_timing_draft: bool = False
+
+
+class VoiceBankConfig(StrictBaseModel):
+    path: str = "voice_bank/voice_bank_manifest.json"
     speaker_assignment_backend: SpeakerAssignmentBackend = "none"
     diarization_model_id: str = "pyannote/speaker-diarization-community-1"
     diarization_embedding_model_id: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -651,63 +547,37 @@ class ProjectConfig(StrictBaseModel):
     diarization_min_speakers: int | None = Field(default=None, ge=1)
     diarization_max_speakers: int | None = Field(default=None, ge=1)
     diarization_embedding_match_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
-    segmentation_min_segment_sec: float = Field(default=0.25, gt=0)
-    segmentation_max_segment_sec: float = Field(default=20.0, gt=0)
-    segmentation_silence_db: float = -45.0
-    segmentation_min_silence_sec: float = Field(default=0.30, ge=0)
-    duration_tolerance: float = Field(default=0.20, gt=0, lt=1)
-    mix_profile: MixProfile = "asmr_stereo"
-    mix_background_bed: MixBackgroundBed = "preserve_original"
-    background_gain_db: float = Field(default=-18.0, ge=-60.0, le=6.0)
-    background_speech_suppression: bool = True
-    background_speech_suppression_db: float = Field(default=-42.0, ge=-80.0, le=0.0)
-    background_speech_suppression_pad_sec: float = Field(default=0.06, ge=0.0, le=1.0)
-    background_speech_suppression_fade_ms: float = Field(default=30.0, ge=0.0, le=500.0)
-    mix_dialogue_gain_db: float = Field(default=0.0, ge=-60.0, le=12.0)
-    mix_dialogue_fade_ms: float | None = Field(default=None, ge=0.0, le=250.0)
-    mix_loudness_strategy: MixLoudnessStrategy = "peak_guard_only"
-    mix_peak_limit_dbfs: float = Field(default=-1.0, ge=-24.0, le=0.0)
-    mix_allow_korean_timing_draft: bool = False
-    rvc_required: bool = True
-    rvc_backend: Literal["command", "mock"] = "command"
-    rvc_train_required: bool = True
-    rvc_train_backend: Literal["command", "mock"] = "command"
-    rvc_train_command: list[str] = Field(default_factory=list)
-    rvc_train_working_dir: str | None = None
-    rvc_train_timeout_sec: float = Field(default=14400.0, gt=0)
-    rvc_train_experiment_name: str = "asmr-rvc-speaker-1"
-    rvc_train_sample_rate: int = Field(default=48_000, ge=0)
-    rvc_train_batch_size: int = Field(default=0, ge=0, le=64)
-    rvc_train_preprocess_processes: int = Field(default=0, ge=0)
-    rvc_train_f0_workers: int = Field(default=0, ge=0)
-    rvc_train_feature_workers: int = Field(default=0, ge=0)
-    rvc_train_save_every_epoch: int = Field(default=50, ge=1)
-    rvc_train_reuse_intermediate_cache: bool = True
-    rvc_train_output_model_path: str | None = None
-    rvc_train_output_index_path: str | None = None
-    rvc_command: list[str] = Field(default_factory=list)
-    rvc_batch_infer: bool = True
-    rvc_batch_command: list[str] = Field(default_factory=list)
-    rvc_batch_size: int = Field(default=200, ge=1, le=1000)
-    rvc_batch_concurrency: int = Field(default=1, ge=1, le=4)
-    rvc_working_dir: str | None = None
-    rvc_timeout_sec: float = Field(default=180.0, gt=0)
-    rvc_concurrency: int = Field(default=1, ge=1, le=8)
-    rvc_model_path: str | None = None
-    rvc_index_path: str | None = None
-    rvc_device: str = "cuda:0"
-    rvc_f0_up_key: int = 0
-    rvc_f0_method: str = "rmvpe"
-    rvc_index_rate: float = Field(default=0.45, ge=0.0, le=1.0)
-    rvc_filter_radius: int = Field(default=3, ge=0)
-    rvc_resample_sr: int = Field(default=48_000, ge=0)
-    rvc_rms_mix_rate: float = Field(default=0.25, ge=0.0, le=1.0)
-    rvc_protect: float = Field(default=0.33, ge=0.0, le=0.5)
-    rvc_failure_policy: Literal["retry_then_error", "error"] = "retry_then_error"
-    rvc_allow_pre_rvc_fallback: bool = False
-    rvc_duration_tolerance: float | None = Field(default=None, gt=0, lt=1)
-    rvc_auto_profiles: list[RVCProfile] = Field(default_factory=default_rvc_profiles)
-    rvc_speaker_models: dict[str, RVCSpeakerConfig] = Field(default_factory=dict)
+
+
+class SafetyConfig(StrictBaseModel):
+    hf_local_files_only: bool = True
+
+
+class ProjectConfig(StrictBaseModel):
+    project_name: str = "asmr-dub-project"
+    source_language: SourceLanguage = "ja"
+    target_language: TargetLanguage = "ko"
+    candidate_count: int = Field(default=1, ge=1, le=8)
+    base_seed: int = 12345
+    asr: ASRConfig = Field(default_factory=ASRConfig)
+    gemma: GemmaConfig = Field(default_factory=GemmaConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
+    gsv: GSVConfig = Field(default_factory=GSVConfig)
+    rvc: RVCConfig = Field(default_factory=RVCConfig)
+    mix: MixConfig = Field(default_factory=MixConfig)
+    voice_bank: VoiceBankConfig = Field(default_factory=VoiceBankConfig)
+    safety: SafetyConfig = Field(default_factory=SafetyConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_flat_config_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        for flat_key, path in _PROJECT_CONFIG_FLAT_ALIASES.items():
+            if flat_key in data:
+                _assign_nested_config_value(data, path, data.pop(flat_key))
+        return data
 
     @field_validator("source_language", "target_language", mode="before")
     @classmethod
@@ -721,26 +591,406 @@ class ProjectConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_duration_contracts(self) -> ProjectConfig:
-        if self.gsv_ref_max_sec <= self.gsv_ref_min_sec:
+        if self.gsv.ref_max_sec <= self.gsv.ref_min_sec:
             raise ValueError("gsv_ref_max_sec must be greater than gsv_ref_min_sec")
-        if self.gsv_tts_max_speed_factor < self.gsv_tts_min_speed_factor:
+        if self.gsv.tts_max_speed_factor < self.gsv.tts_min_speed_factor:
             raise ValueError("gsv_tts_max_speed_factor must be >= gsv_tts_min_speed_factor")
-        if self.rvc_required and not self.rvc_auto_profiles:
+        if self.rvc.required and not self.rvc.auto_profiles:
             raise ValueError("rvc_auto_profiles must contain at least one profile when RVC is required")
-        if self.rvc_required and not self.rvc_train_required and not self.rvc_speaker_models:
+        if self.rvc.required and not self.rvc.train_required and not self.rvc.speaker_models:
             raise ValueError(
                 "rvc_train_required must be true when RVC is required unless rvc_speaker_models are configured"
             )
-        profile_names = [profile.name for profile in self.rvc_auto_profiles]
+        profile_names = [profile.name for profile in self.rvc.auto_profiles]
         if len(profile_names) != len(set(profile_names)):
             raise ValueError("rvc_auto_profiles names must be unique")
         if (
-            self.diarization_min_speakers is not None
-            and self.diarization_max_speakers is not None
-            and self.diarization_min_speakers > self.diarization_max_speakers
+            self.voice_bank.diarization_min_speakers is not None
+            and self.voice_bank.diarization_max_speakers is not None
+            and self.voice_bank.diarization_min_speakers > self.voice_bank.diarization_max_speakers
         ):
             raise ValueError("diarization_min_speakers must be <= diarization_max_speakers")
         return self
+
+    def __getattr__(self, item: str) -> Any:
+        if item in _PROJECT_CONFIG_FLAT_ALIASES:
+            return _get_nested_config_value(self, _PROJECT_CONFIG_FLAT_ALIASES[item])
+        return super().__getattr__(item)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        aliases = globals().get("_PROJECT_CONFIG_FLAT_ALIASES", {})
+        if name in aliases:
+            _set_nested_config_value(self, aliases[name], value)
+            return
+        super().__setattr__(name, value)
+
+
+FlatConfigPath = tuple[str, ...]
+
+
+def _mapping_from_config_value(value: Any, path: FlatConfigPath) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return dict(value)
+    joined = ".".join(path)
+    raise ValueError(f"Project config section must be a mapping before assigning {joined}")
+
+
+def _assign_nested_config_value(data: dict[str, Any], path: FlatConfigPath, value: Any) -> None:
+    cursor = data
+    for index, part in enumerate(path[:-1]):
+        existing = cursor.get(part)
+        if existing is None and tuple(path[: index + 1]) == ("asr", "correction_profile"):
+            existing = default_asr_correction_profile().model_dump(mode="json")
+        section = _mapping_from_config_value(existing, path[: index + 1])
+        cursor[part] = section
+        cursor = section
+    cursor[path[-1]] = value
+
+
+def _get_nested_config_value(config: ProjectConfig, path: FlatConfigPath) -> Any:
+    value: Any = config
+    for part in path:
+        value = getattr(value, part)
+    return value
+
+
+def _set_nested_config_value(config: ProjectConfig, path: FlatConfigPath, value: Any) -> None:
+    target: Any = config
+    for part in path[:-1]:
+        target = getattr(target, part)
+    setattr(target, path[-1], value)
+
+
+_ASR_DIRECT_FLAT_FIELDS = [
+    "backend",
+    "preset",
+    "model_id",
+    "language",
+    "local_files_only",
+    "device",
+    "compute_type",
+    "batched_inference",
+    "batch_size",
+    "beam_size",
+    "best_of",
+    "condition_on_previous_text",
+    "vad_filter",
+    "vad_parameters",
+    "word_timestamps",
+    "hallucination_silence_threshold",
+    "initial_prompt",
+    "diagnostics_enabled",
+    "input_min_rms_dbfs",
+    "input_min_peak_dbfs",
+    "input_duration_tolerance",
+    "resegment_from_chunks",
+    "resegment_min_sec",
+    "resegment_max_sec",
+    "resegment_merge_gap_sec",
+    "sparse_chunk_max_sec",
+    "sparse_chunk_min_chars_per_sec",
+    "repair_enabled",
+    "repair_confidence_threshold",
+    "repair_sparse_min_sec",
+    "repair_sparse_min_chars_per_sec",
+    "repair_padding_sec",
+    "repair_max_chunks",
+    "qwen_repair_fallback_enabled",
+    "review_enabled",
+    "review_backend",
+    "review_batch_size",
+    "review_max_chunks",
+    "review_context_radius",
+    "review_confidence_threshold",
+    "review_generate_candidates",
+    "review_candidate_padding_sec",
+    "review_audio_padding_sec",
+    "review_initial_prompt",
+    "translation_backcheck_enabled",
+    "translation_backcheck_mark_manual_review",
+    "correction_profile_path",
+]
+_QWEN_ASR_FLAT_FIELDS = [
+    "model_id",
+    "forced_aligner_model_id",
+    "device_map",
+    "dtype",
+    "return_timestamps",
+    "context",
+    "max_inference_batch_size",
+    "max_new_tokens",
+]
+_GEMMA_SIMPLE_FLAT_FIELDS = ["model_id", "http_url", "http_send_audio"]
+_GEMMA_LLAMA_CPP_FLAT_FIELDS = [
+    "cli_path",
+    "model_path",
+    "mmproj_path",
+    "timeout_sec",
+    "ctx_size",
+    "n_predict",
+    "gpu_layers",
+    "temperature",
+    "seed",
+    "extra_args",
+]
+_GEMMA_TEXT_FLAT_FIELDS = [
+    "server_url",
+    "server_auto_start",
+    "server_command",
+    "batch_size",
+    "span_size",
+    "span_max_sec",
+    "span_max_gap_sec",
+    "context_radius",
+    "two_pass",
+    "concurrency",
+    "n_predict",
+    "timeout_sec",
+    "retries",
+    "server_startup_timeout_sec",
+    "server_shutdown_timeout_sec",
+]
+_GSV_FLAT_FIELDS = [
+    "url",
+    "gpt_weights_path",
+    "sovits_weights_path",
+    "gpt_weights_policy",
+    "sovits_weights_policy",
+    "speaker_models",
+    "timeout_sec",
+    "retries",
+    "concurrency",
+    "auto_start",
+    "server_command",
+    "server_cwd",
+    "server_startup_timeout_sec",
+    "server_shutdown_timeout_sec",
+    "trim_edge_silence",
+    "trim_silence_threshold_db",
+    "trim_silence_keep_sec",
+    "few_shot_enabled",
+    "few_shot_target_sec",
+    "few_shot_min_clip_sec",
+    "few_shot_max_clip_sec",
+    "few_shot_min_quality_score",
+    "ref_min_sec",
+    "ref_max_sec",
+    "ref_min_quality_score",
+    "ko_text_min_hangul_ratio",
+    "top_k",
+    "top_p",
+    "temperature",
+    "text_split_method",
+    "parallel_infer",
+    "repetition_penalty",
+    "sample_steps",
+    "super_sampling",
+    "overlap_length",
+    "min_chunk_length",
+    "fragment_interval",
+    "tts_min_speed_factor",
+    "tts_max_speed_factor",
+    "few_shot_force",
+    "few_shot_version",
+]
+_RVC_FLAT_FIELDS = [
+    "required",
+    "backend",
+    "train_required",
+    "train_backend",
+    "train_command",
+    "train_working_dir",
+    "train_timeout_sec",
+    "train_experiment_name",
+    "train_sample_rate",
+    "train_batch_size",
+    "train_preprocess_processes",
+    "train_f0_workers",
+    "train_feature_workers",
+    "train_save_every_epoch",
+    "train_reuse_intermediate_cache",
+    "train_output_model_path",
+    "train_output_index_path",
+    "command",
+    "batch_infer",
+    "batch_command",
+    "batch_size",
+    "batch_concurrency",
+    "working_dir",
+    "timeout_sec",
+    "concurrency",
+    "model_path",
+    "index_path",
+    "device",
+    "f0_up_key",
+    "f0_method",
+    "index_rate",
+    "filter_radius",
+    "resample_sr",
+    "rms_mix_rate",
+    "protect",
+    "failure_policy",
+    "allow_pre_rvc_fallback",
+    "duration_tolerance",
+    "auto_profiles",
+    "speaker_models",
+]
+_MIX_FLAT_FIELDS = [
+    "profile",
+    "background_bed",
+    "dialogue_gain_db",
+    "dialogue_fade_ms",
+    "loudness_strategy",
+    "peak_limit_dbfs",
+    "allow_korean_timing_draft",
+]
+_BACKGROUND_FLAT_FIELDS = [
+    "gain_db",
+    "speech_suppression",
+    "speech_suppression_db",
+    "speech_suppression_pad_sec",
+    "speech_suppression_fade_ms",
+]
+_VOICE_BANK_DIARIZATION_FLAT_FIELDS = [
+    "model_id",
+    "embedding_model_id",
+    "auto_download",
+    "min_speakers",
+    "max_speakers",
+    "embedding_match_threshold",
+]
+_QWEN_TTS_FLAT_FIELDS = [
+    "model_id",
+    "candidate_count",
+    "device_map",
+    "dtype",
+    "attn_implementation",
+    "local_files_only",
+    "candidate_batch_size",
+    "segment_batch_size",
+    "target_vram_gb",
+    "temperature",
+    "top_p",
+    "max_new_tokens",
+    "x_vector_only_mode",
+]
+_FISH_TTS_FLAT_FIELDS = [
+    "repo_dir",
+    "base_url",
+    "candidate_count",
+    "timeout_sec",
+    "chunk_length",
+    "temperature",
+    "top_p",
+    "repetition_penalty",
+    "max_new_tokens",
+    "normalize",
+    "latency",
+]
+_COSYVOICE_FLAT_FIELDS = [
+    "repo_dir",
+    "model_dir",
+    "base_url",
+    "candidate_count",
+    "timeout_sec",
+    "mode",
+    "sample_rate",
+    "instruct_text",
+]
+
+_PROJECT_CONFIG_FLAT_ALIASES: dict[str, FlatConfigPath] = {
+    "mix_sample_rate": ("mix", "sample_rate"),
+    "gemma_sample_rate": ("gemma", "sample_rate"),
+    "default_gemma_backend": ("gemma", "default_backend"),
+    "hf_local_files_only": ("safety", "hf_local_files_only"),
+    "duration_tolerance": ("mix", "duration_tolerance"),
+    "voice_bank_path": ("voice_bank", "path"),
+    "speaker_assignment_backend": ("voice_bank", "speaker_assignment_backend"),
+    "source_separation_backend": ("asr", "source_separation_backend"),
+    "source_separation_model": ("asr", "source_separation_model"),
+    "source_separation_device": ("asr", "source_separation_device"),
+    "segmentation_min_segment_sec": ("asr", "segmentation_min_segment_sec"),
+    "segmentation_max_segment_sec": ("asr", "segmentation_max_segment_sec"),
+    "segmentation_silence_db": ("asr", "segmentation_silence_db"),
+    "segmentation_min_silence_sec": ("asr", "segmentation_min_silence_sec"),
+    "asr_hotwords": ("asr", "correction_profile", "hotwords"),
+    "asr_repair_suspicious_text_patterns": (
+        "asr",
+        "correction_profile",
+        "repair_suspicious_text_patterns",
+    ),
+    "asr_text_replacements": ("asr", "correction_profile", "text_replacements"),
+    "asr_review_suspicious_text_patterns": (
+        "asr",
+        "correction_profile",
+        "review_suspicious_text_patterns",
+    ),
+    "asr_review_candidate_replacements": (
+        "asr",
+        "correction_profile",
+        "review_candidate_replacements",
+    ),
+    "asr_translation_backcheck_source_patterns": (
+        "asr",
+        "correction_profile",
+        "translation_backcheck_source_patterns",
+    ),
+    "asr_translation_backcheck_ko_patterns": (
+        "asr",
+        "correction_profile",
+        "translation_backcheck_ko_patterns",
+    ),
+}
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"asr_{field}": ("asr", field) for field in _ASR_DIRECT_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"qwen_asr_{field}": ("asr", f"qwen_{field}") for field in _QWEN_ASR_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"gemma_{field}": ("gemma", field) for field in _GEMMA_SIMPLE_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {
+        f"gemma_llama_cpp_{field}": ("gemma", f"llama_cpp_{field}")
+        for field in _GEMMA_LLAMA_CPP_FLAT_FIELDS
+    }
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"gemma_text_{field}": ("gemma", f"text_{field}") for field in _GEMMA_TEXT_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"gsv_{field}": ("gsv", field) for field in _GSV_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"rvc_{field}": ("rvc", field) for field in _RVC_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"mix_{field}": ("mix", field) for field in _MIX_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"background_{field}": ("mix", f"background_{field}") for field in _BACKGROUND_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {
+        f"diarization_{field}": ("voice_bank", f"diarization_{field}")
+        for field in _VOICE_BANK_DIARIZATION_FLAT_FIELDS
+    }
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"qwen_tts_{field}": ("tts", f"qwen_{field}") for field in _QWEN_TTS_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"fish_tts_{field}": ("tts", f"fish_{field}") for field in _FISH_TTS_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"cosyvoice_{field}": ("tts", f"cosyvoice_{field}") for field in _COSYVOICE_FLAT_FIELDS}
+)
+
 
 
 class RightsAudit(StrictBaseModel):

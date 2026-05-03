@@ -13,9 +13,11 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
     _load_config_into_manifest(project_dir, manifest)
     cfg = manifest.project_config
     if asr_review is not None:
-        cfg = type(cfg).model_validate(
+        next_cfg = type(cfg).model_validate(
             {**cfg.model_dump(mode="json"), "asr_review_enabled": asr_review}
         )
+        next_cfg.asr.correction_profile = cfg.asr.correction_profile
+        cfg = next_cfg
         manifest.project_config = cfg
     cfg = _effective_asr_config(
         cfg,
@@ -40,9 +42,11 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         _load_config_into_manifest(project_dir, manifest)
         cfg = manifest.project_config
         if asr_review is not None:
-            cfg = type(cfg).model_validate(
+            next_cfg = type(cfg).model_validate(
                 {**cfg.model_dump(mode="json"), "asr_review_enabled": asr_review}
             )
+            next_cfg.asr.correction_profile = cfg.asr.correction_profile
+            cfg = next_cfg
             manifest.project_config = cfg
         cfg = _effective_asr_config(
             cfg,

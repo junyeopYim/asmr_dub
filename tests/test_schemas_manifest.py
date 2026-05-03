@@ -114,9 +114,9 @@ def test_manifest_rejects_legacy_asr_text_review_project_config(tmp_project_dir)
     project_config["asr_text_review_enabled"] = True
     project_config["asr_text_review_backend"] = "llama_server"
     project_config["asr_text_review_max_chunks"] = 11
-    project_config.pop("asr_review_enabled")
-    project_config.pop("asr_review_backend")
-    project_config.pop("asr_review_max_chunks")
+    project_config["asr"].pop("review_enabled")
+    project_config["asr"].pop("review_backend")
+    project_config["asr"].pop("review_max_chunks")
     manifest_path = tmp_project_dir / "work" / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", "utf-8")

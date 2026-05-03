@@ -1,98 +1,277 @@
-background_gain_db: -18.0
+asr:
+  backend: faster_whisper
+  batch_size: 8
+  batched_inference: false
+  beam_size: 5
+  best_of: 5
+  compute_type: default
+  condition_on_previous_text: false
+  correction_profile_path: builtin:asmr_ja
+  device: auto
+  diagnostics_enabled: true
+  hallucination_silence_threshold: null
+  initial_prompt: ''
+  input_duration_tolerance: 0.08
+  input_min_peak_dbfs: -65.0
+  input_min_rms_dbfs: -75.0
+  language: ja
+  local_files_only: true
+  model_id: Systran/faster-whisper-large-v3
+  preset: default
+  qwen_context: ''
+  qwen_device_map: cuda:0
+  qwen_dtype: bfloat16
+  qwen_forced_aligner_model_id: Qwen/Qwen3-ForcedAligner-0.6B
+  qwen_max_inference_batch_size: 8
+  qwen_max_new_tokens: 4096
+  qwen_model_id: Qwen/Qwen3-ASR-1.7B
+  qwen_repair_fallback_enabled: false
+  qwen_return_timestamps: true
+  repair_confidence_threshold: 0.94
+  repair_enabled: true
+  repair_max_chunks: 160
+  repair_padding_sec: 1.0
+  repair_sparse_min_chars_per_sec: 1.0
+  repair_sparse_min_sec: 12.0
+  resegment_from_chunks: true
+  resegment_max_sec: 20.0
+  resegment_merge_gap_sec: 1.0
+  resegment_min_sec: 3.0
+  review_audio_padding_sec: 0.4
+  review_backend: llama_server_audio
+  review_batch_size: 8
+  review_candidate_padding_sec:
+  - 0.4
+  - 1.2
+  review_confidence_threshold: 0.78
+  review_context_radius: 2
+  review_enabled: false
+  review_generate_candidates: true
+  review_initial_prompt: ''
+  review_max_chunks: 160
+  segmentation_max_segment_sec: 20.0
+  segmentation_min_segment_sec: 0.25
+  segmentation_min_silence_sec: 0.3
+  segmentation_silence_db: -45.0
+  source_separation_backend: demucs
+  source_separation_device: null
+  source_separation_model: htdemucs
+  sparse_chunk_max_sec: 30.0
+  sparse_chunk_min_chars_per_sec: 0.5
+  translation_backcheck_enabled: true
+  translation_backcheck_mark_manual_review: false
+  vad_filter: true
+  vad_parameters:
+    min_silence_duration_ms: 300
+    speech_pad_ms: 200
+  word_timestamps: false
 base_seed: 12345
 candidate_count: 1
-asr_backend: faster_whisper
-asr_preset: default
-asr_language: ja
-asr_local_files_only: true
-asr_model_id: Systran/faster-whisper-large-v3
-asr_device: auto
-asr_compute_type: default
-asr_batched_inference: false
-asr_batch_size: 8
-asr_diagnostics_enabled: true
-asr_qwen_repair_fallback_enabled: false
-asr_vad_filter: true
-asr_vad_parameters:
-  min_silence_duration_ms: 300
-  speech_pad_ms: 200
-asr_resegment_from_chunks: true
-asr_resegment_merge_gap_sec: 0.6
-asr_resegment_min_sec: 1.0
-source_separation_backend: demucs
-source_separation_model: htdemucs
-source_separation_device: null
-qwen_asr_context: ""
-qwen_asr_device_map: cuda:0
-qwen_asr_dtype: bfloat16
-qwen_asr_forced_aligner_model_id: Qwen/Qwen3-ForcedAligner-0.6B
-qwen_asr_max_inference_batch_size: 8
-qwen_asr_max_new_tokens: 4096
-qwen_asr_model_id: Qwen/Qwen3-ASR-1.7B
-qwen_asr_return_timestamps: true
-qwen_tts_candidate_batch_size: 4
-qwen_tts_max_new_tokens: 2048
-qwen_tts_segment_batch_size: 8
-qwen_tts_target_vram_gb: 14.0
-fish_tts_repo_dir: .cache/tts_backends/fish-speech
-fish_tts_base_url: http://127.0.0.1:8080
-fish_tts_candidate_count: 2
-fish_tts_max_new_tokens: 1024
-cosyvoice_repo_dir: .cache/tts_backends/CosyVoice
-cosyvoice_model_dir: .cache/tts_backends/CosyVoice/pretrained_models/CosyVoice2-0.5B
-cosyvoice_base_url: http://127.0.0.1:50000
-cosyvoice_candidate_count: 2
-cosyvoice_mode: zero_shot
-default_gemma_backend: mock
-duration_tolerance: 0.2
-gemma_http_send_audio: false
-gemma_http_url: null
-gemma_llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli
-gemma_llama_cpp_ctx_size: 4096
-gemma_llama_cpp_extra_args: []
-gemma_llama_cpp_gpu_layers: 999
-gemma_llama_cpp_mmproj_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf
-gemma_llama_cpp_model_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-Q8_0.gguf
-gemma_llama_cpp_n_predict: 1024
-gemma_llama_cpp_seed: 12345
-gemma_llama_cpp_temperature: 0.0
-gemma_llama_cpp_timeout_sec: 600.0
-gemma_model_id: google/gemma-4-E4B-it
-gemma_sample_rate: 16000
-gemma_text_batch_size: 12
-gemma_text_context_radius: 4
-gemma_text_n_predict: 2048
-gemma_text_retries: 1
-gemma_text_span_max_gap_sec: 1.2
-gemma_text_span_max_sec: 18.0
-gemma_text_span_size: 4
-gemma_text_server_auto_start: true
-gemma_text_server_command: []
-gemma_text_server_shutdown_timeout_sec: 10.0
-gemma_text_server_startup_timeout_sec: 120.0
-gemma_text_server_url: http://127.0.0.1:8080
-gemma_text_timeout_sec: 180.0
-gemma_text_two_pass: true
-gsv_retries: 2
-gsv_auto_start: false
-gsv_server_command: []
-gsv_server_cwd: null
-gsv_server_shutdown_timeout_sec: 10.0
-gsv_server_startup_timeout_sec: 120.0
-gsv_timeout_sec: 120.0
-gsv_url: http://127.0.0.1:9880
-gsv_tts_min_speed_factor: 0.85
-gsv_tts_max_speed_factor: 1.12
-hf_local_files_only: true
-mix_background_bed: preserve_original
-mix_dialogue_fade_ms: null
-mix_dialogue_gain_db: 0.0
-mix_loudness_strategy: peak_guard_only
-mix_peak_limit_dbfs: -1.0
-mix_profile: asmr_stereo
-mix_sample_rate: 48000
+gemma:
+  default_backend: mock
+  http_send_audio: false
+  http_url: null
+  llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli
+  llama_cpp_ctx_size: 4096
+  llama_cpp_extra_args: []
+  llama_cpp_gpu_layers: 999
+  llama_cpp_mmproj_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf
+  llama_cpp_model_path: /home/junyeop/projects/ASMR/.cache/llama_cpp/models/mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF/gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf
+  llama_cpp_n_predict: 1024
+  llama_cpp_seed: 12345
+  llama_cpp_temperature: 0.0
+  llama_cpp_timeout_sec: 600.0
+  model_id: google/gemma-4-E4B-it
+  sample_rate: 16000
+  text_batch_size: 12
+  text_concurrency: 4
+  text_context_radius: 4
+  text_n_predict: 2048
+  text_retries: 1
+  text_server_auto_start: true
+  text_server_command: []
+  text_server_shutdown_timeout_sec: 10.0
+  text_server_startup_timeout_sec: 120.0
+  text_server_url: http://127.0.0.1:8080
+  text_span_max_gap_sec: 1.2
+  text_span_max_sec: 18.0
+  text_span_size: 4
+  text_timeout_sec: 180.0
+  text_two_pass: true
+gsv:
+  auto_start: false
+  concurrency: 3
+  few_shot_enabled: true
+  few_shot_force: false
+  few_shot_max_clip_sec: 10.0
+  few_shot_min_clip_sec: 1.0
+  few_shot_min_quality_score: 0.2
+  few_shot_target_sec: 60.0
+  few_shot_version: auto
+  fragment_interval: 0.3
+  gpt_weights_path: null
+  gpt_weights_policy: auto
+  ko_text_min_hangul_ratio: 0.2
+  min_chunk_length: 16
+  overlap_length: 2
+  parallel_infer: true
+  ref_max_sec: 10.0
+  ref_min_quality_score: 0.25
+  ref_min_sec: 3.0
+  repetition_penalty: 1.35
+  retries: 2
+  sample_steps: 32
+  server_command: []
+  server_cwd: null
+  server_shutdown_timeout_sec: 10.0
+  server_startup_timeout_sec: 120.0
+  sovits_weights_path: null
+  sovits_weights_policy: auto
+  speaker_models: {}
+  super_sampling: false
+  temperature: 1.0
+  text_split_method: cut5
+  timeout_sec: 120.0
+  top_k: 15
+  top_p: 1.0
+  trim_edge_silence: true
+  trim_silence_keep_sec: 0.08
+  trim_silence_threshold_db: -50.0
+  tts_max_speed_factor: 1.12
+  tts_min_speed_factor: 0.85
+  url: http://127.0.0.1:9880
+mix:
+  allow_korean_timing_draft: false
+  background_bed: preserve_original
+  background_gain_db: -18.0
+  background_speech_suppression: true
+  background_speech_suppression_db: -42.0
+  background_speech_suppression_fade_ms: 30.0
+  background_speech_suppression_pad_sec: 0.06
+  dialogue_fade_ms: null
+  dialogue_gain_db: 0.0
+  duration_tolerance: 0.2
+  loudness_strategy: peak_guard_only
+  peak_limit_dbfs: -1.0
+  profile: asmr_stereo
+  sample_rate: 48000
 project_name: asmr-dub-project
-segmentation_max_segment_sec: 20.0
-segmentation_min_segment_sec: 0.25
-segmentation_min_silence_sec: 0.3
-segmentation_silence_db: -45.0
+rvc:
+  allow_pre_rvc_fallback: false
+  auto_profiles:
+  - f0_method: rmvpe
+    f0_up_key: 0
+    filter_radius: 3
+    index_rate: 0.45
+    name: rmvpe_index045
+    protect: 0.33
+    resample_sr: 48000
+    rms_mix_rate: 0.25
+  - f0_method: rmvpe
+    f0_up_key: 0
+    filter_radius: 3
+    index_rate: 0.35
+    name: rmvpe_index035_safer
+    protect: 0.33
+    resample_sr: 48000
+    rms_mix_rate: 0.2
+  - f0_method: rmvpe
+    f0_up_key: 0
+    filter_radius: 3
+    index_rate: 0.55
+    name: rmvpe_index055_stronger_timbre
+    protect: 0.33
+    resample_sr: 48000
+    rms_mix_rate: 0.25
+  - f0_method: crepe
+    f0_up_key: 0
+    filter_radius: 3
+    index_rate: 0.45
+    name: crepe_index045_whisper_candidate
+    protect: 0.33
+    resample_sr: 48000
+    rms_mix_rate: 0.2
+  backend: command
+  batch_command: []
+  batch_concurrency: 1
+  batch_infer: true
+  batch_size: 200
+  command: []
+  concurrency: 1
+  device: cuda:0
+  duration_tolerance: null
+  f0_method: rmvpe
+  f0_up_key: 0
+  failure_policy: retry_then_error
+  filter_radius: 3
+  index_path: null
+  index_rate: 0.45
+  model_path: null
+  protect: 0.33
+  required: true
+  resample_sr: 48000
+  rms_mix_rate: 0.25
+  speaker_models: {}
+  timeout_sec: 180.0
+  train_backend: command
+  train_batch_size: 0
+  train_command: []
+  train_experiment_name: asmr-rvc-speaker-1
+  train_f0_workers: 0
+  train_feature_workers: 0
+  train_output_index_path: null
+  train_output_model_path: null
+  train_preprocess_processes: 0
+  train_required: true
+  train_reuse_intermediate_cache: true
+  train_sample_rate: 48000
+  train_save_every_epoch: 50
+  train_timeout_sec: 14400.0
+  train_working_dir: null
+  working_dir: null
+safety:
+  hf_local_files_only: true
+source_language: ja
+target_language: ko
+tts:
+  cosyvoice_base_url: http://127.0.0.1:50000
+  cosyvoice_candidate_count: 2
+  cosyvoice_instruct_text: ''
+  cosyvoice_mode: zero_shot
+  cosyvoice_model_dir: .cache/tts_backends/CosyVoice/pretrained_models/CosyVoice2-0.5B
+  cosyvoice_repo_dir: .cache/tts_backends/CosyVoice
+  cosyvoice_sample_rate: 22050
+  cosyvoice_timeout_sec: 240.0
+  fish_base_url: http://127.0.0.1:8080
+  fish_candidate_count: 2
+  fish_chunk_length: 200
+  fish_latency: normal
+  fish_max_new_tokens: 1024
+  fish_normalize: true
+  fish_repetition_penalty: 1.1
+  fish_repo_dir: .cache/tts_backends/fish-speech
+  fish_temperature: 0.8
+  fish_timeout_sec: 240.0
+  fish_top_p: 0.8
+  qwen_attn_implementation: flash_attention_2
+  qwen_candidate_batch_size: 4
+  qwen_candidate_count: 4
+  qwen_device_map: cuda:0
+  qwen_dtype: bfloat16
+  qwen_local_files_only: true
+  qwen_max_new_tokens: 2048
+  qwen_model_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+  qwen_segment_batch_size: 8
+  qwen_target_vram_gb: 14.0
+  qwen_temperature: 0.65
+  qwen_top_p: 0.85
+  qwen_x_vector_only_mode: false
+voice_bank:
+  diarization_auto_download: true
+  diarization_embedding_match_threshold: 0.78
+  diarization_embedding_model_id: pyannote/wespeaker-voxceleb-resnet34-LM
+  diarization_max_speakers: null
+  diarization_min_speakers: null
+  diarization_model_id: pyannote/speaker-diarization-community-1
+  path: voice_bank/voice_bank_manifest.json
+  speaker_assignment_backend: none
