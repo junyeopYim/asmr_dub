@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from inspect import signature
@@ -44,7 +45,12 @@ from asmr_dub_pipeline.audio.mixing import (
     build_source_suppressed_background,
     mix_with_background,
 )
-from asmr_dub_pipeline.audio.preprocess import extract_project_audio, probe_with_fallback
+from asmr_dub_pipeline.audio.preprocess import (
+    extract_project_audio,
+    merge_numbered_parts_to_audio,
+    plan_numbered_part_merge,
+    probe_with_fallback,
+)
 from asmr_dub_pipeline.audio.quality import AudioQualityMetrics, measure_source_voice_quality
 from asmr_dub_pipeline.audio.segmentation import (
     energy_segments,
@@ -134,6 +140,7 @@ from asmr_dub_pipeline.schemas import (
     JapaneseScript,
     PipelineManifest,
     ProjectConfig,
+    RightsAudit,
     RVCMetadata,
     RVCProfile,
     Segment,
@@ -165,8 +172,14 @@ GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
 )
 LEGACY_DETERMINISTIC_NUMERIC_TRANSLATION_NOTE = "deterministic_numeric_source"
 NUMERIC_COUNTING_POSTPROCESS_NOTE = "numeric_counting_postprocess"
+KOREAN_DIGIT_PRONUNCIATION_POSTPROCESS_NOTE = "korean_digit_pronunciation_postprocess"
 NUMERIC_ONLY_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 NUMERIC_TOKEN_RE = re.compile(r"\d+")
+RAW_DIGIT_RE = re.compile(r"(?<![A-Za-z_])\d+(?![A-Za-z_])")
+KOREAN_TRANSLATION_KANA_RE = re.compile(r"[\u3040-\u30ffー]")
+KOREAN_TRANSLATION_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+KOREAN_TRANSLATION_LATIN_RE = re.compile(r"[A-Za-z]")
+SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS = ("변비약", "비약", "체감")
 KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES = {"duration_ratio_out_of_range", "too_much_silence"}
 PROGRESS_LOG_SECONDS = 30.0
 JAPANESE_TTS_LANGUAGES = {"ja", "jp", "jpn", "japanese"}
@@ -1916,6 +1929,104 @@ def _apply_korean_colloquial_postprocess(segments: list[Segment]) -> int:
     return rewritten_count
 
 
+def _sino_korean_number(value: int) -> str:
+    if value == 0:
+        return "영"
+    digits = ["", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"]
+    units = [(10000, "만"), (1000, "천"), (100, "백"), (10, "십")]
+    remaining = value
+    parts: list[str] = []
+    for unit_value, unit_text in units:
+        count, remaining = divmod(remaining, unit_value)
+        if count == 0:
+            continue
+        prefix = "" if count == 1 and unit_value < 10000 else _sino_korean_number(count)
+        parts.append(prefix + unit_text)
+    if remaining:
+        parts.append(digits[remaining])
+    return "".join(parts)
+
+
+def _spell_korean_numbers_for_tts(text: str) -> str:
+    def replace_match(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if len(token) > 5:
+            return " ".join(_sino_korean_number(int(char)) for char in token)
+        return _sino_korean_number(int(token))
+
+    rewritten = RAW_DIGIT_RE.sub(replace_match, text)
+    rewritten = rewritten.replace("%", "퍼센트")
+    rewritten = re.sub(r"\s+", " ", rewritten)
+    rewritten = re.sub(r"\s+([,.!?…])", r"\1", rewritten)
+    return rewritten.strip()
+
+
+def _translation_has_raw_digit(translation: Any) -> bool:
+    return bool(
+        translation
+        and (
+            RAW_DIGIT_RE.search(str(getattr(translation, "ko_natural", "")))
+            or RAW_DIGIT_RE.search(str(getattr(translation, "ko_literal", "")))
+        )
+    )
+
+
+def _strip_translation_test_placeholders(text: str) -> str:
+    return re.sub(r"(?:seg|batch)_\d+", "", text)
+
+
+def _source_suggests_numeric_translation_repair(segment: Segment) -> bool:
+    source = _strip_translation_test_placeholders(_translation_source_text(segment))
+    return bool(
+        NUMERIC_TOKEN_RE.search(source)
+        or "%" in source
+        or "％" in source
+        or "レベル" in source
+        or "数え" in source
+    )
+
+
+def _apply_korean_digit_pronunciation_postprocess(
+    segments: list[Segment],
+    diagnostics: list[dict[str, Any]],
+    quality_counters: Counter[str],
+) -> int:
+    rewritten_count = 0
+    for segment in segments:
+        translation = segment.translation_ko
+        if (
+            translation is None
+            or not _source_suggests_numeric_translation_repair(segment)
+            or not _translation_has_raw_digit(translation)
+        ):
+            continue
+        before = translation.model_dump(mode="json")
+        notes = list(translation.notes)
+        if KOREAN_DIGIT_PRONUNCIATION_POSTPROCESS_NOTE not in notes:
+            notes.append(KOREAN_DIGIT_PRONUNCIATION_POSTPROCESS_NOTE)
+        repaired = translation.model_copy(
+            update={
+                "ko_literal": _spell_korean_numbers_for_tts(translation.ko_literal),
+                "ko_natural": _spell_korean_numbers_for_tts(translation.ko_natural),
+                "notes": notes,
+            }
+        )
+        segment.translation_ko = repaired
+        quality_counters["raw_digit"] += 1
+        diagnostics.append(
+            {
+                "segment_id": segment.id,
+                "source_text": _translation_source_text(segment),
+                "repair_reasons": ["raw_digit"],
+                "before": before,
+                "after": repaired.model_dump(mode="json"),
+                "accepted": not _translation_has_raw_digit(repaired),
+            }
+        )
+        rewritten_count += 1
+    return rewritten_count
+
+
 def _native_korean_count_number(value: int) -> str | None:
     if value in NATIVE_KOREAN_COUNT_ONES:
         return NATIVE_KOREAN_COUNT_ONES[value]
@@ -2021,6 +2132,124 @@ def _apply_korean_numeric_counting_postprocess(segments: list[Segment]) -> int:
     return rewritten_count
 
 
+def _translation_issue_codes(segment: Segment) -> list[str]:
+    translation = segment.translation_ko
+    if translation is None:
+        return ["missing_translation"]
+    source_text = _translation_source_text(segment)
+    natural = translation.ko_natural.strip()
+    combined = " ".join(
+        text for text in [translation.ko_literal.strip(), natural] if text
+    )
+    issues: list[str] = []
+    if not natural:
+        issues.append("empty_translation")
+    if _source_suggests_numeric_translation_repair(segment) and RAW_DIGIT_RE.search(natural):
+        issues.append("raw_digit")
+    if KOREAN_TRANSLATION_KANA_RE.search(natural):
+        issues.append("japanese_kana")
+    if KOREAN_TRANSLATION_CJK_RE.search(natural):
+        issues.append("untranslated_cjk")
+    latin_check_text = _strip_translation_test_placeholders(natural)
+    if KOREAN_TRANSLATION_LATIN_RE.search(latin_check_text):
+        issues.append("latin")
+    if "媚薬" in source_text and ("변비약" in combined or "비약" in combined):
+        issues.append("domain_mistranslation")
+    if "18禁" in source_text and (
+        "열여덟까지" in combined or "쓸 수 있는" in combined or "사용할 수 있는" in combined
+    ):
+        issues.append("domain_mistranslation")
+    return list(dict.fromkeys(issues))
+
+
+def _backcheck_severity(item: dict[str, Any]) -> str:
+    hits = [str(hit) for hit in item.get("translation_hits", [])]
+    if any(hit in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS for hit in hits):
+        return "severe"
+    ko_natural = str(item.get("ko_natural") or "")
+    if any(pattern in ko_natural for pattern in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS):
+        return "severe"
+    return "warning"
+
+
+def _translation_rejection_message(reasons: list[str]) -> str:
+    return "Korean translation rejected before TTS: " + ", ".join(reasons)
+
+
+def _upsert_translation_row(
+    rows: list[dict[str, Any]],
+    segment: Segment,
+    row: dict[str, Any],
+) -> None:
+    for index, existing in enumerate(rows):
+        if str(existing.get("segment_id") or "") == segment.id:
+            rows[index] = row
+            return
+    rows.append(row)
+
+
+def _finalize_translation_acceptance(
+    rows: list[dict[str, Any]],
+    segments: list[Segment],
+    asr_backcheck_items: list[dict[str, Any]],
+    quality_counters: Counter[str],
+) -> None:
+    backcheck_by_segment_id = {str(item["segment_id"]): item for item in asr_backcheck_items}
+    rows_by_segment_id = {str(row.get("segment_id") or ""): row for row in rows}
+    for segment in segments:
+        row = rows_by_segment_id.get(segment.id)
+        if row is None:
+            continue
+        translation = segment.translation_ko
+        source_text = _translation_source_text(segment)
+        if row.get("status") != "translated":
+            continue
+        rejected_reasons: list[str] = []
+        issue_codes = _translation_issue_codes(segment)
+        for issue in issue_codes:
+            quality_counters[issue] += 1
+        rejected_reasons.extend(issue_codes)
+        backcheck = backcheck_by_segment_id.get(segment.id)
+        if backcheck is not None:
+            severity = _backcheck_severity(backcheck)
+            backcheck["severity"] = severity
+            row["asr_backcheck"] = backcheck
+            if severity == "severe":
+                quality_counters["severe_backcheck"] += 1
+                rejected_reasons.append("severe_translation_smell")
+        if segment.status in SKIP_STATUSES and not rejected_reasons:
+            rejected_reasons.append(f"segment status is {segment.status}")
+        if rejected_reasons:
+            segment.status = "needs_manual_review"
+            message = _translation_rejection_message(rejected_reasons)
+            if message not in segment.errors:
+                segment.errors.append(message)
+            row.update(
+                {
+                    "status": "needs_manual_review",
+                    "reason": "translation rejected before TTS",
+                    "source_text": source_text,
+                    "translation_ko": translation.model_dump(mode="json") if translation else None,
+                    "quality_issues": issue_codes,
+                    "accepted": False,
+                    "rejected_reasons": rejected_reasons,
+                }
+            )
+            _upsert_translation_row(rows, segment, row)
+            continue
+        row.update(
+            {
+                "status": "translated",
+                "source_text": source_text,
+                "translation_ko": translation.model_dump(mode="json") if translation else None,
+                "quality_issues": [],
+                "accepted": True,
+                "rejected_reasons": [],
+            }
+        )
+        _upsert_translation_row(rows, segment, row)
+
+
 def _refresh_translation_rows(rows: list[dict[str, Any]], segments: list[Segment]) -> None:
     by_segment_id = {segment.id: segment for segment in segments}
     for row in rows:
@@ -2033,6 +2262,9 @@ def _refresh_translation_rows(rows: list[dict[str, Any]], segments: list[Segment
         row["colloquialized"] = COLLOQUIAL_REWRITE_NOTE in segment.translation_ko.notes
         row["numeric_counting_postprocessed"] = (
             NUMERIC_COUNTING_POSTPROCESS_NOTE in segment.translation_ko.notes
+        )
+        row["digit_pronunciation_postprocessed"] = (
+            KOREAN_DIGIT_PRONUNCIATION_POSTPROCESS_NOTE in segment.translation_ko.notes
         )
 
 
@@ -2065,7 +2297,7 @@ def _translation_asr_backcheck_item(segment: Segment, cfg: Any) -> dict[str, Any
         reasons.append("source_text_contains_known_asr_risk")
     if translation_hits:
         reasons.append("korean_translation_contains_asr_smell")
-    return {
+    item = {
         "segment_id": segment.id,
         "start": round(segment.start, 3),
         "end": round(segment.end, 3),
@@ -2076,6 +2308,10 @@ def _translation_asr_backcheck_item(segment: Segment, cfg: Any) -> dict[str, Any
         "reasons": reasons,
         "recommendation": "rerun_asr_review_or_manual_review",
     }
+    item["severity"] = _backcheck_severity(item)
+    if item["severity"] == "severe":
+        item["policy_action"] = "needs_manual_review"
+    return item
 
 
 def _apply_translation_asr_backcheck(
@@ -2443,15 +2679,118 @@ def _load_config_into_manifest(project_dir: Path, manifest: PipelineManifest) ->
     manifest.project_config = load_project_config(project_dir)
 
 
-def extract_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> PipelineManifest:
-    _log_stage_start("extract", f"input={input_path}")
+def _input_part_metadata(parts: tuple[Path, ...]) -> list[dict[str, Any]]:
+    metadata: list[dict[str, Any]] = []
+    for index, part in enumerate(parts, start=1):
+        duration = None
+        try:
+            duration = ffmpeg.probe_media(part).duration_sec
+        except ffmpeg.FFmpegError:
+            duration = None
+        metadata.append(
+            {
+                "part_index": index,
+                "path": str(part),
+                "sha256": sha256_file(part),
+                "duration_sec": duration,
+            }
+        )
+    return metadata
+
+
+def _input_merge_metadata(
+    *,
+    requested_path: Path,
+    selected_path: Path,
+    parts: tuple[Path, ...],
+    status: str,
+    reason: str,
+    merged_path: Path | None,
+) -> dict[str, Any]:
+    part_metadata = _input_part_metadata(parts)
+    total_duration = sum(
+        part["duration_sec"] for part in part_metadata if isinstance(part.get("duration_sec"), (int, float))
+    )
+    return {
+        "requested": True,
+        "status": status,
+        "reason": reason,
+        "requested_path": str(requested_path),
+        "selected_input_path": str(selected_path),
+        "merged_output_path": str(merged_path) if merged_path else None,
+        "part_count": len(parts),
+        "parts": part_metadata,
+        "total_part_duration_sec": total_duration,
+    }
+
+
+def _attach_input_merge_to_audit(audit: RightsAudit, metadata: dict[str, Any] | None) -> RightsAudit:
+    if not metadata or not audit.history:
+        return audit
+    history = [*audit.history]
+    history[-1] = {**history[-1], "input_merge": metadata}
+    return audit.model_copy(update={"history": history})
+
+
+def extract_step(
+    input_path: Path,
+    project_dir: Path,
+    confirm_rights: bool,
+    merge_parts: bool = False,
+) -> PipelineManifest:
+    detail = f"input={input_path}"
+    if merge_parts:
+        detail += " merge_parts=on"
+    _log_stage_start("extract", detail)
     create_project_structure(project_dir)
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
-    audit = require_confirmed_rights(confirm_rights, "extract", input_path)
+    audit = require_confirmed_rights(
+        confirm_rights,
+        "extract",
+        input_path,
+        metadata={"merge_parts_requested": merge_parts},
+    )
+    prepared_input_path = input_path
+    input_merge_metadata: dict[str, Any] | None = None
+    if merge_parts:
+        merge_plan = plan_numbered_part_merge(input_path)
+        if merge_plan.status in {"missing_first_part", "missing_numbered_part"}:
+            raise ValueError(merge_plan.reason)
+        if merge_plan.should_merge:
+            prepared_input_path = merge_numbered_parts_to_audio(merge_plan, project_dir)
+            input_merge_metadata = _input_merge_metadata(
+                requested_path=input_path,
+                selected_path=prepared_input_path,
+                parts=merge_plan.parts,
+                status="merged",
+                reason=merge_plan.reason,
+                merged_path=prepared_input_path,
+            )
+        else:
+            warning = f"input merge skipped: {merge_plan.reason}"
+            if warning not in manifest.warnings:
+                manifest.warnings.append(warning)
+            input_merge_metadata = _input_merge_metadata(
+                requested_path=input_path,
+                selected_path=prepared_input_path,
+                parts=merge_plan.parts,
+                status="skipped",
+                reason=merge_plan.reason,
+                merged_path=None,
+            )
+    stereo, mono = extract_project_audio(prepared_input_path, project_dir)
+    manifest.source_info = probe_with_fallback(prepared_input_path)
+    if input_merge_metadata:
+        input_merge_metadata["selected_duration_sec"] = manifest.source_info.duration_sec
+        manifest.source_info.raw["input_merge"] = input_merge_metadata
+        parts_manifest_path = project_dir / "work" / "input" / "input_parts_manifest.json"
+        write_json_atomic(parts_manifest_path, input_merge_metadata)
+        manifest.artifacts["input_parts_manifest"] = str(parts_manifest_path)
+        if input_merge_metadata["status"] == "merged":
+            manifest.artifacts["merged_source_audio"] = str(prepared_input_path)
+    audit = _attach_input_merge_to_audit(audit, input_merge_metadata)
     manifest.rights_audit = merge_rights_audit(manifest.rights_audit, audit)
-    stereo, mono = extract_project_audio(input_path, project_dir)
-    manifest.source_info = probe_with_fallback(input_path)
     manifest.artifacts["original_stereo_48k"] = str(stereo)
     manifest.artifacts["gemma_mono_16k"] = str(mono)
     mark_stage(manifest, "extract", "completed")
@@ -3721,6 +4060,9 @@ def translate_ko_step(
     gemma_text_backend: str | None = None,
     confirm_rights: bool = False,
     force_retranslate: bool = False,
+    retry_failed: bool = False,
+    repair_only: bool = False,
+    force_retranslate_failed: bool = False,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
@@ -3738,16 +4080,25 @@ def translate_ko_step(
 
     jsonl_path = project_dir / "work" / "translate_ko" / "translation_bundles.jsonl"
     summary_path = project_dir / "work" / "translate_ko" / "summary.json"
+    diagnostics_path = project_dir / "work" / "translate_ko" / "diagnostics.json"
     rows: list[dict[str, Any]] = []
+    raw_translation_bundles: list[dict[str, Any]] = []
+    repaired_translation_bundles: list[dict[str, Any]] = []
+    retry_attempts: list[dict[str, Any]] = []
+    diagnostics_lock = Lock()
+    quality_counters: Counter[str] = Counter()
     translated = 0
     needs_manual_review = 0
     colloquialized = 0
+    digit_pronunciation_postprocessed = 0
     numeric_counting_postprocessed = 0
     asr_backcheck_count = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
     for segment in manifest.segments:
         translation = segment.translation_ko
+        failed_status = segment.status in SKIP_STATUSES
+        retry_this_failed = retry_failed and failed_status
         legacy_numeric_translation = bool(
             translation
             and LEGACY_DETERMINISTIC_NUMERIC_TRANSLATION_NOTE in translation.notes
@@ -3756,20 +4107,38 @@ def translate_ko_step(
             translation
             and translation.ko_natural.strip()
             and not force_retranslate
+            and not (retry_this_failed and force_retranslate_failed)
             and not legacy_numeric_translation
         ):
-            translated += 1
+            row_status = "translated" if not (failed_status and not retry_failed) else "needs_manual_review"
+            if row_status == "translated":
+                translated += 1
+            else:
+                needs_manual_review += 1
+            row = {
+                "batch_id": translation.batch_id,
+                "segment_id": segment.id,
+                "status": row_status,
+                "reason": f"segment status is {segment.status}" if row_status != "translated" else None,
+                "source_text": segment.source_script.text if segment.source_script else "",
+                "translation_ko": translation.model_dump(mode="json"),
+                "resumed": True,
+            }
+            rows.append(row)
+            if row_status == "translated":
+                raw_translation_bundles.append(json.loads(json.dumps(row, ensure_ascii=False)))
+        elif repair_only:
+            needs_manual_review += 1
             rows.append(
                 {
-                    "batch_id": translation.batch_id,
                     "segment_id": segment.id,
-                    "status": "translated",
+                    "status": "needs_manual_review",
+                    "reason": "repair_only has no existing translation",
                     "source_text": segment.source_script.text if segment.source_script else "",
-                    "translation_ko": translation.model_dump(mode="json"),
-                    "resumed": True,
+                    "translation_ko": None,
                 }
             )
-        elif segment.status in SKIP_STATUSES:
+        elif failed_status and not retry_this_failed:
             needs_manual_review += 1
             rows.append(
                 {
@@ -3781,7 +4150,7 @@ def translate_ko_step(
                 }
             )
         elif segment.source_script and segment.source_script.text.strip():
-            if force_retranslate or legacy_numeric_translation:
+            if force_retranslate or legacy_numeric_translation or (retry_this_failed and force_retranslate_failed):
                 segment.translation_ko = None
             translatable.append(segment)
         else:
@@ -3849,6 +4218,62 @@ def translate_ko_step(
     last_logged_at = started_at
     processed = translated + needs_manual_review
 
+    def record_raw_translation_row(row: dict[str, Any]) -> None:
+        if row.get("status") == "translated":
+            raw_translation_bundles.append(json.loads(json.dumps(row, ensure_ascii=False)))
+
+    def record_retry_attempt(
+        *,
+        attempt_type: str,
+        batch_id: str,
+        segments: list[Segment],
+        accepted: bool,
+        reason: str | None = None,
+        returned_segment_ids: list[str] | None = None,
+    ) -> None:
+        payload = {
+            "attempt_type": attempt_type,
+            "batch_id": batch_id,
+            "segment_ids": [segment.id for segment in segments],
+            "accepted": accepted,
+            "reason": reason,
+            "returned_segment_ids": returned_segment_ids or [],
+        }
+        with diagnostics_lock:
+            retry_attempts.append(payload)
+
+    def final_translation_diagnostics_rows() -> list[dict[str, Any]]:
+        final_rows = json.loads(json.dumps(rows, ensure_ascii=False))
+        for row in final_rows:
+            if row.get("status") == "translated":
+                row.setdefault("accepted", True)
+                row.setdefault("rejected_reasons", [])
+                continue
+            row.setdefault("accepted", False)
+            rejected_reason = str(row.get("error") or row.get("reason") or "needs_manual_review")
+            row.setdefault("rejected_reasons", [rejected_reason])
+        return final_rows
+
+    def build_diagnostics_payload(partial: bool) -> dict[str, Any]:
+        return {
+            "backend": backend_kind,
+            "model": model_name,
+            "partial": partial,
+            "segments": total,
+            "raw_translation_bundles": raw_translation_bundles,
+            "repaired_translation_bundles": repaired_translation_bundles,
+            "final_translation_bundles": final_translation_diagnostics_rows(),
+            "retry_attempts": retry_attempts,
+            "quality_counters": dict(sorted(quality_counters.items())),
+            "policy": {
+                "retry_failed": retry_failed,
+                "repair_only": repair_only,
+                "force_retranslate": force_retranslate,
+                "force_retranslate_failed": force_retranslate_failed,
+                "severe_backcheck_promotes_manual_review": True,
+            },
+        }
+
     def persist_partial() -> None:
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         _write_jsonl_atomic(jsonl_path, rows)
@@ -3861,6 +4286,7 @@ def translate_ko_step(
                 "translated": translated,
                 "needs_manual_review": needs_manual_review,
                 "colloquialized": colloquialized,
+                "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
                 "numeric_counting_postprocessed": numeric_counting_postprocessed,
                 "asr_backcheck_count": asr_backcheck_count,
                 "concurrency": translation_worker_count,
@@ -3871,12 +4297,17 @@ def translate_ko_step(
                 "span_count": len(translation_batches),
                 "two_pass": cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
                 "force_retranslate": force_retranslate,
+                "retry_failed": retry_failed,
+                "repair_only": repair_only,
+                "force_retranslate_failed": force_retranslate_failed,
                 "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
                 "partial": True,
             },
         )
+        write_json_atomic(diagnostics_path, build_diagnostics_payload(partial=True))
         manifest.artifacts["translation_bundles"] = str(jsonl_path)
         manifest.artifacts["translation_summary"] = str(summary_path)
+        manifest.artifacts["translation_diagnostics"] = str(diagnostics_path)
         save_manifest(project_dir, manifest)
 
     if rows:
@@ -3909,8 +4340,23 @@ def translate_ko_step(
                         context_segments,
                     )
                 )
+                record_retry_attempt(
+                    attempt_type="single",
+                    batch_id=retry_batch_id,
+                    segments=[missing_segment],
+                    accepted=missing_segment.id in translations,
+                    reason=None if missing_segment.id in translations else "missing model response",
+                    returned_segment_ids=[segment_id for segment_id in translations if segment_id == missing_segment.id],
+                )
             except Exception as exc:
                 message = f"Korean translation retry failed for {retry_batch_id}: {exc}"
+                record_retry_attempt(
+                    attempt_type="single",
+                    batch_id=retry_batch_id,
+                    segments=[missing_segment],
+                    accepted=False,
+                    reason=str(exc),
+                )
                 record_failure(missing_segment, message)
                 return
             if missing_segment.id not in translations:
@@ -3934,10 +4380,36 @@ def translate_ko_step(
                     group_batch_id,
                     context_segments,
                 )
+                record_retry_attempt(
+                    attempt_type=(
+                        "single"
+                        if len(group) == 1
+                        else "split"
+                        if "_split_" in group_batch_id or "_missing_" in group_batch_id
+                        else "batch"
+                    ),
+                    batch_id=group_batch_id,
+                    segments=group,
+                    accepted=True,
+                    returned_segment_ids=list(group_translations),
+                )
             except Exception as exc:
                 if backend_kind == "llama_server" and _is_gemma_text_server_unavailable(exc):
                     raise
                 message = f"Korean translation batch failed for {group_batch_id}: {exc}"
+                record_retry_attempt(
+                    attempt_type=(
+                        "single"
+                        if len(group) == 1
+                        else "split"
+                        if "_split_" in group_batch_id or "_missing_" in group_batch_id
+                        else "batch"
+                    ),
+                    batch_id=group_batch_id,
+                    segments=group,
+                    accepted=False,
+                    reason=str(exc),
+                )
                 if len(group) == 1:
                     record_failure(group[0], message)
                     return
@@ -3972,11 +4444,12 @@ def translate_ko_step(
     ) -> None:
         nonlocal last_logged_at, needs_manual_review, processed, translated
         for segment in batch:
-            for message in translation_failures.get(segment.id, []):
-                if message not in segment.errors:
-                    segment.errors.append(message)
             translation = translations.get(segment.id)
             if translation is None:
+                segment.status = "needs_manual_review"
+                for message in translation_failures.get(segment.id, []):
+                    if message not in segment.errors:
+                        segment.errors.append(message)
                 needs_manual_review += 1
                 processed += 1
                 source_text = segment.source_script.text if segment.source_script else ""
@@ -4016,6 +4489,7 @@ def translate_ko_step(
                     "translation_ko": translation.model_dump(mode="json"),
                 }
             )
+            record_raw_translation_row(rows[-1])
             last_logged_at = _log_translate_progress(
                 processed,
                 total,
@@ -4063,12 +4537,25 @@ def translate_ko_step(
         for server_manager in reversed(server_managers):
             server_manager.stop()
 
+    digit_pronunciation_postprocessed = _apply_korean_digit_pronunciation_postprocess(
+        manifest.segments,
+        repaired_translation_bundles,
+        quality_counters,
+    )
     colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
     numeric_counting_postprocessed = _apply_korean_numeric_counting_postprocess(manifest.segments)
     asr_backcheck_items = _apply_translation_asr_backcheck(manifest.segments, cfg)
     asr_backcheck_count = len(asr_backcheck_items)
     _refresh_translation_rows(rows, manifest.segments)
     _attach_asr_backcheck_to_translation_rows(rows, asr_backcheck_items)
+    _finalize_translation_acceptance(
+        rows,
+        manifest.segments,
+        asr_backcheck_items,
+        quality_counters,
+    )
+    translated = sum(1 for row in rows if row.get("status") == "translated")
+    needs_manual_review = sum(1 for row in rows if row.get("status") == "needs_manual_review")
     _write_jsonl_atomic(jsonl_path, rows)
     asr_backcheck_summary_path = project_dir / "work" / "translate_ko" / "asr_backcheck_summary.json"
     write_json_atomic(
@@ -4087,6 +4574,7 @@ def translate_ko_step(
         "translated": translated,
         "needs_manual_review": needs_manual_review,
         "colloquialized": colloquialized,
+        "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
         "numeric_counting_postprocessed": numeric_counting_postprocessed,
         "asr_backcheck_count": asr_backcheck_count,
         "concurrency": translation_worker_count,
@@ -4097,11 +4585,17 @@ def translate_ko_step(
         "span_count": len(translation_batches),
         "two_pass": cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
         "force_retranslate": force_retranslate,
+        "retry_failed": retry_failed,
+        "repair_only": repair_only,
+        "force_retranslate_failed": force_retranslate_failed,
         "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
+        "quality_counters": dict(sorted(quality_counters.items())),
     }
     write_json_atomic(summary_path, summary)
+    write_json_atomic(diagnostics_path, build_diagnostics_payload(partial=False))
     manifest.artifacts["translation_bundles"] = str(jsonl_path)
     manifest.artifacts["translation_summary"] = str(summary_path)
+    manifest.artifacts["translation_diagnostics"] = str(diagnostics_path)
     manifest.artifacts["translation_asr_backcheck_summary"] = str(asr_backcheck_summary_path)
     server_metadata = None
     if backend_kind == "llama_server":
@@ -4137,8 +4631,10 @@ def translate_ko_step(
         translated=translated,
         needs_manual_review=needs_manual_review,
         colloquialized=colloquialized,
+        digit_pronunciation_postprocessed=digit_pronunciation_postprocessed,
         numeric_counting_postprocessed=numeric_counting_postprocessed,
         asr_backcheck_count=asr_backcheck_count,
+        quality_counters=dict(sorted(quality_counters.items())),
         concurrency=translation_worker_count,
         context_radius=cfg.gemma_text_context_radius,
         span_size=cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
@@ -4147,6 +4643,9 @@ def translate_ko_step(
         span_count=len(translation_batches),
         two_pass=cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
         force_retranslate=force_retranslate,
+        retry_failed=retry_failed,
+        repair_only=repair_only,
+        force_retranslate_failed=force_retranslate_failed,
         server=server_metadata,
     )
     save_manifest(project_dir, manifest)
@@ -4171,6 +4670,16 @@ def korean_script_step(project_dir: Path, confirm_rights: bool = False) -> Pipel
     started_at = monotonic()
     last_logged_at = started_at
     for index, segment in enumerate(manifest.segments, start=1):
+        if segment.status in SKIP_STATUSES:
+            needs_manual_review += 1
+            segment.script = None
+            message = f"korean-script skipped segment status {segment.status}."
+            if message not in segment.errors:
+                segment.errors.append(message)
+            last_logged_at = _log_segment_progress(
+                "korean-script", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
         translation = segment.translation_ko
         text = translation.ko_natural.strip() if translation else ""
         source_text = segment.source_script.text.strip() if segment.source_script else ""

@@ -23,7 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 asr = ["faster-whisper", "ctranslate2"]
 hf = ["transformers>=4.56", "torch", "accelerate"]
-separation = ["demucs"]
+separation = ["demucs", "torchcodec"]
 diarization = ["pyannote.audio>=4,<5"]
 dev = ["pytest>=8", "ruff>=0.5"]
 qwen-asr = [

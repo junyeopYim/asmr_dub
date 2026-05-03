@@ -104,6 +104,37 @@ def extract_mono_16k(input_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+def concat_audio_to_wav(
+    input_paths: list[Path],
+    output_path: Path,
+    *,
+    sample_rate: int = 48_000,
+    channels: int = 2,
+) -> Path:
+    if len(input_paths) < 2:
+        raise FFmpegError("At least two input files are required for audio concatenation.")
+    for input_path in input_paths:
+        ensure_not_same_path(input_path, output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args = ["-y"]
+    for input_path in input_paths:
+        args += ["-i", str(input_path)]
+    concat_inputs = "".join(f"[{index}:a:0]" for index in range(len(input_paths)))
+    args += [
+        "-filter_complex",
+        f"{concat_inputs}concat=n={len(input_paths)}:v=0:a=1[a]",
+        "-map",
+        "[a]",
+        "-ac",
+        str(channels),
+        "-ar",
+        str(sample_rate),
+        str(output_path),
+    ]
+    run_ffmpeg(args)
+    return output_path
+
+
 def slice_audio(
     input_path: Path,
     start_sec: float,

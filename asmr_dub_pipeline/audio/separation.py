@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .features import ensure_stereo, load_audio, resample_linear, to_mono, write_audio
+from .ffmpeg import FFmpegError, run_ffmpeg
 
 SourceSeparationBackend = Literal["auto", "none", "demucs", "mock"]
 
@@ -62,7 +63,48 @@ def _find_demucs_stem(output_dir: Path, model: str, input_stem: str, stem_name: 
     return matches[-1]
 
 
-def _write_normalized_stems(
+def _convert_audio_streaming(
+    input_path: Path,
+    output_path: Path,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        [
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-ac",
+            str(channels),
+            "-ar",
+            str(sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+
+
+def _write_normalized_stems_streaming(
+    vocals_source: Path,
+    background_source: Path,
+    vocals_path: Path,
+    vocals_mono_path: Path,
+    background_path: Path,
+    sample_rate: int,
+    mono_sample_rate: int,
+) -> None:
+    _convert_audio_streaming(vocals_source, vocals_path, sample_rate=sample_rate, channels=2)
+    _convert_audio_streaming(background_source, background_path, sample_rate=sample_rate, channels=2)
+    _convert_audio_streaming(vocals_source, vocals_mono_path, sample_rate=mono_sample_rate, channels=1)
+
+
+def _write_normalized_stems_in_memory(
     vocals_source: Path,
     background_source: Path,
     vocals_path: Path,
@@ -85,6 +127,39 @@ def _write_normalized_stems(
     if sample_rate != mono_sample_rate:
         mono = resample_linear(mono, sample_rate, mono_sample_rate)
     write_audio(vocals_mono_path, mono[:, None], mono_sample_rate)
+
+
+def _write_normalized_stems(
+    vocals_source: Path,
+    background_source: Path,
+    vocals_path: Path,
+    vocals_mono_path: Path,
+    background_path: Path,
+    sample_rate: int,
+    mono_sample_rate: int,
+) -> str:
+    try:
+        _write_normalized_stems_streaming(
+            vocals_source,
+            background_source,
+            vocals_path,
+            vocals_mono_path,
+            background_path,
+            sample_rate,
+            mono_sample_rate,
+        )
+    except FFmpegError:
+        _write_normalized_stems_in_memory(
+            vocals_source,
+            background_source,
+            vocals_path,
+            vocals_mono_path,
+            background_path,
+            sample_rate,
+            mono_sample_rate,
+        )
+        return "python_in_memory_fallback"
+    return "ffmpeg_streaming"
 
 
 def _write_mock_stems(
@@ -134,6 +209,7 @@ def separate_source_audio(
     reused_existing = outputs_exist and not force
     selected_backend = backend
     selected_model = model
+    postprocess_method = ""
 
     if reused_existing:
         if metadata_path.exists():
@@ -177,7 +253,7 @@ def separate_source_audio(
                 raise SourceSeparationUnavailable(f"Demucs source separation failed: {exc}") from exc
             vocals_source = _find_demucs_stem(demucs_dir, model, input_audio_path.stem, "vocals")
             background_source = _find_demucs_stem(demucs_dir, model, input_audio_path.stem, "no_vocals")
-            _write_normalized_stems(
+            postprocess_method = _write_normalized_stems(
                 vocals_source,
                 background_source,
                 vocals_path,
@@ -197,6 +273,8 @@ def separate_source_audio(
         "reused_existing": reused_existing,
         "command": command,
     }
+    if postprocess_method:
+        metadata["postprocess_method"] = postprocess_method
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", "utf-8")
     return SourceSeparationResult(

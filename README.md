@@ -58,10 +58,22 @@ Gemma/TTS so it can finish without a running model server:
 asmr-dub full ./audio/RJ01012948.mp4 --confirm-rights
 ```
 
+For split local files named like `RJ094817_1.mp4`, `RJ094817_2.mp4`, and
+`RJ094817_3.mp4`, use the stable audio-only merge path:
+
+```bash
+asmr-dub full ./audio/RJ094817_1.mp4 --merge-parts --confirm-rights
+```
+
+`--merge-parts` detects consecutive sibling files with the same extension,
+creates `work/input/<base>_merged_source.wav`, and records the part list,
+hashes, durations, and selected input in the manifest. It does not concatenate
+video streams; final export from a merged source is WAV-first.
+
 Use `--real --gemma-backend hf` only after installing the optional HF dependencies.
-Use `--real --gemma-backend llama_cpp` to run the repo-local GGUF HauhauCS Gemma
-4 E4B Q8 cache through `llama-mtmd-cli`. Real GPT-SoVITS synthesis needs
-project-local voice references you have rights/consent to use; `full --real`
+Use `--real --gemma-backend llama_cpp` to run the Hugging Face cached
+OBLITERATUS Gemma 4 E4B Q8 GGUF through `llama-mtmd-cli`. Real GPT-SoVITS
+synthesis needs project-local voice references you have rights/consent to use; `full --real`
 now defaults to GPT-SoVITS few-shot training from source segments before
 synthesis and can auto-start repo-local GPT-SoVITS installs such as
 `.cache/third_party/GPT-SoVITS/api_v2.py`. Use `--zero-shot` to skip training
@@ -359,6 +371,23 @@ Korean translations are stored separately from Japanese GPT-SoVITS scripts:
 ```bash
 asmr-dub transcribe --project ./project --confirm-rights --asr-backend faster_whisper
 asmr-dub translate-ko --project ./project --confirm-rights --gemma-text-backend llama_server
+```
+
+`translate-ko` writes `work/translate_ko/diagnostics.json` alongside
+`summary.json` and `translation_bundles.jsonl`. The diagnostics artifact records
+raw, repaired, and final translation bundles, split/single retry attempts,
+quality counters, severe ASR backcheck hits, deterministic digit repairs, and
+the accepted or rejected reason for each segment. Segments with severe domain
+smells such as `媚薬` becoming `변비약`, raw numeric leftovers after repair,
+Japanese/CJK/Latin residue, or other unsafe Korean TTS text are left in
+`needs_manual_review` instead of being scripted for synthesis.
+
+To revisit only failed/manual-review translation work, use:
+
+```bash
+asmr-dub translate-ko --project ./project --confirm-rights --gemma-text-backend llama_server --retry-failed
+asmr-dub translate-ko --project ./project --repair-only
+asmr-dub translate-ko --project ./project --retry-failed --force-retranslate-failed
 ```
 
 For offline tests or pipeline checks, use `--asr-backend mock` and

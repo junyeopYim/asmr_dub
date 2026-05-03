@@ -1431,16 +1431,17 @@ def test_translate_ko_passes_neighbor_context_to_context_aware_clients(
                     [segment.id for segment in (context_segments or [])],
                 )
             )
+            labels = ["첫번째", "두번째", "세번째"]
             return {
                 segment.id: KoreanTranslation(
-                    ko_literal=f"직역 {segment.id}",
-                    ko_natural=f"자연 {segment.id}",
+                    ko_literal=f"직역 {labels[index]}",
+                    ko_natural=f"자연 {labels[index]}",
                     notes=[],
                     confidence=0.9,
                     model="fake",
                     batch_id=batch_id,
                 )
-                for segment in segments
+                for index, segment in enumerate(segments)
             }
 
     monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
@@ -1529,18 +1530,19 @@ def test_translate_ko_groups_adjacent_segments_into_contextual_spans(
                     batch_id,
                     [segment.id for segment in segments],
                     [segment.id for segment in (context_segments or [])],
+                    )
                 )
-            )
+            labels = ["첫번째", "두번째", "세번째"]
             return {
                 segment.id: KoreanTranslation(
-                    ko_literal=f"직역 {segment.id}",
-                    ko_natural=f"자연 {segment.id}",
+                    ko_literal=f"직역 {labels[index]}",
+                    ko_natural=f"자연 {labels[index]}",
                     notes=[],
                     confidence=0.9,
                     model="fake",
                     batch_id=batch_id,
                 )
-                for segment in segments
+                for index, segment in enumerate(segments)
             }
 
     monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
@@ -1890,10 +1892,12 @@ def test_translate_ko_force_retranslate_ignores_resumed_translations(
             batch_id: str,
         ) -> dict[str, KoreanTranslation]:
             calls.append(batch_id)
+            labels = ["첫번째", "두번째", "세번째"]
+            label = labels[len(calls) - 1]
             return {
                 segment.id: KoreanTranslation(
-                    ko_literal=f"직역 {len(calls)}",
-                    ko_natural=f"자연 {len(calls)}",
+                    ko_literal=f"직역 {label}",
+                    ko_natural=f"자연 {label}",
                     notes=[],
                     confidence=0.9,
                     model="fake",
@@ -1908,7 +1912,7 @@ def test_translate_ko_force_retranslate_ignores_resumed_translations(
     first_manifest = load_manifest(tmp_project_dir)
     first_translation = first_manifest.segments[0].translation_ko
     assert first_translation is not None
-    assert first_translation.ko_natural == "자연 1"
+    assert first_translation.ko_natural == "자연 첫번째"
 
     translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
     assert calls == ["batch_0001"]
@@ -1918,7 +1922,7 @@ def test_translate_ko_force_retranslate_ignores_resumed_translations(
     manifest = load_manifest(tmp_project_dir)
     translation = manifest.segments[0].translation_ko
     assert translation is not None
-    assert translation.ko_natural == "자연 2"
+    assert translation.ko_natural == "자연 두번째"
     assert manifest.stage_state["translate-ko"]["force_retranslate"] is True
 
 
@@ -2747,6 +2751,325 @@ def test_translate_ko_skips_manual_review_segments_even_with_source_text(
             "translation_ko": None,
         }
     ]
+
+
+def test_translate_ko_repairs_raw_digits_and_records_diagnostics(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    segment.source_script = SourceScript(
+        text="快感レベル100",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    save_manifest(tmp_project_dir, manifest)
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal="쾌감 레벨 100",
+                    ko_natural="쾌감 레벨 100이에요.",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+
+    manifest = load_manifest(tmp_project_dir)
+    translation = manifest.segments[0].translation_ko
+    assert translation is not None
+    assert translation.ko_natural == "쾌감 레벨 백이에요."
+    assert "korean_digit_pronunciation_postprocess" in translation.notes
+    assert manifest.segments[0].status != "needs_manual_review"
+    diagnostics_path = Path(manifest.artifacts["translation_diagnostics"])
+    diagnostics = json.loads(diagnostics_path.read_text("utf-8"))
+    assert diagnostics["quality_counters"]["raw_digit"] == 1
+    assert diagnostics["repaired_translation_bundles"][0]["repair_reasons"] == ["raw_digit"]
+    assert diagnostics["final_translation_bundles"][0]["status"] == "translated"
+
+
+def test_translate_ko_severe_domain_smell_does_not_reach_korean_script(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    segment.source_script = SourceScript(
+        text="ザーメン媚薬を飲ませます",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    save_manifest(tmp_project_dir, manifest)
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal="정액 변비약을 먹일게요.",
+                    ko_natural="정액 변비약을 먹일게요.",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    assert segment.status == "needs_manual_review"
+    assert segment.script is None
+    assert any("severe_translation_smell" in error for error in segment.errors)
+    diagnostics = json.loads(Path(manifest.artifacts["translation_diagnostics"]).read_text("utf-8"))
+    assert diagnostics["quality_counters"]["domain_mistranslation"] == 1
+    assert diagnostics["final_translation_bundles"][0]["status"] == "needs_manual_review"
+
+
+def test_translate_ko_diagnostics_record_split_and_single_retry_failure(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    _force_single_translation_lane(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    base = manifest.segments[0]
+    manifest.segments.append(
+        Segment(
+            id="seg_0002",
+            start=base.end,
+            end=base.end + base.duration,
+            duration=base.duration,
+            audio_for_gemma=base.audio_for_gemma,
+            audio_for_mix=base.audio_for_mix,
+            source_script=SourceScript(
+                text="追加の台詞です",
+                language="ja",
+                confidence=0.99,
+                backend="mock",
+                start=base.end,
+                end=base.end + base.duration,
+            ),
+        )
+    )
+    save_manifest(tmp_project_dir, manifest)
+
+    class FakeServer:
+        started = False
+        reused_existing = True
+        log_path = None
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            if len(segments) > 1:
+                raise RuntimeError("Could not parse translation JSON array")
+            if segments[0].id == "seg_0002":
+                raise RuntimeError("single JSON parse failed")
+            return {
+                segments[0].id: KoreanTranslation(
+                    ko_literal="좋아요.",
+                    ko_natural="좋아요.",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+            }
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", lambda **kwargs: FakeServer())
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="llama_server")
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].translation_ko is not None
+    assert manifest.segments[1].status == "needs_manual_review"
+    diagnostics = json.loads(Path(manifest.artifacts["translation_diagnostics"]).read_text("utf-8"))
+    assert any(
+        attempt["accepted"] is False and attempt["attempt_type"] == "batch"
+        for attempt in diagnostics["retry_attempts"]
+    )
+    assert any(
+        attempt["accepted"] is False
+        and attempt["attempt_type"] == "single"
+        and attempt["segment_ids"] == ["seg_0002"]
+        for attempt in diagnostics["retry_attempts"]
+    )
+    final_by_id = {row["segment_id"]: row for row in diagnostics["final_translation_bundles"]}
+    assert final_by_id["seg_0002"]["status"] == "needs_manual_review"
+    assert "single JSON parse failed" in final_by_id["seg_0002"]["rejected_reasons"][0]
+
+
+def test_korean_script_skips_existing_manual_review_translation(tmp_project_dir: Path) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        status="needs_manual_review",
+        source_script=SourceScript(
+            text="ザーメン媚薬を飲ませます",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="정액 변비약을 먹일게요.",
+            ko_natural="정액 변비약을 먹일게요.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].status == "needs_manual_review"
+    assert manifest.segments[0].script is None
+
+
+@pytest.mark.parametrize(
+    ("text", "issue"),
+    [
+        ("목소에 계속 따만 ة", "korean_tts_contains_pronunciation_symbol"),
+        ("그럼 다음 푸", "korean_tts_suspicious_truncated_sentence"),
+        ("초상 말고, 사람", "korean_tts_suspicious_truncated_sentence"),
+    ],
+)
+def test_korean_script_blocks_foreign_symbols_and_truncated_fragments(
+    tmp_project_dir: Path,
+    text: str,
+    issue: str,
+) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="少し近づきますね",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal=text,
+            ko_natural=text,
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].status == "needs_manual_review"
+    assert issue in manifest.segments[0].errors[-1]
+
+
+def test_translate_ko_cli_accepts_repair_retry_options(
+    cli_runner,
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_translate_ko_step(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest()
+
+    monkeypatch.setattr(cli_module, "translate_ko_step", fake_translate_ko_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "translate-ko",
+            "-p",
+            str(tmp_project_dir),
+            "--gemma-text-backend",
+            "mock",
+            "--retry-failed",
+            "--repair-only",
+            "--force-retranslate-failed",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["retry_failed"] is True
+    assert kwargs["repair_only"] is True
+    assert kwargs["force_retranslate_failed"] is True
 
 
 def test_korean_script_blocks_japanese_fallback_text(tmp_project_dir: Path) -> None:

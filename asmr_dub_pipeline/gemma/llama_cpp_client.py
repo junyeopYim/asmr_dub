@@ -17,22 +17,19 @@ from .schemas import TASK_REQUIRED_KEYS, TaskName
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LLAMA_CPP_DIR = (
-    Path(".cache")
-    / "llama_cpp"
-    / "models"
-    / "HauhauCS"
-    / "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive"
+    Path.home()
+    / ".cache"
+    / "huggingface"
+    / "hub"
+    / "models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED"
+    / "snapshots"
+    / "d8678bbb9e0d4f5729c115087485a4e25ba89d65"
 )
 DEFAULT_LLAMA_CPP_MODEL = (
-    Path(".cache")
-    / "llama_cpp"
-    / "models"
-    / "mudler"
-    / "gemma-4-26B-A4B-it-heretic-APEX-GGUF"
-    / "gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf"
+    DEFAULT_LLAMA_CPP_DIR / "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf"
 )
 DEFAULT_LLAMA_CPP_MMPROJ = (
-    DEFAULT_LLAMA_CPP_DIR / "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf"
+    DEFAULT_LLAMA_CPP_DIR / "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"
 )
 DEFAULT_LLAMA_CPP_CLI = (
     Path(".cache") / "llama_cpp" / "src" / "llama.cpp" / "build" / "bin" / "llama-mtmd-cli"

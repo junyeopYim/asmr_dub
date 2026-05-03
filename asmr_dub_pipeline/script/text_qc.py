@@ -10,6 +10,9 @@ HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
 LATIN_RE = re.compile(r"[A-Za-z]")
 DIGIT_RE = re.compile(r"\d")
 PRONUNCIATION_SYMBOL_RE = re.compile(r"[^\uac00-\ud7a3\s,.!?…]")
+SUSPICIOUS_FINAL_FRAGMENT_RE = re.compile(
+    r"(?:다음\s+[가-힣]{1,2}|말고,\s*[가-힣]{1,4}|[가-힣]+\s+말고\s+[가-힣]{1,4})$"
+)
 BRACKETED_RE = re.compile(
     r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|（[^）]*）|【[^】]*】|｛[^｝]*｝|〈[^〉]*〉|《[^》]*》)"
 )
@@ -66,6 +69,20 @@ def has_long_korean_clause(text: str, max_chars: int = KOREAN_LONG_CLAUSE_MAX_CH
     return False
 
 
+def has_suspicious_truncated_sentence(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized:
+        return False
+    if normalized.endswith(","):
+        return True
+    if SUSPICIOUS_FINAL_FRAGMENT_RE.search(normalized):
+        return True
+    last_clause = re.split(r"[,!?…]+", normalized)[-1].strip()
+    if last_clause in {"푸"}:
+        return True
+    return bool(re.search(r"(?:그리고|그런데|하지만|또는|혹은|말고|다음)$", last_clause))
+
+
 def hangul_ratio(text: str) -> float:
     speech_chars = [char for char in text if not char.isspace() and not char.isdigit()]
     if not speech_chars:
@@ -101,6 +118,8 @@ def preflight_tts_text(
             issues.append("korean_tts_contains_pronunciation_symbol")
         if has_long_korean_clause(text):
             issues.append("korean_tts_long_clause_without_pause")
+        if has_suspicious_truncated_sentence(text):
+            issues.append("korean_tts_suspicious_truncated_sentence")
         ratio = hangul_ratio(text)
         if source_text.strip() and text == source_text.strip():
             issues.append("korean_tts_matches_source_japanese")

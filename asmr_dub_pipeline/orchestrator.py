@@ -58,6 +58,7 @@ def run_pipeline(
     require_voice_bank: bool = False,
     source_separation_cache_project: Path | None = None,
     regenerate_before_mix: bool = False,
+    merge_input_parts: bool = False,
 ) -> PipelineManifest:
     if mock:
         gemma_backend = "mock"
@@ -97,8 +98,8 @@ def run_pipeline(
         validate_rvc_config(project_dir, cfg, real=True, allow_trained_artifact=True)
     use_korean_text_lane = cfg.target_language == "ko"
     use_few_shot = False if mock or use_voice_bank else cfg.gsv_few_shot_enabled if few_shot is None else few_shot
-    extract_step(input_path, project_dir, confirm_rights)
-    if source_separation_cache_project is not None:
+    extract_step(input_path, project_dir, confirm_rights, merge_parts=merge_input_parts)
+    if source_separation_cache_project is not None and not merge_input_parts:
         import_voice_bank_source_separation_cache_step(
             project_dir,
             input_path,

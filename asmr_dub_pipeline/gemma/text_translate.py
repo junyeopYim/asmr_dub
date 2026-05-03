@@ -351,7 +351,9 @@ def build_translate_ko_prompt(
         "natural counting may use 하나, 둘, 셋; digit/code/phone-like reading may use 일, 이, "
         "삼 or 공; quantities, years, ordinals, time, and measurements should use the idiomatic "
         "Korean form for that context. Never leave raw digits. Translate the full source text "
-        "without summarizing or dropping clauses.\n"
+        "without summarizing or dropping clauses. Preserve ASMR domain terms: translate 媚薬 as "
+        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 "
+        "hypnosis audio without reversing it into content for minors.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -371,7 +373,9 @@ def build_literal_translate_prompt(
         "names, pronouns, omitted subjects, and tone. Read target_span.combined_source_text "
         "first for adjacent-segment context, but keep exactly one output item per input "
         "segment_id; do not merge, split, omit, duplicate, or move content between segment_ids. "
-        "Preserve all clauses without summary.\n"
+        "Preserve all clauses without summary. Preserve ASMR domain terms: translate 媚薬 as "
+        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 "
+        "hypnosis audio without reversing it into content for minors.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -407,7 +411,9 @@ def build_naturalize_ko_prompt(
         "target_span.combined_source_text and context "
         "only for continuity of names, pronouns, register, and tone. Keep exactly one output item "
         "per input segment_id; do not merge, split, omit, duplicate, or move content between "
-        "segment_ids.\n"
+        "segment_ids. Preserve ASMR domain terms: translate 媚薬 as 미약, 최음제, or 흥분제, "
+        "never 변비약; translate 18禁催眠音声 as adult/십팔금 hypnosis audio without reversing "
+        "it into content for minors.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -435,7 +441,8 @@ def build_repair_prompt(
         "original input context, choosing natural counting, digit/code reading, quantity, year, "
         "ordinal, time, or measurement wording as appropriate. Translate the full source "
         "text without summarizing. Preserve the input segment_id boundaries exactly; do not merge, "
-        "split, omit, duplicate, or move content between segment_ids. "
+        "split, omit, duplicate, or move content between segment_ids. Reject domain mistranslations: "
+        "媚薬 must not become 변비약, and 18禁 must not become content for minors. "
         f"Batch id: {batch_id}. Validation error: {error}{input_text}\nPrevious response:\n"
         f"{bad_response[:6000]}"
     )

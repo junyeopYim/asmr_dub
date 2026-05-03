@@ -243,12 +243,14 @@ class ProjectConfig(StrictBaseModel):
         ".cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cli"
     )
     gemma_llama_cpp_model_path: str = (
-        ".cache/llama_cpp/models/mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF/"
-        "gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf"
+        "~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/"
+        "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
+        "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf"
     )
     gemma_llama_cpp_mmproj_path: str = (
-        ".cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/"
-        "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf"
+        "~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/"
+        "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
+        "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"
     )
     gemma_llama_cpp_timeout_sec: float = Field(default=600.0, gt=0)
     gemma_llama_cpp_ctx_size: int = Field(default=4096, ge=512)
@@ -421,6 +423,9 @@ class ProjectConfig(StrictBaseModel):
             "端となく鼻ならして": "はしたなく鼻鳴らして",
             "鼻ならしてかきなさい": "鼻鳴らして嗅ぎなさい",
             "手帳が来る": "絶頂が来る",
+            "シャクラ": "さくら",
+            "インラン": "淫乱",
+            "おじさまのツアー": "おじさまのザーメン",
             "媚薬スプレー 豆腐": "媚薬スプレー投与",
             "ピスタン": "ピストン",
             "ジュガジュガ": "グチュグチュ",
@@ -507,6 +512,8 @@ class ProjectConfig(StrictBaseModel):
             "ネイジー": "イメージ",
             "シャクラ": "さくら",
             "ツアメ": "ザーメン",
+            "インラン": "淫乱",
+            "おじさまのツアー": "おじさまのザーメン",
             "先走り駅": "先走り液",
             "1個1個1個": "一滴一滴",
             "めず行きセックス": "メスイキセックス",

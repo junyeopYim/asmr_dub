@@ -222,6 +222,52 @@ def test_source_separation_auto_reuses_existing_outputs_without_demucs(
     assert second.backend == "mock"
 
 
+def test_demucs_postprocess_uses_ffmpeg_streaming_without_loading_stems(
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "separation_streaming"
+    model = "htdemucs"
+    ffmpeg_calls: list[list[str]] = []
+
+    def fake_demucs_runner(command: list[str], check: bool, text: bool) -> None:
+        assert check is True
+        assert text is True
+        output_dir = Path(command[command.index("-o") + 1])
+        input_stem = Path(command[-1]).stem
+        stem_dir = output_dir / model / input_stem
+        stem_dir.mkdir(parents=True, exist_ok=True)
+        write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
+        write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
+
+    def fake_run_ffmpeg(args: list[str]) -> None:
+        ffmpeg_calls.append(args)
+        output_path = Path(args[-1])
+        channels = int(args[args.index("-ac") + 1])
+        sample_rate = int(args[args.index("-ar") + 1])
+        write_audio(output_path, np.zeros((sample_rate // 20, channels), dtype=np.float32), sample_rate)
+
+    def fail_load_audio(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("demucs postprocess should stream via ffmpeg")
+
+    monkeypatch.setattr(separation_module, "demucs_available", lambda: True)
+    monkeypatch.setattr(separation_module, "run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(separation_module, "load_audio", fail_load_audio)
+
+    result = separate_source_audio(tiny_wav_path, project, backend="demucs", model=model, runner=fake_demucs_runner)
+
+    assert result is not None
+    assert result.backend == "demucs"
+    assert result.vocals_path.exists()
+    assert result.vocals_mono_path.exists()
+    assert result.background_path.exists()
+    assert [call[call.index("-ac") + 1] for call in ffmpeg_calls] == ["2", "2", "1"]
+    assert [call[call.index("-ar") + 1] for call in ffmpeg_calls] == ["48000", "48000", "16000"]
+    metadata = json.loads(result.metadata_path.read_text("utf-8"))
+    assert metadata["postprocess_method"] == "ffmpeg_streaming"
+
+
 def test_full_imports_matching_voice_bank_source_separation_cache(
     cli_runner,
     tiny_wav_path: Path,

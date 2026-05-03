@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conftest import sha256
+import numpy as np
+import soundfile as sf
+from conftest import sha256, write_tiny_wav
 
 import asmr_dub_pipeline.cli as cli_module
+from asmr_dub_pipeline.audio import preprocess
 from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import load_project_config
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest
@@ -63,6 +66,59 @@ def test_mock_pipeline_e2e(cli_runner, tiny_wav_path: Path, tmp_project_dir: Pat
     assert Path(manifest.artifacts["export"]).exists()
 
 
+def test_extract_merge_parts_creates_canonical_audio_source(
+    tmp_path: Path,
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    part_1 = write_tiny_wav(tmp_path / "RJTEST_1.wav", duration=0.7)
+    part_2 = write_tiny_wav(tmp_path / "RJTEST_2.wav", duration=0.8)
+
+    def fake_concat_audio_to_wav(
+        input_paths: list[Path],
+        output_path: Path,
+        *,
+        sample_rate: int = 48_000,
+        channels: int = 2,
+    ) -> Path:
+        clips = []
+        for input_path in input_paths:
+            data, sr = sf.read(input_path, always_2d=True, dtype="float32")
+            assert sr == sample_rate
+            clips.append(data[:, :channels])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(output_path, np.concatenate(clips, axis=0), sample_rate)
+        return output_path
+
+    monkeypatch.setattr(preprocess.ffmpeg, "concat_audio_to_wav", fake_concat_audio_to_wav)
+
+    manifest = extract_step(part_1, tmp_project_dir, confirm_rights=True, merge_parts=True)
+
+    merged_path = tmp_project_dir / "work" / "input" / "RJTEST_merged_source.wav"
+    assert merged_path.exists()
+    assert manifest.source_info is not None
+    assert manifest.source_info.path == str(merged_path)
+    assert manifest.artifacts["merged_source_audio"] == str(merged_path)
+    assert Path(manifest.artifacts["input_parts_manifest"]).exists()
+    merge = manifest.source_info.raw["input_merge"]
+    assert merge["status"] == "merged"
+    assert merge["part_count"] == 2
+    assert [part["path"] for part in merge["parts"]] == [str(part_1.resolve()), str(part_2.resolve())]
+    assert manifest.rights_audit.history[-1]["input_merge"]["status"] == "merged"
+
+
+def test_numbered_part_merge_planner_refuses_ambiguous_base_file(tmp_path: Path) -> None:
+    write_tiny_wav(tmp_path / "RJAMB.wav")
+    part_1 = write_tiny_wav(tmp_path / "RJAMB_1.wav")
+    write_tiny_wav(tmp_path / "RJAMB_2.wav")
+
+    plan = preprocess.plan_numbered_part_merge(part_1)
+
+    assert plan.status == "ambiguous_base_file_exists"
+    assert not plan.should_merge
+    assert plan.parts == (part_1.resolve(),)
+
+
 def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path, tmp_path: Path) -> None:
     project = tmp_path / "full_project"
     result = cli_runner.invoke(
@@ -94,6 +150,41 @@ def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path
     assert manifest.artifacts["export"].endswith("_dub.wav")
     assert Path(manifest.artifacts["segments_final"]).exists()
     assert Path(manifest.artifacts["export"]).exists()
+
+
+def test_full_merge_parts_uses_group_run_name_and_passes_flag(
+    cli_runner,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    part_1 = write_tiny_wav(tmp_path / "RJGROUP_1.wav")
+    captured: dict[str, object] = {}
+    fake_repo = tmp_path / "repo"
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "REPO_ROOT", fake_repo)
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(part_1),
+            "--confirm-rights",
+            "--merge-parts",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    args = captured["args"]
+    kwargs = captured["kwargs"]
+    assert Path(args[1]).name.endswith("_RJGROUP")
+    assert kwargs["merge_input_parts"] is True
 
 
 def test_full_real_applies_high_quality_preset_by_default(

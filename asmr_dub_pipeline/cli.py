@@ -9,6 +9,7 @@ from pathlib import Path
 import typer
 from rich.table import Table
 
+from asmr_dub_pipeline.audio.preprocess import numbered_part_base_stem
 from asmr_dub_pipeline.gemma.llama_cpp_client import (
     DEFAULT_LLAMA_CPP_CLI,
     DEFAULT_LLAMA_CPP_MMPROJ,
@@ -131,14 +132,16 @@ def _handle_error(exc: Exception) -> None:
     raise typer.Exit(code=1) from exc
 
 
-def _safe_run_name(input_path: Path) -> str:
-    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", input_path.stem).strip("-._")
+def _safe_run_name(input_path: Path, *, merge_parts: bool = False) -> str:
+    stem = numbered_part_base_stem(input_path) if merge_parts else None
+    stem = stem or input_path.stem
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", stem).strip("-._")
     return stem or "input"
 
 
-def _default_full_project_dir(input_path: Path) -> Path:
+def _default_full_project_dir(input_path: Path, *, merge_parts: bool = False) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return REPO_ROOT / "runs" / f"{timestamp}_{_safe_run_name(input_path)}"
+    return REPO_ROOT / "runs" / f"{timestamp}_{_safe_run_name(input_path, merge_parts=merge_parts)}"
 
 
 def _default_voice_bank_project_dir() -> Path:
@@ -407,10 +410,20 @@ def extract(
     input: Path = typer.Argument(..., help="Input media."),
     project: Path = typer.Option(..., "--project", "-p"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    merge_parts: bool = typer.Option(
+        False,
+        "--merge-parts",
+        help="Merge consecutive sibling files named <base>_1, <base>_2, ... into an audio-only source.",
+    ),
 ) -> None:
     """Extract stereo 48 kHz and Gemma mono 16 kHz audio."""
     try:
-        extract_step(input.expanduser().resolve(), project.expanduser().resolve(), confirm_rights)
+        extract_step(
+            input.expanduser().resolve(),
+            project.expanduser().resolve(),
+            confirm_rights,
+            merge_parts=merge_parts,
+        )
     except RightsError as exc:
         _handle_error(exc)
     except Exception as exc:
@@ -547,6 +560,21 @@ def translate_ko_cmd(
         "--force-retranslate",
         help="Ignore existing Korean translations and regenerate translate-ko artifacts.",
     ),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Retry segments currently marked needs_manual_review or failed when source text exists.",
+    ),
+    repair_only: bool = typer.Option(
+        False,
+        "--repair-only",
+        help="Only run deterministic translate-ko repairs and diagnostics on existing translations.",
+    ),
+    force_retranslate_failed: bool = typer.Option(
+        False,
+        "--force-retranslate-failed",
+        help="When used with --retry-failed, discard existing failed translations before retrying.",
+    ),
 ) -> None:
     """Translate source scripts to Korean with text-only Gemma."""
     try:
@@ -555,6 +583,9 @@ def translate_ko_cmd(
             gemma_text_backend,
             confirm_rights=confirm_rights,
             force_retranslate=force_retranslate,
+            retry_failed=retry_failed,
+            repair_only=repair_only,
+            force_retranslate_failed=force_retranslate_failed,
         )
     except Exception as exc:
         _handle_error(exc)
@@ -1037,6 +1068,11 @@ def run(
     input: Path = typer.Argument(..., help="Input media."),
     project: Path = typer.Option(..., "--project", "-p"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    merge_parts: bool = typer.Option(
+        False,
+        "--merge-parts",
+        help="Merge consecutive sibling files named <base>_1, <base>_2, ... into an audio-only source.",
+    ),
     mock: bool = typer.Option(False, "--mock", help="Use mock Gemma and mock TTS."),
     gemma_backend: str = typer.Option("mock", "--gemma-backend", help="mock|hf|http|llama_cpp"),
     target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
@@ -1100,6 +1136,7 @@ def run(
             gsv_few_shot_force=gsv_few_shot_force,
             voice_bank_path=voice_bank,
             require_voice_bank=require_voice_bank,
+            merge_input_parts=merge_parts,
         )
     except Exception as exc:
         _handle_error(exc)
@@ -1116,6 +1153,11 @@ def full(
         help="Project directory. Defaults to runs/<timestamp>_<input-stem>.",
     ),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    merge_parts: bool = typer.Option(
+        False,
+        "--merge-parts",
+        help="Merge consecutive sibling files named <base>_1, <base>_2, ... into an audio-only source.",
+    ),
     real: bool = typer.Option(
         False,
         "--real",
@@ -1221,7 +1263,7 @@ def full(
     if not confirm_rights:
         _handle_error(RightsError(RIGHTS_MESSAGE))
     input_path = input.expanduser().resolve()
-    project_dir = project.expanduser().resolve() if project else _default_full_project_dir(input_path)
+    project_dir = project.expanduser().resolve() if project else _default_full_project_dir(input_path, merge_parts=merge_parts)
     cache_lines = _configure_local_model_cache()
     if cache_status:
         for line in cache_lines:
@@ -1266,6 +1308,7 @@ def full(
             require_voice_bank=require_voice_bank,
             source_separation_cache_project=source_separation_cache_project,
             regenerate_before_mix=real,
+            merge_input_parts=merge_parts,
         )
     except Exception as exc:
         _handle_error(exc)

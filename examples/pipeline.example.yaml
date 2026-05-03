@@ -51,8 +51,8 @@ gemma_llama_cpp_cli_path: .cache/llama_cpp/src/llama.cpp/build/bin/llama-mtmd-cl
 gemma_llama_cpp_ctx_size: 4096
 gemma_llama_cpp_extra_args: []
 gemma_llama_cpp_gpu_layers: 999
-gemma_llama_cpp_mmproj_path: .cache/llama_cpp/models/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf
-gemma_llama_cpp_model_path: .cache/llama_cpp/models/mudler/gemma-4-26B-A4B-it-heretic-APEX-GGUF/gemma-4-26B-A4B-heretic-APEX-I-Mini.gguf
+gemma_llama_cpp_mmproj_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf
+gemma_llama_cpp_model_path: ~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/gemma-4-E4B-it-OBLITERATED-Q8_0.gguf
 gemma_llama_cpp_n_predict: 1024
 gemma_llama_cpp_seed: 12345
 gemma_llama_cpp_temperature: 0.0
