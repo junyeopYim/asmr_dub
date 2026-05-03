@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import socket
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from asmr_dub_pipeline.gemma import text_server as text_server_module
 from asmr_dub_pipeline.gemma.text_server import (
@@ -31,6 +34,36 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             Handler.hits += 1
             self.send_response(200 if Handler.hits >= 3 else 503)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+""".strip()
+        + "\n",
+        "utf-8",
+    )
+
+
+def write_parent_with_child_ready_server(path: Path) -> None:
+    path.write_text(
+        """
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import subprocess
+import sys
+
+marker_path = sys.argv[2]
+child_code = "import pathlib, sys, time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text('alive', encoding='utf-8')"
+subprocess.Popen([sys.executable, "-c", child_code, marker_path])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
             self.end_headers()
             return
         self.send_response(404)
@@ -93,3 +126,27 @@ def test_managed_gemma_text_server_waits_for_http_readiness(tmp_path: Path) -> N
 
     assert manager.process is not None
     assert manager.process.poll() is not None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX process groups")
+def test_managed_gemma_text_server_stop_kills_child_process_group(tmp_path: Path) -> None:
+    port = free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    marker_path = tmp_path / "child_survived.txt"
+    script = tmp_path / "parent_server.py"
+    write_parent_with_child_ready_server(script)
+
+    manager = ManagedGemmaTextServer(
+        enabled=True,
+        base_url=base_url,
+        command=[sys.executable, str(script), str(port), str(marker_path)],
+        startup_timeout_sec=5,
+        shutdown_timeout_sec=1,
+    )
+
+    with manager:
+        assert manager.started is True
+        assert is_http_ready(base_url)
+
+    time.sleep(1.2)
+    assert not marker_path.exists()

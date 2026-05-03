@@ -10,6 +10,12 @@ from urllib.parse import urlparse
 
 import httpx
 
+from asmr_dub_pipeline.process import (
+    popen_process_group_kwargs,
+    tail_file,
+    terminate_process_group,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_LLAMA_SERVER = (
@@ -127,11 +133,7 @@ def _normalize_command(command: Sequence[str] | str | None) -> list[str]:
 
 
 def _tail(path: Path, max_chars: int = 2000) -> str:
-    try:
-        text = path.read_text("utf-8", errors="replace")
-    except OSError:
-        return ""
-    return text[-max_chars:]
+    return tail_file(path, max_chars=max_chars)
 
 
 class ManagedGemmaTextServer:
@@ -167,7 +169,9 @@ class ManagedGemmaTextServer:
                     f"Gemma text server exited before becoming ready with code "
                     f"{self.process.returncode}.{details}"
                 )
-            time.sleep(0.5)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.5, remaining))
         details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
         if self.process is not None:
             self.stop()
@@ -178,6 +182,9 @@ class ManagedGemmaTextServer:
 
     def start(self) -> ManagedGemmaTextServer:
         if not self.enabled:
+            return self
+        if is_http_ready(self.base_url):
+            self.reused_existing = True
             return self
         if is_tcp_open(self.base_url):
             self.reused_existing = True
@@ -199,7 +206,13 @@ class ManagedGemmaTextServer:
             stdout = subprocess.DEVNULL
             stderr = subprocess.DEVNULL
         try:
-            self.process = subprocess.Popen(self.command, stdout=stdout, stderr=stderr, text=True)
+            self.process = subprocess.Popen(
+                self.command,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                **popen_process_group_kwargs(),
+            )
         except OSError as exc:
             self._close_log()
             raise GemmaTextServerError(f"Could not start Gemma text server: {exc}") from exc
@@ -211,12 +224,11 @@ class ManagedGemmaTextServer:
             self._close_log()
             return
         if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=self.shutdown_timeout_sec)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+            terminate_process_group(
+                self.process,
+                terminate_timeout_sec=self.shutdown_timeout_sec,
+                kill_timeout_sec=5,
+            )
         self._close_log()
 
     def _close_log(self) -> None:

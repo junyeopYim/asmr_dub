@@ -65,8 +65,10 @@ asmr-dub synth --project ./project --gsv-url http://127.0.0.1:9880 --refs refs/r
 
 For one-command real runs, `full --real` can manage a local GPT-SoVITS server
 for the duration of the pipeline. It first checks whether `gsv_url` is already
-listening; if so, it reuses that process and does not shut it down. If not, it
-starts the configured command and terminates only the process it started when
+HTTP-ready; if so, it reuses that process and does not shut it down. If the
+port is open but the HTTP API is not ready, it waits up to the configured
+startup timeout and reports the server log tail on failure. If not, it starts
+the configured command and terminates only the process group it started when
 the run finishes. Real runs now default to few-shot GPT-SoVITS: the pipeline
 collects about 60 seconds of transcribed source segments, writes a project-local
 training set, runs GPT-SoVITS prepare/train scripts, loads the resulting

@@ -619,7 +619,7 @@ def synth(
     auto_gsv_server: bool = typer.Option(
         False,
         "--auto-gsv-server/--no-auto-gsv-server",
-        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already listening.",
+        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already HTTP-ready.",
     ),
     gsv_server_command: str | None = typer.Option(
         None,
@@ -801,7 +801,7 @@ def regenerate(
     auto_gsv_server: bool = typer.Option(
         False,
         "--auto-gsv-server/--no-auto-gsv-server",
-        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already listening.",
+        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already HTTP-ready.",
     ),
     gsv_server_command: str | None = typer.Option(
         None,
@@ -1084,7 +1084,7 @@ def run(
     auto_gsv_server: bool = typer.Option(
         False,
         "--auto-gsv-server/--no-auto-gsv-server",
-        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already listening.",
+        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already HTTP-ready.",
     ),
     gsv_server_command: str | None = typer.Option(
         None,
@@ -1217,7 +1217,7 @@ def full(
     auto_gsv_server: bool = typer.Option(
         True,
         "--auto-gsv-server/--no-auto-gsv-server",
-        help="Start a local GPT-SoVITS api_v2 server if --real needs it and gsv_url is not already listening.",
+        help="Start a local GPT-SoVITS api_v2 server if --real needs it and gsv_url is not already HTTP-ready.",
     ),
     gsv_server_command: str | None = typer.Option(
         None,

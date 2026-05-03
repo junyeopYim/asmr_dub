@@ -12,7 +12,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
 import yaml
+
+from asmr_dub_pipeline.process import (
+    popen_process_group_kwargs,
+    tail_file,
+    terminate_process_group,
+)
 
 from .client import GPTSoVITSError
 
@@ -44,6 +51,20 @@ def is_tcp_open(base_url: str, timeout_sec: float = 0.3) -> bool:
             return True
     except OSError:
         return False
+
+
+def is_http_ready(base_url: str, timeout_sec: float = 0.5) -> bool:
+    if not is_tcp_open(base_url, timeout_sec=timeout_sec):
+        return False
+    with httpx.Client(timeout=timeout_sec) as client:
+        for path in ("/docs", "/openapi.json", "/tts"):
+            try:
+                response = client.get(f"{base_url.rstrip('/')}{path}")
+            except httpx.HTTPError:
+                continue
+            if response.status_code < 500 and response.status_code != 404:
+                return True
+    return False
 
 
 def _dedupe_text(values: Sequence[str]) -> list[str]:
@@ -199,11 +220,7 @@ def _gsv_subprocess_env() -> dict[str, str]:
 
 
 def _tail(path: Path, max_chars: int = 2000) -> str:
-    try:
-        text = path.read_text("utf-8", errors="replace")
-    except OSError:
-        return ""
-    return text[-max_chars:]
+    return tail_file(path, max_chars=max_chars)
 
 
 class ManagedGPTSoVITSServer:
@@ -230,12 +247,37 @@ class ManagedGPTSoVITSServer:
         self.reused_existing = False
         self._log_file = None
 
+    def _wait_until_ready(self, deadline: float) -> ManagedGPTSoVITSServer:
+        while time.monotonic() < deadline:
+            if is_http_ready(self.base_url):
+                return self
+            if self.process is not None and self.process.poll() is not None:
+                details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
+                self._close_log()
+                raise GPTSoVITSError(
+                    f"GPT-SoVITS server exited before becoming ready with code "
+                    f"{self.process.returncode}.{details}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.5, remaining))
+        details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
+        if self.process is not None:
+            self.stop()
+        raise GPTSoVITSError(
+            f"GPT-SoVITS server did not become ready at {self.base_url} within "
+            f"{self.startup_timeout_sec:g}s.{details}"
+        )
+
     def start(self) -> ManagedGPTSoVITSServer:
         if not self.enabled:
             return self
-        if is_tcp_open(self.base_url):
+        if is_http_ready(self.base_url):
             self.reused_existing = True
             return self
+        if is_tcp_open(self.base_url):
+            self.reused_existing = True
+            return self._wait_until_ready(time.monotonic() + self.startup_timeout_sec)
         if not is_local_gsv_url(self.base_url):
             raise GPTSoVITSError(
                 f"GPT-SoVITS auto-start only supports local URLs; got {self.base_url}"
@@ -261,41 +303,24 @@ class ManagedGPTSoVITSServer:
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
+                **popen_process_group_kwargs(),
             )
         except OSError as exc:
             self._close_log()
             raise GPTSoVITSError(f"Could not start GPT-SoVITS server: {exc}") from exc
         self.started = True
-        deadline = time.monotonic() + self.startup_timeout_sec
-        while time.monotonic() < deadline:
-            if is_tcp_open(self.base_url):
-                return self
-            if self.process.poll() is not None:
-                details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
-                self._close_log()
-                raise GPTSoVITSError(
-                    f"GPT-SoVITS server exited before becoming ready with code "
-                    f"{self.process.returncode}.{details}"
-                )
-            time.sleep(0.5)
-        details = f"\nServer log tail:\n{_tail(self.log_path)}" if self.log_path else ""
-        self.stop()
-        raise GPTSoVITSError(
-            f"GPT-SoVITS server did not open {self.base_url} within "
-            f"{self.startup_timeout_sec:g}s.{details}"
-        )
+        return self._wait_until_ready(time.monotonic() + self.startup_timeout_sec)
 
     def stop(self) -> None:
         if self.process is None:
             self._close_log()
             return
         if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=self.shutdown_timeout_sec)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+            terminate_process_group(
+                self.process,
+                terminate_timeout_sec=self.shutdown_timeout_sec,
+                kill_timeout_sec=5,
+            )
         self._close_log()
 
     def _close_log(self) -> None:

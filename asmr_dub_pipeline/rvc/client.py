@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +13,11 @@ from typing import Any
 from rich.markup import escape
 
 from asmr_dub_pipeline.logging import console
+from asmr_dub_pipeline.process import (
+    popen_process_group_kwargs,
+    tail_text,
+    terminate_process_group,
+)
 from asmr_dub_pipeline.schemas import ProjectConfig, RVCProfile, Segment
 
 SUPPORTED_PLACEHOLDERS = {
@@ -90,38 +93,15 @@ class RVCTrainResult:
 
 
 def _tail(text: str | bytes | None, limit: int = 1200) -> str:
-    if text is None:
-        return ""
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", errors="replace")
-    return text.strip()[-limit:]
+    return tail_text(text, limit=limit)
 
 
 def _popen_process_group_kwargs() -> dict[str, bool]:
-    return {"start_new_session": True} if os.name != "nt" else {}
+    return popen_process_group_kwargs()
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        if os.name != "nt":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            if os.name != "nt":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            return
-        process.wait()
+    terminate_process_group(process, terminate_timeout_sec=5)
 
 
 def _run_subprocess(
