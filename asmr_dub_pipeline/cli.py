@@ -59,6 +59,8 @@ DEFAULT_VOICE_BANK_PROJECT_NAME = "voice_bank_all"
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
     "asr_preset": "whisper",
+    "asr_batched_inference": True,
+    "asr_batch_size": 16,
     "asr_diagnostics_enabled": True,
     "asr_review_enabled": True,
     "asr_review_generate_candidates": True,
