@@ -67,6 +67,8 @@ class FasterWhisperASRBackend(ASRBackend):
         vad_parameters: dict[str, object] | None = None,
         word_timestamps: bool = False,
         hallucination_silence_threshold: float | None = None,
+        initial_prompt: str | None = None,
+        hotwords: str | None = None,
     ) -> None:
         self.model_id = model_id
         self.language = language
@@ -78,6 +80,8 @@ class FasterWhisperASRBackend(ASRBackend):
         self.vad_parameters = vad_parameters or {}
         self.word_timestamps = word_timestamps
         self.hallucination_silence_threshold = hallucination_silence_threshold
+        self.initial_prompt = initial_prompt.strip() if initial_prompt else None
+        self.hotwords = hotwords.strip() if hotwords else None
         self._model: Any | None = None
 
     def _get_model(self) -> Any:
@@ -118,6 +122,8 @@ class FasterWhisperASRBackend(ASRBackend):
             "vad_parameters": self.vad_parameters or None,
             "word_timestamps": self.word_timestamps,
             "hallucination_silence_threshold": self.hallucination_silence_threshold,
+            "initial_prompt": self.initial_prompt,
+            "hotwords": self.hotwords,
         }
         options.update(overrides)
         try:

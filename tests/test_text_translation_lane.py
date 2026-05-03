@@ -198,6 +198,10 @@ def test_transcribe_asr_text_review_mock_selects_domain_candidate(
     summary = json.loads(Path(manifest.artifacts["asr_text_review_summary"]).read_text("utf-8"))
     assert summary["attempted"] == 1
     assert summary["replaced"] == 1
+    assert summary["items"][0]["candidates"] == [
+        {"candidate_id": "original", "text": "もっと大きな手帳が来る"},
+        {"candidate_id": "domain_replacement", "text": "もっと大きな絶頂が来る"},
+    ]
 
 
 def test_asr_text_review_generates_retranscribe_candidates(
@@ -240,6 +244,38 @@ def test_asr_text_review_generates_retranscribe_candidates(
     assert generated == 1
     assert len(calls) == 2
     assert any(candidate["text"] == "もっと大きな絶頂が来る" for candidate in item["candidates"])
+
+
+def test_asr_text_review_default_candidates_are_unprompted() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+
+    option_rows = pipeline_steps._generated_asr_review_candidate_options(cfg)
+
+    assert option_rows
+    assert all("prompted" not in option_id for option_id, _padding, _overrides in option_rows)
+    assert all(overrides["initial_prompt"] is None for _option_id, _padding, overrides in option_rows)
+    assert all(overrides["hotwords"] is None for _option_id, _padding, overrides in option_rows)
+
+
+def test_asr_prompt_leak_filter_rejects_video_outro_text() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+
+    leaked = pipeline_steps._asr_candidate_looks_prompt_leaked(
+        "次の動画でお会いしましょう。",
+        cfg,
+    )
+
+    assert leaked is True
+
+
+def test_asr_text_review_replacements_include_observed_adult_asr_artifacts() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+
+    assert cfg.asr_text_review_candidate_replacements["めず行きセックス"] == "メスイキセックス"
+    assert cfg.asr_text_review_candidate_replacements["薄引き"] == "メスイキ"
+    assert cfg.asr_text_review_candidate_replacements["グリドリス"] == "クリトリス"
+    assert cfg.asr_text_review_candidate_replacements["お孫"] == "おまんこ"
+    assert "めず行き" in cfg.asr_text_review_suspicious_text_patterns
 
 
 def test_translation_asr_backcheck_flags_suspicious_korean_smell() -> None:
@@ -411,6 +447,195 @@ def test_asr_repair_replaces_suspicious_chunk_with_no_vad_candidate(
     assert sliced_paths
     assert backend.calls[0][1]["vad_filter"] is False
     assert backend.calls[0][1]["vad_parameters"] is None
+    assert backend.calls[0][1]["initial_prompt"] is None
+    assert backend.calls[0][1]["hotwords"] is None
+
+
+def test_asr_repair_splits_long_suspicious_group_before_retranscribe(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((80 * 16_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+    slices: list[tuple[float, float]] = []
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, sample_rate, channels
+        slices.append((start, end))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class FakeBackend:
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments, kwargs
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=12.0,
+                    text="絶頂が来る " * 8,
+                    language="ja",
+                    confidence=0.99,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    original = ASRChunk(
+        start=0.0,
+        end=65.0,
+        text="釣りが来る " * 40,
+        language="ja",
+        confidence=0.7,
+    )
+    cfg = ProjectConfig(
+        project_name=tmp_project_dir.name,
+        asr_resegment_max_sec=20.0,
+        asr_repair_padding_sec=1.0,
+        asr_repair_max_chunks=10,
+    )
+
+    _repaired, summary = pipeline_steps._repair_asr_chunks(
+        [original],
+        backend=FakeBackend(),
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=80.0,
+        cfg=cfg,
+    )
+
+    assert summary["attempted"] == 4
+    assert len(slices) == 4
+    assert all(end - start <= cfg.asr_resegment_max_sec + cfg.asr_repair_padding_sec * 2 for start, end in slices)
+
+
+def test_asr_repair_rejects_prompt_leaked_candidate(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((16_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, start, end, sample_rate, channels
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class FakeBackend:
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments, kwargs
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=8.0,
+                    text="気持ちいい イっちゃう 飛んじゃってください さくら ジンジン 痺れる",
+                    language="ja",
+                    confidence=0.99,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    original = ASRChunk(start=10.0, end=18.0, text="釣りが来ちゃう", language="ja", confidence=0.8)
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [original],
+        backend=FakeBackend(),
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=30.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+    )
+
+    assert summary["attempted"] == 1
+    assert summary["repaired"] == 0
+    assert summary["items"][0]["accepted"] is False
+    assert summary["items"][0]["prompt_leaked"] is True
+    assert repaired == [original]
+
+
+def test_asr_repair_rejects_generic_hallucination_candidate(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((16_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, start, end, sample_rate, channels
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class FakeBackend:
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments, kwargs
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=12.0,
+                    text="ご視聴ありがとうございました おやすみ なさい おやすみ なさい",
+                    language="ja",
+                    confidence=0.99,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    original = ASRChunk(start=10.0, end=22.0, text="強くたま", language="ja", confidence=0.8)
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [original],
+        backend=FakeBackend(),
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=30.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+    )
+
+    assert summary["attempted"] == 1
+    assert summary["repaired"] == 0
+    assert summary["items"][0]["accepted"] is False
+    assert summary["items"][0]["prompt_leaked"] is True
+    assert repaired == [original]
 
 
 def test_asr_text_replacements_normalize_known_domain_mishears() -> None:

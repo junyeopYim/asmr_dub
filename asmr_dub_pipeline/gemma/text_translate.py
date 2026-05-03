@@ -446,12 +446,15 @@ def build_asr_text_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: s
         "judge only from candidates, adjacent context, timing, and the ASMR glossary. Never invent "
         "new Japanese text. For each input item, choose only one candidate_id from candidates. "
         "Use decision='replace' only when a non-original candidate is clearly better in this "
-        "ASMR context; use decision='keep' when original is best; use decision='manual_review' "
-        "when candidates are insufficient or ambiguous. Each output item must contain only "
+        "ASMR context; use decision='keep' when original is best or when the item is only a short "
+        "moan, hesitation, or repeated exclamation with no clearly better candidate. Use "
+        "decision='manual_review' only as a last resort when every candidate is unusable and the "
+        "uncertainty changes translation meaning. Each output item must contain only "
         "chunk_id, decision, selected_candidate_id, confidence, reason, and risk_terms. "
         "confidence must be 0.0 to 1.0. risk_terms must be a short array of suspicious source "
         "terms, or an empty array. Prefer ASMR-domain readings such as 絶頂, 媚薬, 耳舐め, 暗示, "
-        "快感, and 10数える when the surrounding context clearly supports them.\n"
+        "快感, 10数える, メスイキ, クリトリス, おまんこ, and 出会いアプリ when the surrounding "
+        "context clearly supports them.\n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 

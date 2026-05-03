@@ -825,6 +825,44 @@ def _asr_repair_candidate_is_better(
     return candidate_density > max(original_density * 1.2, sparse_min_chars_per_sec)
 
 
+ASR_PROMPT_LEAK_MARKERS = (
+    "Sound Hodori",
+    "사운드",
+    "호돌이",
+    "Instagram",
+    "Twitter",
+    "ご視聴",
+    "ありがとうございました",
+    "次の動画",
+    "お会いしましょう",
+    "チャンネル登録",
+    "高評価",
+    "Serviceman",
+    "iling",
+    "İ",
+    "さくら ジンジン 痺れる",
+    "気持ちいい イっちゃう 飛んじゃってください",
+)
+
+
+def _asr_candidate_looks_prompt_leaked(text: str, cfg: Any) -> bool:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in ASR_PROMPT_LEAK_MARKERS):
+        return True
+    if normalized.count("おやすみ") >= 2:
+        return True
+    prompt = str(getattr(cfg, "asr_initial_prompt", "") or "").strip()
+    if prompt and prompt in normalized:
+        return True
+    review_prompt = str(getattr(cfg, "asr_text_review_initial_prompt", "") or "").strip()
+    if review_prompt and review_prompt in normalized:
+        return True
+    hotwords = str(getattr(cfg, "asr_hotwords", "") or "").strip()
+    return bool(hotwords and hotwords in normalized)
+
+
 def _transcribe_with_backend_options(
     backend: Any,
     audio_path: Path,
@@ -835,6 +873,26 @@ def _transcribe_with_backend_options(
     if callable(method):
         return method(audio_path, segments, **overrides)
     return backend.transcribe(audio_path, segments)
+
+
+def _split_asr_chunks_for_repair(
+    chunks: list[ASRChunk],
+    *,
+    audio_duration_sec: float,
+    max_chunk_sec: float,
+) -> list[ASRChunk]:
+    repair_chunks: list[ASRChunk] = []
+    for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
+        text = chunk.text.strip()
+        if not text:
+            continue
+        start = max(0.0, float(chunk.start))
+        end = min(float(audio_duration_sec), max(start, float(chunk.end)))
+        if end - start <= 0.05:
+            continue
+        normalized = chunk.model_copy(update={"start": start, "end": end, "text": text})
+        repair_chunks.extend(_split_long_asr_chunk(normalized, max_chunk_sec=max_chunk_sec))
+    return repair_chunks
 
 
 def _repair_asr_chunks(
@@ -863,7 +921,13 @@ def _repair_asr_chunks(
     repair_groups: list[tuple[bool, list[ASRChunk]]] = []
     current_repair_group: list[ASRChunk] = []
     repair_group_gap_sec = max(1.0, float(getattr(cfg, "asr_resegment_merge_gap_sec", 1.0)))
-    for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
+    repair_group_max_sec = max(1.0, float(getattr(cfg, "asr_resegment_max_sec", 20.0)))
+    repair_input_chunks = _split_asr_chunks_for_repair(
+        chunks,
+        audio_duration_sec=audio_duration_sec,
+        max_chunk_sec=repair_group_max_sec,
+    )
+    for chunk in repair_input_chunks:
         needs_repair = _asr_chunk_needs_repair(
             chunk,
             confidence_threshold=cfg.asr_repair_confidence_threshold,
@@ -872,7 +936,15 @@ def _repair_asr_chunks(
             suspicious_text_patterns=cfg.asr_repair_suspicious_text_patterns,
         )
         if needs_repair:
-            if current_repair_group and chunk.start - current_repair_group[-1].end > repair_group_gap_sec:
+            would_exceed_max = (
+                bool(current_repair_group)
+                and chunk.end - current_repair_group[0].start > repair_group_max_sec
+            )
+            gap_too_large = (
+                bool(current_repair_group)
+                and chunk.start - current_repair_group[-1].end > repair_group_gap_sec
+            )
+            if current_repair_group and (gap_too_large or would_exceed_max):
                 repair_groups.append((True, current_repair_group))
                 current_repair_group = []
             current_repair_group.append(chunk)
@@ -919,7 +991,11 @@ def _repair_asr_chunks(
             condition_on_previous_text=False,
             word_timestamps=False,
             hallucination_silence_threshold=None,
+            initial_prompt=None,
+            hotwords=None,
         )
+        candidate_text = _asr_candidate_text(candidate_local)
+        prompt_leaked = _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
         candidate_abs = [
             candidate.model_copy(
                 update={
@@ -951,11 +1027,14 @@ def _repair_asr_chunks(
             sparse_min_chars_per_sec=cfg.asr_repair_sparse_min_chars_per_sec,
             suspicious_text_patterns=cfg.asr_repair_suspicious_text_patterns,
         )
+        if prompt_leaked:
+            accepted = False
         summary["items"].append(
             {
                 "start": round(group_start, 3),
                 "end": round(group_end, 3),
                 "accepted": accepted,
+                "prompt_leaked": prompt_leaked,
                 "original_text": original.text,
                 "candidate_text": _asr_candidate_text(candidate_abs),
             }
@@ -1096,6 +1175,8 @@ def _generated_asr_review_candidate_options(cfg: Any) -> list[tuple[str, float, 
             "condition_on_previous_text": False,
             "word_timestamps": False,
             "hallucination_silence_threshold": None,
+            "initial_prompt": None,
+            "hotwords": None,
         }
         options.append((f"asr_no_vad_pad_{index}", padding_sec, base_options))
         if prompt:
@@ -1150,6 +1231,8 @@ def _add_generated_asr_review_candidates(
             except Exception:
                 continue
             candidate_text = _asr_candidate_text(candidate_chunks)
+            if _asr_candidate_looks_prompt_leaked(candidate_text, cfg):
+                continue
             if _append_unique_asr_review_candidate(
                 item,
                 candidate_id=option_id,
@@ -1305,6 +1388,7 @@ def _review_asr_chunks_with_text_model(
                 "confidence": confidence,
                 "original_text": candidate_by_id.get("original", ""),
                 "selected_text": selected_text,
+                "candidates": list(item.get("candidates", [])),
                 "reason": review.get("reason"),
                 "risk_terms": review.get("risk_terms", []),
                 "suspicious_patterns": item.get("suspicious_patterns", []),
@@ -2272,6 +2356,8 @@ def _asr_backend_config(cfg: Any) -> dict[str, Any]:
         "vad_parameters": cfg.asr_vad_parameters,
         "word_timestamps": cfg.asr_word_timestamps,
         "hallucination_silence_threshold": cfg.asr_hallucination_silence_threshold,
+        "initial_prompt": cfg.asr_initial_prompt,
+        "hotwords": cfg.asr_hotwords,
         "qwen_model_id": cfg.qwen_asr_model_id,
         "qwen_forced_aligner_model_id": cfg.qwen_asr_forced_aligner_model_id,
         "qwen_device_map": cfg.qwen_asr_device_map,

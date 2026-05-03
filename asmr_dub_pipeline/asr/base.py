@@ -103,6 +103,8 @@ def create_asr_backend(kind: str, config: Mapping[str, Any] | None = None) -> AS
             vad_parameters=dict(config.get("vad_parameters") or {}),
             word_timestamps=bool(config.get("word_timestamps", False)),
             hallucination_silence_threshold=config.get("hallucination_silence_threshold"),
+            initial_prompt=str(config.get("initial_prompt") or "") or None,
+            hotwords=str(config.get("hotwords") or "") or None,
         )
     if normalized == "qwen_asr":
         from .qwen_asr import QwenASRBackend

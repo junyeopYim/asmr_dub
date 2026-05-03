@@ -269,6 +269,12 @@ class ProjectConfig(StrictBaseModel):
     )
     asr_word_timestamps: bool = False
     asr_hallucination_silence_threshold: float | None = Field(default=None, gt=0)
+    asr_initial_prompt: str = ""
+    asr_hotwords: str = (
+        "絶頂 媚薬 耳舐め 耳なめ 暗示 快感 10数える 飛んじゃってください "
+        "気持ちいい イっちゃう さくら ジンジン 痺れる ザーメン 先走り液 "
+        "メスイキ クリトリス おまんこ おちんぽ 精液 潮吹き 出会いアプリ スケベ"
+    )
     qwen_asr_model_id: str = "Qwen/Qwen3-ASR-1.7B"
     qwen_asr_forced_aligner_model_id: str | None = "Qwen/Qwen3-ForcedAligner-0.6B"
     qwen_asr_device_map: str = "cuda:0"
@@ -331,6 +337,25 @@ class ProjectConfig(StrictBaseModel):
             "触れおご",
             "溢れおご",
             "そんなお腹",
+            "チンジン",
+            "ビレる",
+            "アクラ",
+            "ネイジー",
+            "シャクラ",
+            "ツアメ",
+            "先走り駅",
+            "鷹…お顔",
+            "1個1個1個",
+            "めず行き",
+            "薄引き",
+            "グリドリス",
+            "グリドレス",
+            "グリトリス",
+            "クリキュス",
+            "チンポン",
+            "お孫",
+            "活アプリ",
+            "スケベン",
         ]
     )
     asr_text_replacements: dict[str, str] = Field(
@@ -356,10 +381,7 @@ class ProjectConfig(StrictBaseModel):
     asr_text_review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
     asr_text_review_generate_candidates: bool = True
     asr_text_review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
-    asr_text_review_initial_prompt: str = (
-        "Japanese ASMR hypnosis dialogue vocabulary: 絶頂, 媚薬, 耳舐め, 耳なめ, "
-        "暗示, 快感, 10数える, 飛んじゃってください."
-    )
+    asr_text_review_initial_prompt: str = ""
     asr_text_review_suspicious_text_patterns: list[str] = Field(
         default_factory=lambda: [
             "釣り",
@@ -380,6 +402,25 @@ class ProjectConfig(StrictBaseModel):
             "稲目",
             "あんじゅ",
             "暗ん示",
+            "チンジン",
+            "ビレる",
+            "アクラ",
+            "ネイジー",
+            "シャクラ",
+            "ツアメ",
+            "先走り駅",
+            "鷹…お顔",
+            "1個1個1個",
+            "めず行き",
+            "薄引き",
+            "グリドリス",
+            "グリドレス",
+            "グリトリス",
+            "クリキュス",
+            "チンポン",
+            "お孫",
+            "活アプリ",
+            "スケベン",
         ]
     )
     asr_text_review_candidate_replacements: dict[str, str] = Field(
@@ -403,6 +444,26 @@ class ProjectConfig(StrictBaseModel):
             "びよく": "媚薬",
             "あんじゅ": "暗示",
             "暗ん示": "暗示",
+            "チンジン": "ジンジン",
+            "ビレる": "痺れる",
+            "アクラ": "さくら",
+            "ネイジー": "イメージ",
+            "シャクラ": "さくら",
+            "ツアメ": "ザーメン",
+            "先走り駅": "先走り液",
+            "1個1個1個": "一滴一滴",
+            "めず行きセックス": "メスイキセックス",
+            "めず行き": "メスイキ",
+            "薄引きセックス": "メスイキセックス",
+            "薄引き": "メスイキ",
+            "グリドリス": "クリトリス",
+            "グリドレス": "クリトリス",
+            "グリトリス": "クリトリス",
+            "クリキュス": "クリトリス",
+            "チンポン": "チンポ",
+            "お孫": "おまんこ",
+            "活アプリ": "出会いアプリ",
+            "スケベン": "スケベ",
         }
     )
     asr_translation_backcheck_enabled: bool = True
@@ -422,6 +483,25 @@ class ProjectConfig(StrictBaseModel):
             "美よく",
             "あんじゅ",
             "暗ん示",
+            "チンジン",
+            "ビレる",
+            "アクラ",
+            "ネイジー",
+            "シャクラ",
+            "ツアメ",
+            "先走り駅",
+            "鷹…お顔",
+            "1個1個1個",
+            "めず行き",
+            "薄引き",
+            "グリドリス",
+            "グリドレス",
+            "グリトリス",
+            "クリキュス",
+            "チンポン",
+            "お孫",
+            "活アプリ",
+            "スケベン",
         ]
     )
     asr_translation_backcheck_ko_patterns: list[str] = Field(

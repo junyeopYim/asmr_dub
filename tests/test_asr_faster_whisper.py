@@ -42,6 +42,8 @@ def test_create_faster_whisper_backend_passes_asr_options() -> None:
             "vad_parameters": {"min_silence_duration_ms": 250},
             "word_timestamps": True,
             "hallucination_silence_threshold": 0.8,
+            "initial_prompt": "絶頂 媚薬",
+            "hotwords": "絶頂 媚薬 耳舐め",
         },
     )
 
@@ -53,3 +55,5 @@ def test_create_faster_whisper_backend_passes_asr_options() -> None:
     assert backend.vad_parameters == {"min_silence_duration_ms": 250}
     assert backend.word_timestamps is True
     assert backend.hallucination_silence_threshold == 0.8
+    assert backend.initial_prompt == "絶頂 媚薬"
+    assert backend.hotwords == "絶頂 媚薬 耳舐め"
