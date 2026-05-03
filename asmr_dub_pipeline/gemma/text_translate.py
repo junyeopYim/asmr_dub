@@ -27,10 +27,15 @@ _DIGIT_RE = re.compile(r"\d")
 _NON_SPEECH_SOURCE_RE = re.compile(r"^[\d\s,.;:!?！？、。・ー~〜…]+$")
 _NUMERIC_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 _UNSAFE_TTS_SYMBOL_RE = re.compile(r"[—–―“”‘’「」『』]")
+_ASR_REVIEW_COMPARE_DROP_RE = re.compile(r"[\s,.;:!?！？、。・ー~〜…'\"“”‘’「」『』（）()]+")
 
 
 def _strip_fence(text: str) -> str:
     return _FENCE_RE.sub(lambda match: match.group(1), text.strip()).strip()
+
+
+def _normalize_asr_review_compare_text(text: str) -> str:
+    return _ASR_REVIEW_COMPARE_DROP_RE.sub("", text).strip().casefold()
 
 
 def _balanced_arrays(text: str) -> list[str]:
@@ -165,7 +170,7 @@ def _coerce_review_decision(value: Any) -> str:
     return "manual_review"
 
 
-def parse_asr_text_review_response(
+def parse_asr_review_response(
     text: str,
     *,
     batch_id: str,
@@ -186,6 +191,7 @@ def parse_asr_text_review_response(
             "decision": _coerce_review_decision(item.get("decision")),
             "selected_candidate_id": selected_candidate_id,
             "confidence": _coerce_confidence(item.get("confidence")),
+            "heard_text": str(item.get("heard_text") or "").strip(),
             "reason": str(item.get("reason") or "").strip(),
             "risk_terms": _coerce_notes(item.get("risk_terms")),
             "model": str(item.get("model") or model),
@@ -435,33 +441,7 @@ def build_repair_prompt(
     )
 
 
-def build_asr_text_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: str) -> str:
-    payload = {
-        "batch_id": batch_id,
-        "task": "japanese_asr_candidate_review",
-        "domain": "user-authorized Japanese ASMR transcription",
-        "items": list(items),
-    }
-    return (
-        "Return exactly one valid JSON array and no markdown. You are reviewing Japanese ASR "
-        "text candidates for a user-authorized ASMR dubbing workflow. You cannot hear the audio; "
-        "judge only from candidates, adjacent context, timing, and the ASMR glossary. Never invent "
-        "new Japanese text. For each input item, choose only one candidate_id from candidates. "
-        "Use decision='replace' only when a non-original candidate is clearly better in this "
-        "ASMR context; use decision='keep' when original is best or when the item is only a short "
-        "moan, hesitation, or repeated exclamation with no clearly better candidate. Use "
-        "decision='manual_review' only as a last resort when every candidate is unusable and the "
-        "uncertainty changes translation meaning. Each output item must contain only "
-        "chunk_id, decision, selected_candidate_id, confidence, reason, and risk_terms. "
-        "confidence must be 0.0 to 1.0. risk_terms must be a short array of suspicious source "
-        "terms, or an empty array. Prefer ASMR-domain readings such as 絶頂, 媚薬, 耳舐め, 暗示, "
-        "快感, 10数える, メスイキ, クリトリス, おまんこ, and 出会いアプリ when the surrounding "
-        "context clearly supports them.\n"
-        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
-    )
-
-
-def build_asr_audio_text_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: str) -> str:
+def build_asr_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: str) -> str:
     prompt_items = [
         {key: value for key, value in item.items() if key not in {"audio_clip_path", "audio_clip"}}
         for item in items
@@ -475,15 +455,21 @@ def build_asr_audio_text_review_prompt(items: Sequence[Mapping[str, Any]], batch
     return (
         "Return exactly one valid JSON array and no markdown. You are reviewing Japanese ASR "
         "text candidates for a user-authorized ASMR dubbing workflow with the matching audio "
-        "attached to this request. Listen to the audio and use the provided candidates, adjacent "
-        "context, timing, confidence, and ASMR glossary to choose the best candidate. Do not "
-        "invent unrelated Japanese text. For each input item, choose only one candidate_id from "
-        "candidates. Use decision='replace' only when a non-original candidate is clearly better "
-        "than the original transcription; use decision='keep' when original is best or when the "
-        "item is only a short moan, hesitation, or repeated exclamation with no clearly better "
-        "candidate. Use decision='manual_review' only as a last resort when every candidate is "
+        "attached to this request. Treat the audio as the primary evidence. First, internally "
+        "transcribe the spoken Japanese in the audio. Then choose the candidate whose meaning and "
+        "wording are closest to that internal transcript. Candidate labels such as original, "
+        "repair, replacement, and ASR confidence are only supporting metadata; do not keep the "
+        "original merely because its confidence is high. Ignore harmless spacing and punctuation "
+        "differences. Do not invent unrelated Japanese text beyond a short heard_text transcript. "
+        "For each input item, write heard_text as the Japanese you hear in the audio, then choose "
+        "only one candidate_id from candidates. If selected_candidate_id is not 'original', decision must "
+        "be 'replace'. Use decision='replace' when a non-original candidate better matches the "
+        "audio than the original transcription; use decision='keep' only when selected_candidate_id "
+        "is 'original' and original is closest to the audio. Use decision='manual_review' only "
+        "when no candidate is close to the audio, and in that case selected_candidate_id must be "
+        "'original'. Treat manual_review as a last resort when every candidate is "
         "unusable and the uncertainty changes translation meaning. Each output item must contain "
-        "only chunk_id, decision, selected_candidate_id, confidence, reason, and risk_terms. "
+        "only chunk_id, heard_text, decision, selected_candidate_id, confidence, reason, and risk_terms. "
         "confidence must be 0.0 to 1.0. risk_terms must be a short array of suspicious source "
         "terms, or an empty array. Prefer ASMR-domain readings such as 絶頂, 媚薬, 耳舐め, 暗示, "
         "快感, 10数える, メスイキ, クリトリス, おまんこ, and 出会いアプリ only when the audio "
@@ -492,7 +478,7 @@ def build_asr_audio_text_review_prompt(items: Sequence[Mapping[str, Any]], batch
     )
 
 
-def build_asr_text_review_repair_prompt(
+def build_asr_review_repair_prompt(
     bad_response: str,
     error: str,
     batch_id: str,
@@ -500,13 +486,82 @@ def build_asr_text_review_repair_prompt(
 ) -> str:
     return (
         "Repair the previous ASR review response into exactly one valid JSON array. Each item "
-        "must contain only chunk_id, decision, selected_candidate_id, confidence, reason, and "
-        "risk_terms. selected_candidate_id must exactly match one candidate_id from the original "
-        "input item. Do not invent candidate text. "
+        "must contain only chunk_id, heard_text, decision, selected_candidate_id, confidence, reason, and "
+        "risk_terms. heard_text may be an empty string if absent from the previous response. "
+        "selected_candidate_id must exactly match one candidate_id from the original "
+        "input item. If selected_candidate_id is not 'original', decision must be 'replace'. "
+        "If decision is 'keep' or 'manual_review', selected_candidate_id must be 'original'. "
+        "If decision is 'replace', selected_candidate_id must not be 'original'. Do not invent "
+        "candidate text. "
         f"Batch id: {batch_id}. Validation error: {error}\nOriginal input:\n"
         f"{json.dumps({'items': list(items)}, ensure_ascii=False)}\nPrevious response:\n"
         f"{bad_response[:6000]}"
     )
+
+
+def _asr_review_consistency_errors(
+    reviews: Mapping[str, Mapping[str, Any]],
+    candidate_ids_by_chunk: Mapping[str, set[str]],
+) -> list[str]:
+    invalid: list[str] = []
+    for chunk_id, review in reviews.items():
+        selected_id = str(review.get("selected_candidate_id") or "")
+        decision = str(review.get("decision") or "")
+        if selected_id not in candidate_ids_by_chunk.get(chunk_id, set()):
+            invalid.append(f"{chunk_id}: invalid selected_candidate_id {selected_id}")
+        if decision == "replace" and selected_id == "original":
+            invalid.append(f"{chunk_id}: decision replace requires a non-original candidate")
+        if decision in {"keep", "manual_review"} and selected_id != "original":
+            invalid.append(f"{chunk_id}: decision {decision} requires selected_candidate_id original")
+    return invalid
+
+
+def _align_asr_review_with_heard_text(
+    reviews: dict[str, dict[str, Any]],
+    items: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    candidate_text_by_chunk: dict[str, dict[str, str]] = {}
+    for item in items:
+        chunk_id = str(item.get("chunk_id") or "")
+        candidate_text_by_chunk[chunk_id] = {
+            str(candidate.get("candidate_id")): str(candidate.get("text") or "")
+            for candidate in item.get("candidates", [])
+            if isinstance(candidate, Mapping)
+        }
+    aligned: dict[str, dict[str, Any]] = {}
+    for chunk_id, review in reviews.items():
+        heard_text = str(review.get("heard_text") or "")
+        normalized_heard = _normalize_asr_review_compare_text(heard_text)
+        if not normalized_heard:
+            aligned[chunk_id] = review
+            continue
+        candidate_texts = candidate_text_by_chunk.get(chunk_id, {})
+        original_text = candidate_texts.get("original", "")
+        normalized_original = _normalize_asr_review_compare_text(original_text)
+        if normalized_heard == normalized_original:
+            aligned[chunk_id] = review
+            continue
+        matched_id = next(
+            (
+                candidate_id
+                for candidate_id, text in candidate_texts.items()
+                if candidate_id != "original"
+                and _normalize_asr_review_compare_text(text) == normalized_heard
+            ),
+            None,
+        )
+        if matched_id is None:
+            aligned[chunk_id] = review
+            continue
+        confidence = review.get("confidence")
+        aligned[chunk_id] = {
+            **review,
+            "decision": "replace",
+            "selected_candidate_id": matched_id,
+            "confidence": confidence if confidence is not None else 0.9,
+            "reason": str(review.get("reason") or "heard_text matched a non-original candidate"),
+        }
+    return aligned
 
 
 class LlamaServerTranslationClient:
@@ -744,64 +799,6 @@ class LlamaServerTranslationClient:
             return self._translate_batch_single_pass(segments, batch_id, context_segments)
         return self._translate_batch_two_pass(segments, batch_id, context_segments)
 
-    def review_asr_candidates(
-        self,
-        items: Sequence[Mapping[str, Any]],
-        batch_id: str,
-    ) -> dict[str, dict[str, Any]]:
-        candidate_ids_by_chunk = {
-            str(item.get("chunk_id")): {
-                str(candidate.get("candidate_id"))
-                for candidate in item.get("candidates", [])
-                if isinstance(candidate, Mapping)
-            }
-            for item in items
-        }
-        prompt = build_asr_text_review_prompt(items, batch_id)
-        raw_response = ""
-        last_error: Exception | None = None
-        for attempt in range(self.retries + 1):
-            try:
-                raw_response = self._complete(
-                    prompt
-                    if attempt == 0
-                    else build_asr_text_review_repair_prompt(
-                        raw_response,
-                        str(last_error),
-                        batch_id,
-                        items,
-                    )
-                )
-                reviews = parse_asr_text_review_response(
-                    raw_response,
-                    batch_id=batch_id,
-                    model=self.model,
-                )
-                invalid = [
-                    f"{chunk_id}: invalid selected_candidate_id {review['selected_candidate_id']}"
-                    for chunk_id, review in reviews.items()
-                    if review["selected_candidate_id"] not in candidate_ids_by_chunk.get(chunk_id, set())
-                ]
-                if invalid:
-                    raise GemmaTextTranslationError("; ".join(invalid[:5]))
-                return {
-                    chunk_id: review
-                    for chunk_id, review in reviews.items()
-                    if chunk_id in candidate_ids_by_chunk
-                }
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_error = exc
-                if attempt < self.retries:
-                    time.sleep(0.2 * (attempt + 1))
-                    continue
-                break
-            except (ValueError, GemmaTextTranslationError) as exc:
-                last_error = exc
-                if attempt < self.retries:
-                    continue
-                break
-        raise GemmaTextTranslationError(f"Gemma ASR text review failed: {last_error}")
-
     def review_asr_candidates_with_audio(
         self,
         items: Sequence[Mapping[str, Any]],
@@ -818,33 +815,29 @@ class LlamaServerTranslationClient:
             }
             for item in items
         }
-        prompt = build_asr_audio_text_review_prompt(items, batch_id)
+        prompt = build_asr_review_prompt(items, batch_id)
         raw_response = ""
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
-                raw_response = (
-                    self._complete_with_input_audio(prompt, audio_path)
-                    if attempt == 0
-                    else self._complete(
-                        build_asr_text_review_repair_prompt(
+                if not raw_response:
+                    raw_response = self._complete_with_input_audio(prompt, audio_path)
+                else:
+                    raw_response = self._complete(
+                        build_asr_review_repair_prompt(
                             raw_response,
                             str(last_error),
                             batch_id,
                             items,
                         )
                     )
-                )
-                reviews = parse_asr_text_review_response(
+                reviews = parse_asr_review_response(
                     raw_response,
                     batch_id=batch_id,
                     model=self.model,
                 )
-                invalid = [
-                    f"{chunk_id}: invalid selected_candidate_id {review['selected_candidate_id']}"
-                    for chunk_id, review in reviews.items()
-                    if review["selected_candidate_id"] not in candidate_ids_by_chunk.get(chunk_id, set())
-                ]
+                reviews = _align_asr_review_with_heard_text(reviews, items)
+                invalid = _asr_review_consistency_errors(reviews, candidate_ids_by_chunk)
                 if invalid:
                     raise GemmaTextTranslationError("; ".join(invalid[:5]))
                 return {
@@ -888,7 +881,7 @@ class MockTranslationClient:
             )
         return result
 
-    def review_asr_candidates(
+    def review_asr_candidates_for_mock(
         self,
         items: Sequence[Mapping[str, Any]],
         batch_id: str,
@@ -927,4 +920,4 @@ class MockTranslationClient:
         audio_path: str | Path,
     ) -> dict[str, dict[str, Any]]:
         _ = audio_path
-        return self.review_asr_candidates(items, batch_id)
+        return self.review_asr_candidates_for_mock(items, batch_id)

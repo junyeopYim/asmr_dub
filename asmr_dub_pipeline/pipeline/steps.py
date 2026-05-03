@@ -784,14 +784,31 @@ def _apply_asr_text_replacements_to_chunks(
     return normalized_chunks, int(summary["chunks_changed"])
 
 
-def _replacement_hits(text: str, replacements: dict[str, str]) -> list[dict[str, Any]]:
+def _apply_text_replacements_with_hits(
+    text: str,
+    replacements: dict[str, str],
+    *,
+    max_passes: int = 3,
+) -> tuple[str, list[dict[str, Any]]]:
     hits: list[dict[str, Any]] = []
-    for source, target in replacements.items():
-        if not source:
-            continue
-        count = text.count(source)
-        if count > 0:
-            hits.append({"source": source, "target": target, "count": count})
+    normalized = text
+    for _ in range(max(1, max_passes)):
+        changed = False
+        for source, target in replacements.items():
+            if not source:
+                continue
+            count = normalized.count(source)
+            if count > 0:
+                hits.append({"source": source, "target": target, "count": count})
+                normalized = normalized.replace(source, target)
+                changed = True
+        if not changed:
+            break
+    return normalized, hits
+
+
+def _replacement_hits(text: str, replacements: dict[str, str]) -> list[dict[str, Any]]:
+    _, hits = _apply_text_replacements_with_hits(text, replacements)
     return hits
 
 
@@ -807,10 +824,7 @@ def _apply_asr_text_replacements_to_chunks_with_summary(
     normalized_chunks: list[ASRChunk] = []
     for index, chunk in enumerate(chunks, start=1):
         text = chunk.text
-        normalized = text
-        hits = _replacement_hits(text, replacements)
-        for hit in hits:
-            normalized = normalized.replace(str(hit["source"]), str(hit["target"]))
+        normalized, hits = _apply_text_replacements_with_hits(text, replacements)
         if normalized != text:
             chunks_changed += 1
             total_replacements += sum(int(hit["count"]) for hit in hits)
@@ -911,7 +925,7 @@ def _asr_candidate_looks_prompt_leaked(text: str, cfg: Any) -> bool:
     prompt = str(getattr(cfg, "asr_initial_prompt", "") or "").strip()
     if prompt and prompt in normalized:
         return True
-    review_prompt = str(getattr(cfg, "asr_text_review_initial_prompt", "") or "").strip()
+    review_prompt = str(getattr(cfg, "asr_review_initial_prompt", "") or "").strip()
     if review_prompt and review_prompt in normalized:
         return True
     hotwords = str(getattr(cfg, "asr_hotwords", "") or "").strip()
@@ -1299,7 +1313,7 @@ def _repair_asr_chunks(
     return sorted(repaired_chunks, key=lambda item: (item.start, item.end)), summary
 
 
-ASR_TEXT_REVIEW_GLOSSARY = [
+ASR_REVIEW_GLOSSARY = [
     "絶頂",
     "媚薬",
     "耳舐め",
@@ -1311,10 +1325,7 @@ ASR_TEXT_REVIEW_GLOSSARY = [
 
 
 def _asr_text_with_replacements(text: str, replacements: dict[str, str]) -> str:
-    normalized = text
-    for source, target in replacements.items():
-        if source:
-            normalized = normalized.replace(source, target)
+    normalized, _ = _apply_text_replacements_with_hits(text, replacements)
     return normalized
 
 
@@ -1336,7 +1347,7 @@ def _asr_review_context(chunks: list[ASRChunk], index: int, radius: int, *, befo
     ]
 
 
-def _asr_text_review_item(
+def _asr_review_item(
     chunks: list[ASRChunk],
     index: int,
     *,
@@ -1348,16 +1359,16 @@ def _asr_text_review_item(
         return None
     suspicious_patterns = [
         pattern
-        for pattern in cfg.asr_text_review_suspicious_text_patterns
+        for pattern in cfg.asr_review_suspicious_text_patterns
         if pattern and pattern in text
     ]
     candidate_text = _asr_text_with_replacements(
         text,
-        cfg.asr_text_review_candidate_replacements,
+        cfg.asr_review_candidate_replacements,
     ).strip()
     low_confidence = (
         chunk.confidence is not None
-        and chunk.confidence < cfg.asr_text_review_confidence_threshold
+        and chunk.confidence < cfg.asr_review_confidence_threshold
     )
     if not suspicious_patterns and candidate_text == text and not low_confidence:
         return None
@@ -1376,16 +1387,16 @@ def _asr_text_review_item(
         "context_before": _asr_review_context(
             chunks,
             index,
-            cfg.asr_text_review_context_radius,
+            cfg.asr_review_context_radius,
             before=True,
         ),
         "context_after": _asr_review_context(
             chunks,
             index,
-            cfg.asr_text_review_context_radius,
+            cfg.asr_review_context_radius,
             before=False,
         ),
-        "glossary": ASR_TEXT_REVIEW_GLOSSARY,
+        "glossary": ASR_REVIEW_GLOSSARY,
         "candidates": candidates,
     }
 
@@ -1412,11 +1423,11 @@ def _append_unique_asr_review_candidate(
 def _generated_asr_review_candidate_options(cfg: Any) -> list[tuple[str, float, dict[str, Any]]]:
     padding_values = [
         max(0.0, float(value))
-        for value in getattr(cfg, "asr_text_review_candidate_padding_sec", [])
+        for value in getattr(cfg, "asr_review_candidate_padding_sec", [])
     ]
     if not padding_values:
         padding_values = [0.8]
-    prompt = str(getattr(cfg, "asr_text_review_initial_prompt", "") or "").strip()
+    prompt = str(getattr(cfg, "asr_review_initial_prompt", "") or "").strip()
     options: list[tuple[str, float, dict[str, Any]]] = []
     for index, padding_sec in enumerate(padding_values, start=1):
         base_options: dict[str, Any] = {
@@ -1449,7 +1460,7 @@ def _add_generated_asr_review_candidates(
     audio_duration_sec: float,
     cfg: Any,
 ) -> int:
-    if not cfg.asr_text_review_generate_candidates:
+    if not cfg.asr_review_generate_candidates:
         return 0
     if not callable(getattr(backend, "transcribe_with_options", None)):
         return 0
@@ -1457,7 +1468,7 @@ def _add_generated_asr_review_candidates(
         return 0
 
     generated = 0
-    review_dir = project_dir / "work" / "transcribe" / "asr_text_review_clips"
+    review_dir = project_dir / "work" / "transcribe" / "asr_review_clips"
     for item in review_items:
         chunk_id = str(item.get("chunk_id") or "chunk")
         start = float(item["start"])
@@ -1491,7 +1502,7 @@ def _add_generated_asr_review_candidates(
                 generated += 1
             replaced_text = _asr_text_with_replacements(
                 candidate_text,
-                cfg.asr_text_review_candidate_replacements,
+                cfg.asr_review_candidate_replacements,
             )
             if replaced_text != candidate_text and _append_unique_asr_review_candidate(
                 item,
@@ -1513,7 +1524,7 @@ def _attach_asr_review_audio_clips(
     summary: dict[str, Any] = {
         "enabled": True,
         "created": 0,
-        "padding_sec": float(getattr(cfg, "asr_text_review_audio_padding_sec", 0.4)),
+        "padding_sec": float(getattr(cfg, "asr_review_audio_padding_sec", 0.4)),
         "error": None,
         "items": [],
     }
@@ -1521,7 +1532,7 @@ def _attach_asr_review_audio_clips(
         summary["error"] = f"review audio not found: {review_audio_path}"
         return summary
 
-    review_dir = project_dir / "work" / "transcribe" / "asr_text_review_audio_clips"
+    review_dir = project_dir / "work" / "transcribe" / "asr_review_audio_clips"
     padding_sec = max(0.0, float(summary["padding_sec"]))
     for item in review_items:
         chunk_id = str(item.get("chunk_id") or "chunk")
@@ -1574,7 +1585,7 @@ def _attach_asr_review_audio_clips(
     return summary
 
 
-def _review_asr_chunks_with_text_model(
+def _review_asr_chunks_with_model(
     chunks: list[ASRChunk],
     *,
     backend: Any,
@@ -1584,8 +1595,8 @@ def _review_asr_chunks_with_text_model(
     cfg: Any,
 ) -> tuple[list[ASRChunk], dict[str, Any]]:
     summary: dict[str, Any] = {
-        "enabled": bool(cfg.asr_text_review_enabled),
-        "backend": cfg.asr_text_review_backend,
+        "enabled": bool(cfg.asr_review_enabled),
+        "backend": cfg.asr_review_backend,
         "attempted": 0,
         "reviewed": 0,
         "replaced": 0,
@@ -1596,17 +1607,17 @@ def _review_asr_chunks_with_text_model(
         "error": None,
         "items": [],
     }
-    if not cfg.asr_text_review_enabled or not chunks:
+    if not cfg.asr_review_enabled or not chunks:
         return chunks, summary
 
     review_items = [
         item
         for index in range(len(chunks))
-        if (item := _asr_text_review_item(chunks, index, cfg=cfg)) is not None
+        if (item := _asr_review_item(chunks, index, cfg=cfg)) is not None
     ]
-    if cfg.asr_text_review_max_chunks >= 0 and len(review_items) > cfg.asr_text_review_max_chunks:
-        summary["skipped"] = len(review_items) - cfg.asr_text_review_max_chunks
-        review_items = review_items[: cfg.asr_text_review_max_chunks]
+    if cfg.asr_review_max_chunks >= 0 and len(review_items) > cfg.asr_review_max_chunks:
+        summary["skipped"] = len(review_items) - cfg.asr_review_max_chunks
+        review_items = review_items[: cfg.asr_review_max_chunks]
     if not review_items:
         return chunks, summary
 
@@ -1619,9 +1630,9 @@ def _review_asr_chunks_with_text_model(
         cfg=cfg,
     )
 
-    backend_kind = cfg.asr_text_review_backend.replace("-", "_")
-    if backend_kind not in {"llama_server", "llama_server_audio", "mock"}:
-        summary["error"] = f"unsupported backend: {cfg.asr_text_review_backend}"
+    backend_kind = cfg.asr_review_backend.replace("-", "_")
+    if backend_kind not in {"llama_server_audio", "mock"}:
+        summary["error"] = f"unsupported backend: {cfg.asr_review_backend}"
         return chunks, summary
     audio_review_enabled = backend_kind == "llama_server_audio"
     if audio_review_enabled:
@@ -1649,15 +1660,11 @@ def _review_asr_chunks_with_text_model(
     review_by_chunk_id = {str(item["chunk_id"]): item for item in review_items}
     selected_text_by_chunk_id: dict[str, str] = {}
     review_results: dict[str, dict[str, Any]] = {}
-    model_name = (
-        cfg.gemma_llama_cpp_model_path
-        if backend_kind in {"llama_server", "llama_server_audio"}
-        else "mock"
-    )
+    model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server_audio" else "mock"
     base_url = cfg.gemma_text_server_url.rstrip("/")
 
     def create_review_client() -> Any:
-        if backend_kind in {"llama_server", "llama_server_audio"}:
+        if backend_kind == "llama_server_audio":
             return LlamaServerTranslationClient(
                 base_url,
                 timeout_sec=cfg.gemma_text_timeout_sec,
@@ -1669,7 +1676,7 @@ def _review_asr_chunks_with_text_model(
         return MockTranslationClient(model=model_name)
 
     server_manager = None
-    if backend_kind in {"llama_server", "llama_server_audio"}:
+    if backend_kind == "llama_server_audio":
         server_manager = ManagedGemmaTextServer(
             enabled=cfg.gemma_text_server_auto_start,
             base_url=base_url,
@@ -1678,12 +1685,12 @@ def _review_asr_chunks_with_text_model(
                     cfg,
                     base_url=base_url,
                     lane_index=0,
-                    include_mmproj=audio_review_enabled,
+                    include_mmproj=True,
                 )
                 if cfg.gemma_text_server_auto_start
                 else []
             ),
-            log_path=project_dir / "work" / "transcribe" / "asr_text_review_llama_server.log",
+            log_path=project_dir / "work" / "transcribe" / "asr_review_llama_server.log",
             startup_timeout_sec=cfg.gemma_text_server_startup_timeout_sec,
             shutdown_timeout_sec=cfg.gemma_text_server_shutdown_timeout_sec,
         )
@@ -1694,7 +1701,7 @@ def _review_asr_chunks_with_text_model(
         client = create_review_client()
         review_batches = ([item] for item in review_items) if audio_review_enabled else _chunked(
             review_items,
-            cfg.asr_text_review_batch_size,
+            cfg.asr_review_batch_size,
         )
         for batch_index, batch in enumerate(review_batches, start=1):
             batch_id = f"asr_review_{batch_index:04d}"
@@ -1704,7 +1711,7 @@ def _review_asr_chunks_with_text_model(
                     client.review_asr_candidates_with_audio(batch, batch_id, audio_path)
                 )
             else:
-                review_results.update(client.review_asr_candidates(batch, batch_id))
+                review_results.update(client.review_asr_candidates_for_mock(batch, batch_id))
     except Exception as exc:
         summary["error"] = str(exc)
         return chunks, summary
@@ -1731,7 +1738,7 @@ def _review_asr_chunks_with_text_model(
             and selected_id != "original"
             and selected_text is not None
             and confidence is not None
-            and confidence >= cfg.asr_text_review_confidence_threshold
+            and confidence >= cfg.asr_review_confidence_threshold
         )
         if review.get("decision") == "manual_review":
             summary["manual_review"] += 1
@@ -1751,6 +1758,7 @@ def _review_asr_chunks_with_text_model(
                 "selected_text": selected_text,
                 "candidates": list(item.get("candidates", [])),
                 "audio_clip": item.get("audio_clip"),
+                "heard_text": review.get("heard_text"),
                 "reason": review.get("reason"),
                 "risk_terms": review.get("risk_terms", []),
                 "suspicious_patterns": item.get("suspicious_patterns", []),
@@ -2066,7 +2074,7 @@ def _translation_asr_backcheck_item(segment: Segment, cfg: Any) -> dict[str, Any
         "source_hits": source_hits,
         "translation_hits": translation_hits,
         "reasons": reasons,
-        "recommendation": "rerun_asr_text_review_or_manual_review",
+        "recommendation": "rerun_asr_review_or_manual_review",
     }
 
 
@@ -3089,7 +3097,7 @@ def _asr_chunk_diagnostics(
 ) -> list[dict[str, Any]]:
     replacements = replacements or {}
     patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
-        getattr(cfg, "asr_text_review_suspicious_text_patterns", []) or []
+        getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
     )
     rows: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
@@ -3156,14 +3164,14 @@ def _source_script_asr_review_reasons(source_script: SourceScript | None, cfg: A
     if _asr_candidate_looks_prompt_leaked(text, cfg):
         reasons.append("asr_prompt_or_hallucination_leak")
     patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
-        getattr(cfg, "asr_text_review_suspicious_text_patterns", []) or []
+        getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
     )
     hits = _asr_suspicious_pattern_hits(text, patterns)
     if hits:
         reasons.append("asr_suspicious_pattern:" + ",".join(hits[:5]))
     if (
         source_script.confidence is not None
-        and source_script.confidence < getattr(cfg, "asr_text_review_confidence_threshold", 0.78)
+        and source_script.confidence < getattr(cfg, "asr_review_confidence_threshold", 0.78)
     ):
         reasons.append(f"asr_low_confidence:{source_script.confidence:.3f}")
     duration = max(0.001, source_script.end - source_script.start)
@@ -3172,6 +3180,44 @@ def _source_script_asr_review_reasons(source_script: SourceScript | None, cfg: A
         and len(text) / duration < getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)
     ):
         reasons.append("asr_sparse_text_density")
+    return reasons
+
+
+def _source_script_rejected_repair_reasons(
+    source_script: SourceScript | None,
+    repair_summary: dict[str, Any],
+) -> list[str]:
+    if source_script is None or not source_script.text.strip():
+        return []
+    reasons: list[str] = []
+    script_start = float(source_script.start)
+    script_end = float(source_script.end)
+    script_duration = max(0.001, script_end - script_start)
+    for item in repair_summary.get("items", []):
+        if item.get("accepted"):
+            continue
+        try:
+            repair_start = float(item.get("start"))
+            repair_end = float(item.get("end"))
+        except (TypeError, ValueError):
+            continue
+        overlap = max(0.0, min(script_end, repair_end) - max(script_start, repair_start))
+        repair_duration = max(0.001, repair_end - repair_start)
+        if overlap / min(script_duration, repair_duration) < 0.3:
+            continue
+        attempt_reasons = {
+            str(attempt.get("reason") or "")
+            for attempt in item.get("attempts", [])
+            if attempt.get("reason")
+        }
+        suffix = (
+            ":prompt_or_hallucination_leak"
+            if "prompt_or_hallucination_leak" in attempt_reasons
+            else ""
+        )
+        reason = f"asr_repair_rejected{suffix}"
+        if reason not in reasons:
+            reasons.append(reason)
     return reasons
 
 
@@ -3187,7 +3233,7 @@ def _write_asr_diagnostics_artifacts(
     repaired_chunks: list[ASRChunk],
     final_chunks: list[ASRChunk],
     repair_summary: dict[str, Any],
-    text_review_summary: dict[str, Any],
+    asr_review_summary: dict[str, Any],
     replacements_summary: dict[str, Any],
     filtered_summary: list[dict[str, Any]],
     qwen_fallback_summary: dict[str, Any],
@@ -3238,7 +3284,7 @@ def _write_asr_diagnostics_artifacts(
         "repaired_asr_chunks": _asr_chunk_diagnostics(repaired_chunks, cfg=cfg),
         "final_asr_chunks": final_chunk_rows,
         "repair": repair_summary,
-        "text_review": text_review_summary,
+        "asr_review": asr_review_summary,
         "text_replacements": replacements_summary,
         "filtered_chunks": filtered_summary,
         "qwen_repair_fallback": qwen_fallback_summary,
@@ -3259,8 +3305,8 @@ def _write_asr_diagnostics_artifacts(
         "final_asr_chunk_count": len(final_chunks),
         "repair_attempted": repair_summary.get("attempted", 0),
         "repair_repaired": repair_summary.get("repaired", 0),
-        "text_review_attempted": text_review_summary.get("attempted", 0),
-        "text_review_replaced": text_review_summary.get("replaced", 0),
+        "asr_review_attempted": asr_review_summary.get("attempted", 0),
+        "asr_review_replaced": asr_review_summary.get("replaced", 0),
         "text_replacements": replacements_summary,
         "filtered_chunk_count": len(filtered_summary),
         "needs_manual_review": sum(1 for segment in manifest.segments if segment.status == "needs_manual_review"),
@@ -3317,7 +3363,7 @@ def transcribe_step(
     project_dir: Path,
     asr_backend: str | None = None,
     confirm_rights: bool = False,
-    asr_text_review: bool | None = None,
+    asr_review: bool | None = None,
     asr_preset: str | None = None,
     asr_vad_off: bool | None = None,
     asr_diagnostics: bool | None = None,
@@ -3329,9 +3375,9 @@ def transcribe_step(
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
     cfg = manifest.project_config
-    if asr_text_review is not None:
+    if asr_review is not None:
         cfg = type(cfg).model_validate(
-            {**cfg.model_dump(mode="json"), "asr_text_review_enabled": asr_text_review}
+            {**cfg.model_dump(mode="json"), "asr_review_enabled": asr_review}
         )
         manifest.project_config = cfg
     cfg = _effective_asr_config(
@@ -3356,9 +3402,9 @@ def transcribe_step(
         manifest = source_separation_step(project_dir, confirm_rights=confirm_rights)
         _load_config_into_manifest(project_dir, manifest)
         cfg = manifest.project_config
-        if asr_text_review is not None:
+        if asr_review is not None:
             cfg = type(cfg).model_validate(
-                {**cfg.model_dump(mode="json"), "asr_text_review_enabled": asr_text_review}
+                {**cfg.model_dump(mode="json"), "asr_review_enabled": asr_review}
             )
             manifest.project_config = cfg
         cfg = _effective_asr_config(
@@ -3399,9 +3445,9 @@ def transcribe_step(
         "skipped": 0,
         "items": [],
     }
-    text_review_summary: dict[str, Any] = {
-        "enabled": bool(cfg.asr_text_review_enabled),
-        "backend": cfg.asr_text_review_backend,
+    asr_review_summary: dict[str, Any] = {
+        "enabled": bool(cfg.asr_review_enabled),
+        "backend": cfg.asr_review_backend,
         "attempted": 0,
         "reviewed": 0,
         "replaced": 0,
@@ -3439,7 +3485,7 @@ def transcribe_step(
         repair_summary_path = project_dir / "work" / "transcribe" / "asr_repair_summary.json"
         write_json_atomic(repair_summary_path, repair_summary)
         manifest.artifacts["asr_repair_summary"] = str(repair_summary_path)
-        chunks, text_review_summary = _review_asr_chunks_with_text_model(
+        chunks, asr_review_summary = _review_asr_chunks_with_model(
             chunks,
             backend=backend,
             project_dir=project_dir,
@@ -3447,9 +3493,9 @@ def transcribe_step(
             audio_duration_sec=audio_duration,
             cfg=cfg,
         )
-        text_review_summary_path = project_dir / "work" / "transcribe" / "asr_text_review_summary.json"
-        write_json_atomic(text_review_summary_path, text_review_summary)
-        manifest.artifacts["asr_text_review_summary"] = str(text_review_summary_path)
+        asr_review_summary_path = project_dir / "work" / "transcribe" / "asr_review_summary.json"
+        write_json_atomic(asr_review_summary_path, asr_review_summary)
+        manifest.artifacts["asr_review_summary"] = str(asr_review_summary_path)
         chunks, asr_text_replacements_summary = _apply_asr_text_replacements_to_chunks_with_summary(
             chunks,
             cfg.asr_text_replacements,
@@ -3500,6 +3546,13 @@ def transcribe_step(
         source_script = mapped.get(segment.id)
         segment.source_script = source_script
         review_reasons = _source_script_asr_review_reasons(source_script, cfg)
+        repair_review_reasons = _source_script_rejected_repair_reasons(
+            source_script,
+            repair_summary,
+        )
+        review_reasons.extend(
+            reason for reason in repair_review_reasons if reason not in review_reasons
+        )
         if review_reasons:
             segment.status = "needs_manual_review"
             manual_review_count += 1
@@ -3541,7 +3594,7 @@ def transcribe_step(
         repaired_chunks=repaired_chunks,
         final_chunks=final_chunks,
         repair_summary=repair_summary,
-        text_review_summary=text_review_summary,
+        asr_review_summary=asr_review_summary,
         replacements_summary=asr_text_replacements_summary,
         filtered_summary=filtered_final_chunks,
         qwen_fallback_summary=qwen_fallback_summary,
@@ -3564,10 +3617,10 @@ def transcribe_step(
         asr_chunk_count=len(chunks),
         asr_repair_attempted=repair_summary.get("attempted", 0),
         asr_repair_repaired=repair_summary.get("repaired", 0),
-        asr_text_review_attempted=text_review_summary.get("attempted", 0),
-        asr_text_review_replaced=text_review_summary.get("replaced", 0),
-        asr_text_review_manual_review=text_review_summary.get("manual_review", 0),
-        asr_text_review_error=text_review_summary.get("error"),
+        asr_review_attempted=asr_review_summary.get("attempted", 0),
+        asr_review_replaced=asr_review_summary.get("replaced", 0),
+        asr_review_manual_review=asr_review_summary.get("manual_review", 0),
+        asr_review_error=asr_review_summary.get("error"),
         asr_text_replacements=asr_text_replacement_count,
         seeded_for_transcribe=seeded_for_transcribe,
         resegmented_from_chunks=resegmented_from_chunks,

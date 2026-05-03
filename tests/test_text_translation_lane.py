@@ -16,7 +16,7 @@ from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.gemma.text_translate import (
     LlamaServerTranslationClient,
-    parse_asr_text_review_response,
+    parse_asr_review_response,
     parse_translation_response,
 )
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
@@ -154,7 +154,7 @@ def test_asr_resegment_drops_sparse_hallucinated_long_chunks(tmp_project_dir: Pa
     ]
 
 
-def test_transcribe_asr_text_review_mock_selects_domain_candidate(
+def test_transcribe_asr_review_mock_selects_domain_candidate(
     monkeypatch: pytest.MonkeyPatch,
     tiny_wav_path: Path,
     tmp_project_dir: Path,
@@ -170,8 +170,8 @@ def test_transcribe_asr_text_review_mock_selects_domain_candidate(
             project_name=tmp_project_dir.name,
             asr_resegment_from_chunks=False,
             asr_repair_enabled=False,
-            asr_text_review_enabled=True,
-            asr_text_review_backend="mock",
+            asr_review_enabled=True,
+            asr_review_backend="mock",
             source_separation_backend="none",
         ),
         tmp_project_dir / "pipeline.yaml",
@@ -197,7 +197,7 @@ def test_transcribe_asr_text_review_mock_selects_domain_candidate(
 
     assert manifest.segments[0].source_script is not None
     assert manifest.segments[0].source_script.text == "もっと大きな絶頂が来る"
-    summary = json.loads(Path(manifest.artifacts["asr_text_review_summary"]).read_text("utf-8"))
+    summary = json.loads(Path(manifest.artifacts["asr_review_summary"]).read_text("utf-8"))
     assert summary["attempted"] == 1
     assert summary["replaced"] == 1
     assert summary["items"][0]["candidates"] == [
@@ -222,9 +222,9 @@ def test_transcribe_asr_audio_review_passes_clip_to_client(
             project_name=tmp_project_dir.name,
             asr_resegment_from_chunks=False,
             asr_repair_enabled=False,
-            asr_text_review_enabled=True,
-            asr_text_review_backend="llama_server_audio",
-            asr_text_review_audio_padding_sec=0.05,
+            asr_review_enabled=True,
+            asr_review_backend="llama_server_audio",
+            asr_review_audio_padding_sec=0.05,
             gemma_text_server_auto_start=False,
             source_separation_backend="none",
         ),
@@ -278,21 +278,21 @@ def test_transcribe_asr_audio_review_passes_clip_to_client(
     assert review_calls
     assert manifest.segments[0].source_script is not None
     assert manifest.segments[0].source_script.text == "もっと大きな絶頂が来る"
-    summary = json.loads(Path(manifest.artifacts["asr_text_review_summary"]).read_text("utf-8"))
+    summary = json.loads(Path(manifest.artifacts["asr_review_summary"]).read_text("utf-8"))
     assert summary["backend"] == "llama_server_audio"
     assert summary["audio_input"]["enabled"] is True
     assert summary["audio_input"]["created"] == 1
     assert summary["items"][0]["audio_clip"]["path"] == str(review_calls[0][1])
 
 
-def test_asr_text_review_generates_retranscribe_candidates(
+def test_asr_review_generates_retranscribe_candidates(
     tiny_wav_path: Path,
     tmp_project_dir: Path,
 ) -> None:
     cfg = ProjectConfig(
         project_name=tmp_project_dir.name,
-        asr_text_review_candidate_padding_sec=[0.1],
-        asr_text_review_initial_prompt="絶頂 媚薬 耳舐め",
+        asr_review_candidate_padding_sec=[0.1],
+        asr_review_initial_prompt="絶頂 媚薬 耳舐め",
     )
     item = {
         "chunk_id": "chunk_0001",
@@ -327,7 +327,7 @@ def test_asr_text_review_generates_retranscribe_candidates(
     assert any(candidate["text"] == "もっと大きな絶頂が来る" for candidate in item["candidates"])
 
 
-def test_asr_text_review_default_candidates_are_unprompted() -> None:
+def test_asr_review_default_candidates_are_unprompted() -> None:
     cfg = ProjectConfig(project_name="test-project")
 
     option_rows = pipeline_steps._generated_asr_review_candidate_options(cfg)
@@ -349,14 +349,14 @@ def test_asr_prompt_leak_filter_rejects_video_outro_text() -> None:
     assert leaked is True
 
 
-def test_asr_text_review_replacements_include_observed_adult_asr_artifacts() -> None:
+def test_asr_review_replacements_include_observed_adult_asr_artifacts() -> None:
     cfg = ProjectConfig(project_name="test-project")
 
-    assert cfg.asr_text_review_candidate_replacements["めず行きセックス"] == "メスイキセックス"
-    assert cfg.asr_text_review_candidate_replacements["薄引き"] == "メスイキ"
-    assert cfg.asr_text_review_candidate_replacements["グリドリス"] == "クリトリス"
-    assert cfg.asr_text_review_candidate_replacements["お孫"] == "おまんこ"
-    assert "めず行き" in cfg.asr_text_review_suspicious_text_patterns
+    assert cfg.asr_review_candidate_replacements["めず行きセックス"] == "メスイキセックス"
+    assert cfg.asr_review_candidate_replacements["薄引き"] == "メスイキ"
+    assert cfg.asr_review_candidate_replacements["グリドリス"] == "クリトリス"
+    assert cfg.asr_review_candidate_replacements["お孫"] == "おまんこ"
+    assert "めず行き" in cfg.asr_review_suspicious_text_patterns
 
 
 def test_translation_asr_backcheck_flags_suspicious_korean_smell() -> None:
@@ -878,12 +878,103 @@ def test_asr_text_replacements_include_observed_midcheck_mishears() -> None:
                 language="ja",
                 confidence=0.92,
             ),
+            ASRChunk(
+                start=28.0,
+                end=32.0,
+                text="全身が薄いて熱くなってくる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=32.0,
+                end=36.0,
+                text="発症中 発症した 発症してる 発症する 発症しちゃう",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=36.0,
+                end=40.0,
+                text="お泣きして待っててね 尿位が強くなる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=40.0,
+                end=44.0,
+                text="私は中旬なメスになります 巣に侵されることを考えて",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=44.0,
+                end=48.0,
+                text="お巣に侵されることを考えて 速速が止まらない",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=48.0,
+                end=52.0,
+                text="貧乱なメス犬 鼻ならしてかきなさい",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=52.0,
+                end=56.0,
+                text="端となく鼻ならして",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=56.0,
+                end=60.0,
+                text="もっと大きな手帳が来る",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=60.0,
+                end=64.0,
+                text="媚薬スプレー 豆腐",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=64.0,
+                end=68.0,
+                text="お耳ジュガジュガピスタンされて",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=68.0,
+                end=72.0,
+                text="魅力まで触手が入ってくる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=72.0,
+                end=76.0,
+                text="ウニオクまで触手が入ってくる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=76.0,
+                end=80.0,
+                text="この音声は中八菌催眠音声です",
+                language="ja",
+                confidence=0.92,
+            ),
         ],
         replacements,
     )
 
-    assert summary["chunks_changed"] == 7
-    assert summary["total_replacements"] == 13
+    assert summary["chunks_changed"] == 20
+    assert summary["total_replacements"] == 34
     assert chunks[0].text == "女体化の薬で全身性感帯になる"
     assert chunks[1].text == "君の四肢は拘束されている"
     assert chunks[2].text == "簡易版採集マシーンでドリーム採集を継続"
@@ -891,6 +982,47 @@ def test_asr_text_replacements_include_observed_midcheck_mishears() -> None:
     assert chunks[4].text == "雨宿りをするために駆け込んだ神社"
     assert chunks[5].text == "甘い催眠へと引きずり込む 右のお耳も敏感になる"
     assert chunks[6].text == "意識が揺らぐ たっぷり気持ちよくなろうね"
+    assert chunks[7].text == "全身が疼いて熱くなってくる"
+    assert chunks[8].text == "発情中 発情した 発情してる 発情する 発情しちゃう"
+    assert chunks[9].text == "オナニーして待っててね 尿意が強くなる"
+    assert chunks[10].text == "私は従順なメスになります オスに犯されることを考えて"
+    assert chunks[11].text == "オスに犯されることを考えて ゾクゾクが止まらない"
+    assert chunks[12].text == "淫乱なメス犬 鼻鳴らして嗅ぎなさい"
+    assert chunks[13].text == "はしたなく鼻鳴らして"
+    assert chunks[14].text == "もっと大きな絶頂が来る"
+    assert chunks[15].text == "媚薬スプレー投与"
+    assert chunks[16].text == "お耳グチュグチュピストンされて"
+    assert chunks[17].text == "耳奥まで触手が入ってくる"
+    assert chunks[18].text == "耳奥まで触手が入ってくる"
+    assert chunks[19].text == "この音声は18禁催眠音声です"
+
+
+def test_asr_text_replacements_handle_cascaded_yaml_order() -> None:
+    replacements = dict(sorted(ProjectConfig().asr_text_replacements.items()))
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="媚薬スプレー 豆腐",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="美薬スプレー 豆腐",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        replacements,
+    )
+
+    assert summary["chunks_changed"] == 2
+    assert summary["total_replacements"] == 3
+    assert chunks[0].text == "媚薬スプレー投与"
+    assert chunks[1].text == "媚薬スプレー投与"
 
 
 def test_transcribe_writes_unified_asr_diagnostics(
@@ -905,7 +1037,7 @@ def test_transcribe_writes_unified_asr_diagnostics(
             source_separation_backend="none",
             asr_resegment_from_chunks=False,
             asr_repair_enabled=False,
-            asr_text_review_enabled=False,
+            asr_review_enabled=False,
         ),
         tmp_project_dir / "pipeline.yaml",
     )
@@ -942,6 +1074,38 @@ def test_transcribe_writes_unified_asr_diagnostics(
     assert summary["final_asr_chunk_count"] == 1
     assert summary["text_replacements"]["total_replacements"] == 1
     assert manifest.artifacts["asr_input_diagnostics"]
+
+
+def test_rejected_asr_repair_marks_overlapping_text_for_manual_review() -> None:
+    source_script = SourceScript(
+        text="私はあなたを愛しています すよ お耳 私に食べら",
+        language="ja",
+        confidence=0.96,
+        backend="faster_whisper",
+        start=3177.56,
+        end=3195.86,
+    )
+    repair_summary = {
+        "items": [
+            {
+                "start": 3180.41,
+                "end": 3195.86,
+                "accepted": False,
+                "attempts": [
+                    {
+                        "candidate_id": "no_vad_clean",
+                        "reason": "prompt_or_hallucination_leak",
+                        "candidate_text": "ご視聴ありがとうございました",
+                    }
+                ],
+            }
+        ]
+    }
+
+    assert pipeline_steps._source_script_rejected_repair_reasons(
+        source_script,
+        repair_summary,
+    ) == ["asr_repair_rejected:prompt_or_hallucination_leak"]
 
 
 def test_transcribe_qwen_repair_fallback_skips_when_dependency_missing(
@@ -1044,14 +1208,28 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().asr_repair_padding_sec == pytest.approx(1.0)
     assert ProjectConfig().asr_repair_max_chunks == 160
     assert "もちなとい" in ProjectConfig().asr_repair_suspicious_text_patterns
-    assert ProjectConfig(asr_text_review_backend="llama_server_audio").asr_text_review_backend == "llama_server_audio"
-    assert ProjectConfig().asr_text_review_audio_padding_sec == pytest.approx(0.4)
+    assert "ご処生" in ProjectConfig().asr_repair_suspicious_text_patterns
+    assert ProjectConfig(asr_review_backend="llama_server_audio").asr_review_backend == "llama_server_audio"
+    assert ProjectConfig().asr_review_audio_padding_sec == pytest.approx(0.4)
     assert "女体化" in ProjectConfig().asr_hotwords
     assert "性感帯" in ProjectConfig().asr_hotwords
     assert "採集マシーン" in ProjectConfig().asr_hotwords
+    assert "発情" in ProjectConfig().asr_hotwords
+    assert "尿意" in ProjectConfig().asr_hotwords
+    assert "オナニー" in ProjectConfig().asr_hotwords
+    assert "18禁" in ProjectConfig().asr_hotwords
+    assert "投与" in ProjectConfig().asr_hotwords
+    assert "耳奥" in ProjectConfig().asr_hotwords
+    assert "ピストン" in ProjectConfig().asr_hotwords
     assert ProjectConfig().asr_text_replacements["釣りが来ちゃう"] == "絶頂が来ちゃう"
     assert ProjectConfig().asr_text_replacements["女体科"] == "女体化"
     assert ProjectConfig().asr_text_replacements["生還体"] == "性感帯"
+    assert ProjectConfig().asr_text_replacements["薄いて"] == "疼いて"
+    assert ProjectConfig().asr_text_replacements["尿位"] == "尿意"
+    assert ProjectConfig().asr_text_replacements["中八菌催眠音声"] == "18禁催眠音声"
+    assert ProjectConfig().asr_text_replacements["手帳が来る"] == "絶頂が来る"
+    assert ProjectConfig().asr_text_replacements["ピスタン"] == "ピストン"
+    assert ProjectConfig().asr_text_replacements["ウニアクナで触手"] == "耳奥まで触手"
     assert ProjectConfig().source_separation_backend == "demucs"
     assert ProjectConfig().source_separation_model == "htdemucs"
     assert ProjectConfig().gsv_trim_edge_silence is True
@@ -1878,12 +2056,13 @@ def test_translation_parser_accepts_minimal_model_output() -> None:
     assert translation.batch_id == "batch_0001"
 
 
-def test_asr_text_review_parser_accepts_candidate_selection() -> None:
-    parsed = parse_asr_text_review_response(
+def test_asr_review_parser_accepts_candidate_selection() -> None:
+    parsed = parse_asr_review_response(
         json.dumps(
             [
                 {
                     "chunk_id": "chunk_0001",
+                    "heard_text": "もっと大きな絶頂が来る",
                     "decision": "replace",
                     "selected_candidate_id": "domain_replacement",
                     "confidence": "92%",
@@ -1900,55 +2079,8 @@ def test_asr_text_review_parser_accepts_candidate_selection() -> None:
     assert parsed["chunk_0001"]["decision"] == "replace"
     assert parsed["chunk_0001"]["selected_candidate_id"] == "domain_replacement"
     assert parsed["chunk_0001"]["confidence"] == pytest.approx(0.92)
+    assert parsed["chunk_0001"]["heard_text"] == "もっと大きな絶頂が来る"
     assert parsed["chunk_0001"]["risk_terms"] == ["手帳"]
-
-
-def test_llama_server_translation_client_reviews_asr_candidates() -> None:
-    requests: list[dict[str, object]] = []
-    response = [
-        {
-            "chunk_id": "chunk_0001",
-            "decision": "replace",
-            "selected_candidate_id": "domain_replacement",
-            "confidence": 0.94,
-            "reason": "Adjacent ASMR context supports 絶頂.",
-            "risk_terms": ["手帳"],
-        }
-    ]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]},
-        )
-
-    client = LlamaServerTranslationClient(
-        "http://gemma.local",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-        model="gemma4",
-        retries=0,
-        n_predict=128,
-    )
-    reviews = client.review_asr_candidates(
-        [
-            {
-                "chunk_id": "chunk_0001",
-                "context_before": [{"text": "もっと大きな"}],
-                "context_after": [{"text": "行く"}],
-                "candidates": [
-                    {"candidate_id": "original", "text": "もっと大きな手帳が来る"},
-                    {"candidate_id": "domain_replacement", "text": "もっと大きな絶頂が来る"},
-                ],
-            }
-        ],
-        "asr_review_0001",
-    )
-
-    assert reviews["chunk_0001"]["selected_candidate_id"] == "domain_replacement"
-    prompt = requests[0]["messages"][0]["content"]
-    assert "japanese_asr_candidate_review" in prompt
-    assert "もっと大きな絶頂が来る" in prompt
 
 
 def test_llama_server_translation_client_reviews_asr_candidates_with_audio(tmp_path: Path) -> None:
@@ -2009,7 +2141,181 @@ def test_llama_server_translation_client_reviews_asr_candidates_with_audio(tmp_p
     assert base64.b64decode(content[1]["input_audio"]["data"]) == audio_path.read_bytes()
 
 
-def test_llama_server_translation_client_rejects_non_candidate_asr_text() -> None:
+def test_llama_server_translation_client_audio_review_does_not_fallback_to_text_repair(
+    tmp_path: Path,
+) -> None:
+    requests: list[dict[str, object]] = []
+    audio_path = tmp_path / "chunk_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "message": "audio input is not supported",
+                }
+            },
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=128,
+    )
+
+    with pytest.raises(Exception, match="audio input is not supported"):
+        client.review_asr_candidates_with_audio(
+            [
+                {
+                    "chunk_id": "chunk_0001",
+                    "candidates": [
+                        {"candidate_id": "original", "text": "手帳が来る"},
+                        {"candidate_id": "domain_replacement", "text": "絶頂が来る"},
+                    ],
+                }
+            ],
+            "asr_review_0001",
+            audio_path,
+        )
+
+    assert len(requests) == 2
+    for request in requests:
+        content = request["messages"][0]["content"]
+        assert isinstance(content, list)
+        assert content[1]["type"] == "input_audio"
+
+
+def test_llama_server_translation_client_repairs_audio_review_decision_mismatch(
+    tmp_path: Path,
+) -> None:
+    requests: list[dict[str, object]] = []
+    audio_path = tmp_path / "chunk_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+    responses = [
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "decision": "manual_review",
+                "selected_candidate_id": "domain_replacement",
+                "confidence": 0.95,
+                "reason": "best candidate but wrong decision label",
+                "risk_terms": [],
+            }
+        ],
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "decision": "replace",
+                "selected_candidate_id": "domain_replacement",
+                "confidence": 0.95,
+                "reason": "fixed decision label",
+                "risk_terms": [],
+            }
+        ],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(responses[len(requests) - 1], ensure_ascii=False)
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=128,
+    )
+
+    reviews = client.review_asr_candidates_with_audio(
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "candidates": [
+                    {"candidate_id": "original", "text": "私の声は 弟兄"},
+                    {"candidate_id": "domain_replacement", "text": "息を深く吐くたびに体から嫌な力が抜けて"},
+                ],
+            }
+        ],
+        "asr_review_0001",
+        audio_path,
+    )
+
+    assert reviews["chunk_0001"]["decision"] == "replace"
+    assert len(requests) == 2
+    first_content = requests[0]["messages"][0]["content"]
+    second_content = requests[1]["messages"][0]["content"]
+    assert isinstance(first_content, list)
+    assert "Repair the previous ASR review response" in second_content
+
+
+def test_llama_server_translation_client_aligns_audio_review_with_heard_text(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "chunk_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = [
+            {
+                "chunk_id": "chunk_0001",
+                "heard_text": "20 そろそろきつくなってきた",
+                "decision": "manual_review",
+                "selected_candidate_id": "original",
+                "confidence": 0.95,
+                "reason": "heard the leading count but chose the wrong id",
+                "risk_terms": [],
+            }
+        ]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]},
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=0,
+        n_predict=128,
+    )
+
+    reviews = client.review_asr_candidates_with_audio(
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "candidates": [
+                    {"candidate_id": "original", "text": "そろそろきつくなってきた?"},
+                    {"candidate_id": "repair_no_vad", "text": "20 そろそろきつくなってきた"},
+                ],
+            }
+        ],
+        "asr_review_0001",
+        audio_path,
+    )
+
+    assert reviews["chunk_0001"]["decision"] == "replace"
+    assert reviews["chunk_0001"]["selected_candidate_id"] == "repair_no_vad"
+
+
+def test_llama_server_translation_client_rejects_non_candidate_asr_text(tmp_path: Path) -> None:
+    audio_path = tmp_path / "chunk_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+
     def handler(_request: httpx.Request) -> httpx.Response:
         response = [
             {
@@ -2034,7 +2340,7 @@ def test_llama_server_translation_client_rejects_non_candidate_asr_text() -> Non
     )
 
     with pytest.raises(Exception, match="invalid selected_candidate_id"):
-        client.review_asr_candidates(
+        client.review_asr_candidates_with_audio(
             [
                 {
                     "chunk_id": "chunk_0001",
@@ -2045,6 +2351,7 @@ def test_llama_server_translation_client_rejects_non_candidate_asr_text() -> Non
                 }
             ],
             "asr_review_0001",
+            audio_path,
         )
 
 

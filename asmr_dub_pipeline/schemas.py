@@ -278,9 +278,11 @@ class ProjectConfig(StrictBaseModel):
     asr_initial_prompt: str = ""
     asr_hotwords: str = (
         "絶頂 媚薬 耳舐め 耳なめ 暗示 快感 10数える 飛んじゃってください "
-        "気持ちいい イっちゃう さくら ジンジン 痺れる ザーメン 先走り液 "
+        "気持ちいい イっちゃう 18禁 さくら ジンジン 痺れる ザーメン 先走り液 "
         "メスイキ クリトリス おまんこ おちんぽ 精液 潮吹き 出会いアプリ スケベ "
-        "女体化 性感帯 四肢 採集 デイドリーム 採集マシーン エネルギー不足"
+        "女体化 性感帯 四肢 採集 デイドリーム 採集マシーン エネルギー不足 "
+        "疼いて 発情 発情中 尿意 従順 オスに犯される オナニー ゾクゾク 淫乱 "
+        "はしたなく 鼻鳴らして 嗅ぎなさい 投与 耳奥 ピストン グチュグチュ 中イキ"
     )
     asr_diagnostics_enabled: bool = True
     asr_input_min_rms_dbfs: float = -75.0
@@ -368,6 +370,9 @@ class ProjectConfig(StrictBaseModel):
             "お孫",
             "活アプリ",
             "スケベン",
+            "ご処生",
+            "耳は長生き",
+            "耳は 長生き",
         ]
     )
     asr_text_replacements: dict[str, str] = Field(
@@ -375,6 +380,7 @@ class ProjectConfig(StrictBaseModel):
             "釣りが来ちゃう": "絶頂が来ちゃう",
             "釣りが来ちゃえ": "絶頂が来ちゃう",
             "銃数える": "10数える",
+            "中八菌催眠音声": "18禁催眠音声",
             "膨れ起こって": "膨れ上がって",
             "触れおごって": "膨れ上がって",
             "溢れおごって": "膨れ上がって",
@@ -399,19 +405,41 @@ class ProjectConfig(StrictBaseModel):
             "血のお耳": "右のお耳",
             "いいえ 気が揺らぐ": "意識が揺らぐ",
             "ぶり気持ちよく": "たっぷり気持ちよく",
+            "薄いて": "疼いて",
+            "発症中": "発情中",
+            "発症した": "発情した",
+            "発症してる": "発情してる",
+            "発症する": "発情する",
+            "発症し": "発情し",
+            "お泣きして": "オナニーして",
+            "尿位": "尿意",
+            "中旬な": "従順な",
+            "お巣に侵される": "オスに犯される",
+            "巣に侵される": "オスに犯される",
+            "速速": "ゾクゾク",
+            "貧乱": "淫乱",
+            "端となく鼻ならして": "はしたなく鼻鳴らして",
+            "鼻ならしてかきなさい": "鼻鳴らして嗅ぎなさい",
+            "手帳が来る": "絶頂が来る",
+            "媚薬スプレー 豆腐": "媚薬スプレー投与",
+            "ピスタン": "ピストン",
+            "ジュガジュガ": "グチュグチュ",
+            "魅力まで触手": "耳奥まで触手",
+            "ウニオクまで触手": "耳奥まで触手",
+            "ウニアクナで触手": "耳奥まで触手",
         }
     )
-    asr_text_review_enabled: bool = False
-    asr_text_review_backend: Literal["llama_server", "llama_server_audio", "mock"] = "llama_server"
-    asr_text_review_batch_size: int = Field(default=8, ge=1, le=50)
-    asr_text_review_max_chunks: int = Field(default=160, ge=0)
-    asr_text_review_context_radius: int = Field(default=2, ge=0, le=8)
-    asr_text_review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
-    asr_text_review_generate_candidates: bool = True
-    asr_text_review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
-    asr_text_review_audio_padding_sec: float = Field(default=0.4, ge=0.0)
-    asr_text_review_initial_prompt: str = ""
-    asr_text_review_suspicious_text_patterns: list[str] = Field(
+    asr_review_enabled: bool = False
+    asr_review_backend: Literal["llama_server_audio", "mock"] = "llama_server_audio"
+    asr_review_batch_size: int = Field(default=8, ge=1, le=50)
+    asr_review_max_chunks: int = Field(default=160, ge=0)
+    asr_review_context_radius: int = Field(default=2, ge=0, le=8)
+    asr_review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    asr_review_generate_candidates: bool = True
+    asr_review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
+    asr_review_audio_padding_sec: float = Field(default=0.4, ge=0.0)
+    asr_review_initial_prompt: str = ""
+    asr_review_suspicious_text_patterns: list[str] = Field(
         default_factory=lambda: [
             "釣り",
             "手帳",
@@ -452,7 +480,7 @@ class ProjectConfig(StrictBaseModel):
             "スケベン",
         ]
     )
-    asr_text_review_candidate_replacements: dict[str, str] = Field(
+    asr_review_candidate_replacements: dict[str, str] = Field(
         default_factory=lambda: {
             "釣りが来ちゃう": "絶頂が来ちゃう",
             "釣りが来る": "絶頂が来る",

@@ -59,8 +59,8 @@ FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
     "asr_preset": "whisper",
     "asr_diagnostics_enabled": True,
-    "asr_text_review_enabled": True,
-    "asr_text_review_generate_candidates": True,
+    "asr_review_enabled": True,
+    "asr_review_generate_candidates": True,
     "asr_translation_backcheck_enabled": True,
     "candidate_count": 3,
     "duration_tolerance": 0.25,
@@ -506,10 +506,10 @@ def transcribe(
         "--asr-batch-size",
         help="Batch size for faster-whisper batched inference.",
     ),
-    asr_text_review: bool = typer.Option(
+    asr_review: bool = typer.Option(
         False,
-        "--asr-text-review",
-        help="Use the configured Gemma text model to review suspicious ASR candidate text.",
+        "--asr-review",
+        help="Use the configured Gemma audio+text model to review suspicious ASR candidates.",
     ),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
 ) -> None:
@@ -519,7 +519,7 @@ def transcribe(
             project.expanduser().resolve(),
             asr_backend,
             confirm_rights=confirm_rights,
-            asr_text_review=True if asr_text_review else None,
+            asr_review=True if asr_review else None,
             asr_preset=asr_preset,
             asr_vad_off=True if asr_vad_off else None,
             asr_diagnostics=asr_diagnostics,
