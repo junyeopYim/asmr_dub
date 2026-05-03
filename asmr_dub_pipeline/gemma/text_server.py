@@ -79,6 +79,7 @@ def default_llama_server_command(
     *,
     base_url: str,
     model_path: str | Path,
+    mmproj_path: str | Path | None = None,
     ctx_size: int,
     gpu_layers: int,
     n_predict: int,
@@ -86,27 +87,35 @@ def default_llama_server_command(
     host, port = _host_port(base_url)
     server_path = _resolve_existing_path(DEFAULT_LLAMA_SERVER, "binary")
     model = _resolve_existing_path(model_path, "model")
-    return [
+    command = [
         str(server_path),
         "-m",
         str(model),
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--jinja",
-        "--reasoning",
-        "off",
-        "--reasoning-budget",
-        "0",
-        "--no-warmup",
-        "-c",
-        str(ctx_size),
-        "-ngl",
-        str(gpu_layers),
-        "-n",
-        str(n_predict),
     ]
+    if mmproj_path:
+        mmproj = _resolve_existing_path(mmproj_path, "mmproj")
+        command.extend(["--mmproj", str(mmproj)])
+    command.extend(
+        [
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--jinja",
+            "--reasoning",
+            "off",
+            "--reasoning-budget",
+            "0",
+            "--no-warmup",
+            "-c",
+            str(ctx_size),
+            "-ngl",
+            str(gpu_layers),
+            "-n",
+            str(n_predict),
+        ]
+    )
+    return command
 
 
 def _normalize_command(command: Sequence[str] | str | None) -> list[str]:

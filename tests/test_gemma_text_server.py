@@ -4,7 +4,12 @@ import socket
 import sys
 from pathlib import Path
 
-from asmr_dub_pipeline.gemma.text_server import ManagedGemmaTextServer, is_http_ready
+from asmr_dub_pipeline.gemma import text_server as text_server_module
+from asmr_dub_pipeline.gemma.text_server import (
+    ManagedGemmaTextServer,
+    default_llama_server_command,
+    is_http_ready,
+)
 
 
 def free_port() -> int:
@@ -39,6 +44,31 @@ ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
         + "\n",
         "utf-8",
     )
+
+
+def test_default_llama_server_command_includes_mmproj_when_requested(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    server = tmp_path / "llama-server"
+    model = tmp_path / "model.gguf"
+    mmproj = tmp_path / "mmproj.gguf"
+    for path in (server, model, mmproj):
+        path.write_text("mock", "utf-8")
+    monkeypatch.setattr(text_server_module, "DEFAULT_LLAMA_SERVER", server)
+
+    command = default_llama_server_command(
+        base_url="http://127.0.0.1:18080",
+        model_path=model,
+        mmproj_path=mmproj,
+        ctx_size=4096,
+        gpu_layers=999,
+        n_predict=1024,
+    )
+
+    assert command[:5] == [str(server.resolve()), "-m", str(model.resolve()), "--mmproj", str(mmproj.resolve())]
+    assert "--host" in command
+    assert "--port" in command
 
 
 def test_managed_gemma_text_server_waits_for_http_readiness(tmp_path: Path) -> None:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -459,6 +461,37 @@ def build_asr_text_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: s
     )
 
 
+def build_asr_audio_text_review_prompt(items: Sequence[Mapping[str, Any]], batch_id: str) -> str:
+    prompt_items = [
+        {key: value for key, value in item.items() if key not in {"audio_clip_path", "audio_clip"}}
+        for item in items
+    ]
+    payload = {
+        "batch_id": batch_id,
+        "task": "japanese_asr_audio_candidate_review",
+        "domain": "user-authorized Japanese ASMR transcription",
+        "items": prompt_items,
+    }
+    return (
+        "Return exactly one valid JSON array and no markdown. You are reviewing Japanese ASR "
+        "text candidates for a user-authorized ASMR dubbing workflow with the matching audio "
+        "attached to this request. Listen to the audio and use the provided candidates, adjacent "
+        "context, timing, confidence, and ASMR glossary to choose the best candidate. Do not "
+        "invent unrelated Japanese text. For each input item, choose only one candidate_id from "
+        "candidates. Use decision='replace' only when a non-original candidate is clearly better "
+        "than the original transcription; use decision='keep' when original is best or when the "
+        "item is only a short moan, hesitation, or repeated exclamation with no clearly better "
+        "candidate. Use decision='manual_review' only as a last resort when every candidate is "
+        "unusable and the uncertainty changes translation meaning. Each output item must contain "
+        "only chunk_id, decision, selected_candidate_id, confidence, reason, and risk_terms. "
+        "confidence must be 0.0 to 1.0. risk_terms must be a short array of suspicious source "
+        "terms, or an empty array. Prefer ASMR-domain readings such as 絶頂, 媚薬, 耳舐め, 暗示, "
+        "快感, 10数える, メスイキ, クリトリス, おまんこ, and 出会いアプリ only when the audio "
+        "and surrounding context support them.\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
 def build_asr_text_review_repair_prompt(
     bad_response: str,
     error: str,
@@ -500,6 +533,58 @@ class LlamaServerTranslationClient:
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": n_predict or self.n_predict,
+            "stream": False,
+        }
+        response = self.client.post(f"{self.base_url}/v1/chat/completions", json=payload)
+        if response.status_code >= 400:
+            raise GemmaTextTranslationError(
+                f"Gemma text server error {response.status_code}: {response.text[:500]}"
+            )
+        data = response.json()
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, Mapping):
+                message = first.get("message")
+                if isinstance(message, Mapping) and isinstance(message.get("content"), str):
+                    return message["content"]
+                if isinstance(first.get("text"), str):
+                    return first["text"]
+        if isinstance(data.get("content"), str):
+            return data["content"]
+        raise GemmaTextTranslationError("Gemma text server response did not include content.")
+
+    def _complete_with_input_audio(
+        self,
+        prompt: str,
+        audio_path: str | Path,
+        *,
+        audio_format: str = "wav",
+        n_predict: int | None = None,
+    ) -> str:
+        try:
+            audio_data = Path(audio_path).read_bytes()
+        except OSError as exc:
+            raise GemmaTextTranslationError(f"Could not read ASR review audio clip: {audio_path}") from exc
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(audio_data).decode("ascii"),
+                                "format": audio_format,
+                            },
+                        },
+                    ],
+                }
+            ],
             "temperature": 0.0,
             "max_tokens": n_predict or self.n_predict,
             "stream": False,
@@ -717,6 +802,69 @@ class LlamaServerTranslationClient:
                 break
         raise GemmaTextTranslationError(f"Gemma ASR text review failed: {last_error}")
 
+    def review_asr_candidates_with_audio(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        batch_id: str,
+        audio_path: str | Path,
+    ) -> dict[str, dict[str, Any]]:
+        if len(items) != 1:
+            raise GemmaTextTranslationError("Gemma ASR audio review expects exactly one item per request.")
+        candidate_ids_by_chunk = {
+            str(item.get("chunk_id")): {
+                str(candidate.get("candidate_id"))
+                for candidate in item.get("candidates", [])
+                if isinstance(candidate, Mapping)
+            }
+            for item in items
+        }
+        prompt = build_asr_audio_text_review_prompt(items, batch_id)
+        raw_response = ""
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                raw_response = (
+                    self._complete_with_input_audio(prompt, audio_path)
+                    if attempt == 0
+                    else self._complete(
+                        build_asr_text_review_repair_prompt(
+                            raw_response,
+                            str(last_error),
+                            batch_id,
+                            items,
+                        )
+                    )
+                )
+                reviews = parse_asr_text_review_response(
+                    raw_response,
+                    batch_id=batch_id,
+                    model=self.model,
+                )
+                invalid = [
+                    f"{chunk_id}: invalid selected_candidate_id {review['selected_candidate_id']}"
+                    for chunk_id, review in reviews.items()
+                    if review["selected_candidate_id"] not in candidate_ids_by_chunk.get(chunk_id, set())
+                ]
+                if invalid:
+                    raise GemmaTextTranslationError("; ".join(invalid[:5]))
+                return {
+                    chunk_id: review
+                    for chunk_id, review in reviews.items()
+                    if chunk_id in candidate_ids_by_chunk
+                }
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                break
+            except (ValueError, GemmaTextTranslationError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    continue
+                break
+        raise GemmaTextTranslationError(f"Gemma ASR audio review failed: {last_error}")
+
 
 class MockTranslationClient:
     def __init__(self, model: str = "mock") -> None:
@@ -771,3 +919,12 @@ class MockTranslationClient:
                 "batch_id": batch_id,
             }
         return reviews
+
+    def review_asr_candidates_with_audio(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        batch_id: str,
+        audio_path: str | Path,
+    ) -> dict[str, dict[str, Any]]:
+        _ = audio_path
+        return self.review_asr_candidates(items, batch_id)

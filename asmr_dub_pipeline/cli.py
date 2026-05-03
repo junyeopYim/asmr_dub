@@ -57,6 +57,8 @@ AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".mp4", ".mkv", ".mov"}
 DEFAULT_VOICE_BANK_PROJECT_NAME = "voice_bank_all"
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
+    "asr_preset": "whisper",
+    "asr_diagnostics_enabled": True,
     "asr_text_review_enabled": True,
     "asr_text_review_generate_candidates": True,
     "asr_translation_backcheck_enabled": True,
@@ -469,6 +471,41 @@ def analyze(
 def transcribe(
     project: Path = typer.Option(..., "--project", "-p"),
     asr_backend: str = typer.Option("faster_whisper", "--asr-backend", help="faster_whisper|qwen_asr|mock"),
+    asr_preset: str | None = typer.Option(
+        None,
+        "--asr-preset",
+        help="Runtime ASR preset: default|conservative|whisper|no_vad_repair.",
+    ),
+    asr_vad_off: bool = typer.Option(
+        False,
+        "--asr-vad-off",
+        help="Disable VAD for the main ASR pass without editing pipeline.yaml.",
+    ),
+    asr_diagnostics: bool | None = typer.Option(
+        None,
+        "--asr-diagnostics/--no-asr-diagnostics",
+        help="Write unified ASR diagnostics artifacts for this run.",
+    ),
+    asr_device: str | None = typer.Option(
+        None,
+        "--asr-device",
+        help="Override faster-whisper device, e.g. auto|cuda|cpu.",
+    ),
+    asr_compute_type: str | None = typer.Option(
+        None,
+        "--asr-compute-type",
+        help="Override faster-whisper compute type, e.g. default|float16|int8_float16.",
+    ),
+    asr_batched: bool | None = typer.Option(
+        None,
+        "--asr-batched/--no-asr-batched",
+        help="Use faster-whisper BatchedInferencePipeline for higher GPU throughput.",
+    ),
+    asr_batch_size: int | None = typer.Option(
+        None,
+        "--asr-batch-size",
+        help="Batch size for faster-whisper batched inference.",
+    ),
     asr_text_review: bool = typer.Option(
         False,
         "--asr-text-review",
@@ -483,6 +520,13 @@ def transcribe(
             asr_backend,
             confirm_rights=confirm_rights,
             asr_text_review=True if asr_text_review else None,
+            asr_preset=asr_preset,
+            asr_vad_off=True if asr_vad_off else None,
+            asr_diagnostics=asr_diagnostics,
+            asr_device=asr_device,
+            asr_compute_type=asr_compute_type,
+            asr_batched_inference=asr_batched,
+            asr_batch_size=asr_batch_size,
         )
     except Exception as exc:
         _handle_error(exc)
@@ -1087,6 +1131,41 @@ def full(
         "--asr-backend",
         help="Override ASR backend for the transcribe stage: faster_whisper|qwen_asr|mock.",
     ),
+    asr_preset: str | None = typer.Option(
+        None,
+        "--asr-preset",
+        help="Runtime ASR preset for the transcribe stage: default|conservative|whisper|no_vad_repair.",
+    ),
+    asr_vad_off: bool = typer.Option(
+        False,
+        "--asr-vad-off",
+        help="Disable VAD for the main ASR pass during full runs.",
+    ),
+    asr_diagnostics: bool | None = typer.Option(
+        None,
+        "--asr-diagnostics/--no-asr-diagnostics",
+        help="Write unified ASR diagnostics artifacts during full runs.",
+    ),
+    asr_device: str | None = typer.Option(
+        None,
+        "--asr-device",
+        help="Override faster-whisper device during full runs, e.g. auto|cuda|cpu.",
+    ),
+    asr_compute_type: str | None = typer.Option(
+        None,
+        "--asr-compute-type",
+        help="Override faster-whisper compute type during full runs.",
+    ),
+    asr_batched: bool | None = typer.Option(
+        None,
+        "--asr-batched/--no-asr-batched",
+        help="Use faster-whisper BatchedInferencePipeline during full runs.",
+    ),
+    asr_batch_size: int | None = typer.Option(
+        None,
+        "--asr-batch-size",
+        help="Batch size for faster-whisper batched inference during full runs.",
+    ),
     target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
     gsv_url: str | None = typer.Option(None, "--gsv-url"),
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
@@ -1166,6 +1245,13 @@ def full(
             mock=not real,
             gemma_backend=gemma_backend if real else "mock",
             asr_backend=asr_backend,
+            asr_preset=asr_preset,
+            asr_vad_off=True if asr_vad_off else None,
+            asr_diagnostics=asr_diagnostics,
+            asr_device=asr_device,
+            asr_compute_type=asr_compute_type,
+            asr_batched_inference=asr_batched,
+            asr_batch_size=asr_batch_size,
             target_language=target_language,
             gsv_url=gsv_url,
             refs_path=refs,

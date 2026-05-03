@@ -4,13 +4,16 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
+
 from asmr_dub_pipeline.asr.base import ASRChunk
 from asmr_dub_pipeline.audio import separation as separation_module
+from asmr_dub_pipeline.audio.features import write_audio
 from asmr_dub_pipeline.audio.separation import separate_source_audio
 from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import create_project_structure, save_project_config
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
-from asmr_dub_pipeline.pipeline.manifest_io import load_manifest
+from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
 from asmr_dub_pipeline.pipeline.steps import (
     extract_step,
     segment_step,
@@ -91,6 +94,115 @@ def test_real_transcribe_runs_source_separation_and_uses_vocal_mono(
     assert captured["audio_path"] == Path(manifest.artifacts["source_vocals_mono_16k"])
     assert captured["audio_path"].name == "source_vocals_mono_16k.wav"
     assert manifest.stage_state["transcribe"]["status"] == "completed"
+
+
+def test_real_transcribe_falls_back_to_gemma_when_source_vocals_are_too_quiet(
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "transcribe_fallback_gemma"
+    create_project_structure(project)
+    save_project_config(
+        ProjectConfig(
+            project_name=project.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+        ),
+        project / "pipeline.yaml",
+    )
+    extract_step(tiny_wav_path, project, confirm_rights=True)
+    manifest = load_manifest(project)
+    silent_vocals = project / "work" / "audio" / "source_vocals_mono_16k.wav"
+    write_audio(silent_vocals, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    manifest.artifacts["source_vocals_mono_16k"] = str(silent_vocals)
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(project, manifest)
+    captured: dict[str, Path] = {}
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, audio_path: Path, segments: list[object]) -> list[ASRChunk]:
+            captured["audio_path"] = Path(audio_path)
+            return [ASRChunk(start=0.0, end=1.0, text="テスト", language="ja", confidence=0.9)]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert captured["audio_path"] == Path(manifest.artifacts["gemma_mono_16k"])
+    input_summary = json.loads(Path(manifest.artifacts["asr_input_diagnostics"]).read_text("utf-8"))
+    assert input_summary["selected"]["source"] == "gemma_mono_16k"
+    assert any("too_quiet" in warning for warning in input_summary["warnings"])
+    assert "asr_diagnostics" in manifest.artifacts
+
+
+def test_transcribe_passes_project_asr_config_to_backend(
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "transcribe_config"
+    create_project_structure(project)
+    save_project_config(
+        ProjectConfig(
+            project_name=project.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_model_id="custom/fw",
+            asr_language="ja",
+            asr_device="cuda",
+            asr_compute_type="float16",
+            asr_batched_inference=True,
+            asr_batch_size=16,
+            asr_beam_size=7,
+            asr_best_of=6,
+            asr_condition_on_previous_text=False,
+            asr_vad_filter=True,
+            asr_vad_parameters={"threshold": 0.25, "speech_pad_ms": 640},
+            asr_word_timestamps=True,
+            asr_hallucination_silence_threshold=0.75,
+            asr_initial_prompt="絶頂 媚薬",
+            asr_hotwords="耳舐め",
+        ),
+        project / "pipeline.yaml",
+    )
+    extract_step(tiny_wav_path, project, confirm_rights=True)
+    captured: dict[str, object] = {}
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[object]) -> list[ASRChunk]:
+            return [ASRChunk(start=0.0, end=1.0, text="テスト", language="ja", confidence=0.9)]
+
+    def fake_create(kind: str, config: dict[str, object]) -> FakeASRBackend:
+        captured["kind"] = kind
+        captured["config"] = config
+        return FakeASRBackend()
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", fake_create)
+
+    transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert captured["kind"] == "faster_whisper"
+    config = captured["config"]
+    assert isinstance(config, dict)
+    assert config["model_id"] == "custom/fw"
+    assert config["device"] == "cuda"
+    assert config["compute_type"] == "float16"
+    assert config["batched_inference"] is True
+    assert config["batch_size"] == 16
+    assert config["beam_size"] == 7
+    assert config["best_of"] == 6
+    assert config["vad_parameters"] == {"threshold": 0.25, "speech_pad_ms": 640}
+    assert config["word_timestamps"] is True
+    assert config["hallucination_silence_threshold"] == 0.75
+    assert config["initial_prompt"] == "絶頂 媚薬"
+    assert config["hotwords"] == "耳舐め"
 
 
 def test_source_separation_auto_reuses_existing_outputs_without_demucs(

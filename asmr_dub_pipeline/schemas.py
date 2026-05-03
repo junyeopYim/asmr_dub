@@ -43,6 +43,7 @@ TargetLanguage = Literal["ko"]
 GSVGPTWeightsPolicy = Literal["auto", "explicit", "few_shot", "base_for_korean", "unchanged"]
 GSVSoVITSWeightsPolicy = Literal["auto", "explicit", "few_shot", "unchanged"]
 SpeakerAssignmentBackend = Literal["none", "mock", "pyannote"]
+ASRPreset = Literal["default", "conservative", "whisper", "no_vad_repair"]
 
 
 def utc_now() -> datetime:
@@ -257,9 +258,14 @@ class ProjectConfig(StrictBaseModel):
     gemma_llama_cpp_seed: int = 12345
     gemma_llama_cpp_extra_args: list[str] = Field(default_factory=list)
     asr_backend: Literal["mock", "faster_whisper", "qwen_asr"] = "faster_whisper"
+    asr_preset: ASRPreset = "default"
     asr_model_id: str = "Systran/faster-whisper-large-v3"
     asr_language: str = "ja"
     asr_local_files_only: bool = True
+    asr_device: str = "auto"
+    asr_compute_type: str = "default"
+    asr_batched_inference: bool = False
+    asr_batch_size: int = Field(default=8, ge=1)
     asr_beam_size: int = Field(default=5, ge=1)
     asr_best_of: int = Field(default=5, ge=1)
     asr_condition_on_previous_text: bool = False
@@ -273,8 +279,13 @@ class ProjectConfig(StrictBaseModel):
     asr_hotwords: str = (
         "絶頂 媚薬 耳舐め 耳なめ 暗示 快感 10数える 飛んじゃってください "
         "気持ちいい イっちゃう さくら ジンジン 痺れる ザーメン 先走り液 "
-        "メスイキ クリトリス おまんこ おちんぽ 精液 潮吹き 出会いアプリ スケベ"
+        "メスイキ クリトリス おまんこ おちんぽ 精液 潮吹き 出会いアプリ スケベ "
+        "女体化 性感帯 四肢 採集 デイドリーム 採集マシーン エネルギー不足"
     )
+    asr_diagnostics_enabled: bool = True
+    asr_input_min_rms_dbfs: float = -75.0
+    asr_input_min_peak_dbfs: float = -65.0
+    asr_input_duration_tolerance: float = Field(default=0.08, ge=0.0, le=1.0)
     qwen_asr_model_id: str = "Qwen/Qwen3-ASR-1.7B"
     qwen_asr_forced_aligner_model_id: str | None = "Qwen/Qwen3-ForcedAligner-0.6B"
     qwen_asr_device_map: str = "cuda:0"
@@ -327,6 +338,7 @@ class ProjectConfig(StrictBaseModel):
     asr_repair_sparse_min_chars_per_sec: float = Field(default=1.0, ge=0)
     asr_repair_padding_sec: float = Field(default=1.0, ge=0)
     asr_repair_max_chunks: int = Field(default=160, ge=0)
+    asr_qwen_repair_fallback_enabled: bool = False
     asr_repair_suspicious_text_patterns: list[str] = Field(
         default_factory=lambda: [
             "もちなとい",
@@ -371,16 +383,33 @@ class ProjectConfig(StrictBaseModel):
             "体幹が弾ける": "快感が弾ける",
             "美薬": "媚薬",
             "微薬": "媚薬",
+            "女体科": "女体化",
+            "生還体": "性感帯",
+            "君の志士": "君の四肢",
+            "君の獅子": "君の四肢",
+            "エネルギー速化しています": "エネルギー不足しています",
+            "ああ 速化": "ああ 不足",
+            "簡易版最終マシーン": "簡易版採集マシーン",
+            "ドリーム最終": "ドリーム採集",
+            "最終には必要": "採集には必要",
+            "最終に必要": "採集に必要",
+            "最終を継続": "採集を継続",
+            "親城": "神社",
+            "愛 催眠": "甘い催眠",
+            "血のお耳": "右のお耳",
+            "いいえ 気が揺らぐ": "意識が揺らぐ",
+            "ぶり気持ちよく": "たっぷり気持ちよく",
         }
     )
     asr_text_review_enabled: bool = False
-    asr_text_review_backend: Literal["llama_server", "mock"] = "llama_server"
+    asr_text_review_backend: Literal["llama_server", "llama_server_audio", "mock"] = "llama_server"
     asr_text_review_batch_size: int = Field(default=8, ge=1, le=50)
     asr_text_review_max_chunks: int = Field(default=160, ge=0)
     asr_text_review_context_radius: int = Field(default=2, ge=0, le=8)
     asr_text_review_confidence_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
     asr_text_review_generate_candidates: bool = True
     asr_text_review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
+    asr_text_review_audio_padding_sec: float = Field(default=0.4, ge=0.0)
     asr_text_review_initial_prompt: str = ""
     asr_text_review_suspicious_text_patterns: list[str] = Field(
         default_factory=lambda: [

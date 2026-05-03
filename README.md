@@ -31,6 +31,12 @@ For local ASR transcription support:
 python -m pip install -e ".[asr,dev]"
 ```
 
+For optional Qwen ASR fallback checks during suspicious ASR repair:
+
+```bash
+python -m pip install -e ".[qwen-asr,dev]"
+```
+
 `ffmpeg` and `ffprobe` are runtime binaries. If they are missing, media extraction/export commands fail with a clear message; WAV-only mock tests can still use the Python fallback.
 
 ## Quickstart
@@ -77,6 +83,45 @@ faster-whisper transcription also defaults to rebuilding TTS segments from ASR
 chunks (`asr_resegment_from_chunks: true`) so long ASR sentences are not copied
 onto many tiny energy segments.
 
+## ASR Debugging
+
+When ASR breaks on whispery Japanese ASMR, debug in this order:
+
+1. Run only transcription with diagnostics:
+
+```bash
+asmr-dub transcribe --project ./project --asr-backend faster_whisper --asr-preset whisper --asr-diagnostics --confirm-rights
+```
+
+On a CUDA GPU with spare VRAM, keep the same model and decoding settings but
+increase throughput with faster-whisper batched inference:
+
+```bash
+asmr-dub transcribe --project ./project --asr-backend faster_whisper --asr-preset whisper --asr-device cuda --asr-compute-type float16 --asr-batched --asr-batch-size 16 --asr-diagnostics --confirm-rights
+```
+
+2. Inspect `work/transcribe/asr_input_diagnostics.json`,
+   `work/transcribe/asr_diagnostics_summary.json`, and
+   `work/transcribe/asr_diagnostics.json`. Check which audio was selected,
+   source-vocal RMS/peak/duration warnings, runtime device/compute/batch
+   settings, raw vs repaired chunks, prompt leak rejections, sparse chunks, and
+   manual-review reasons.
+
+3. If VAD appears to cut whispered syllables, try:
+
+```bash
+asmr-dub transcribe --project ./project --asr-backend faster_whisper --asr-preset no_vad_repair --asr-vad-off --asr-diagnostics --confirm-rights
+```
+
+4. If source-separated vocals are too quiet or duration-mismatched, the pipeline
+   falls back to `gemma_mono_16k` or an original-derived mono 16 kHz file and
+   records the decision in `asr_input_diagnostics`.
+
+5. To allow Qwen ASR as an optional suspicious-chunk repair verifier, install
+   `.[qwen-asr]` and set `asr_qwen_repair_fallback_enabled: true` in
+   `pipeline.yaml`. If `qwen-asr` is missing, transcription continues with a
+   warning and faster-whisper repair candidates only.
+
 Expected mock outputs:
 
 - `work/audio/original_stereo_48k.wav`
@@ -87,6 +132,9 @@ Expected mock outputs:
 - `work/segments/manifests/segments_gemma.json`
 - `work/segments/manifests/segments_script.json`
 - `work/transcribe/source_segments.jsonl` when `transcribe` is run
+- `work/transcribe/asr_input_diagnostics.json` when `transcribe` is run
+- `work/transcribe/asr_diagnostics_summary.json` when ASR diagnostics are enabled
+- `work/transcribe/asr_diagnostics.json` when ASR diagnostics are enabled
 - `work/translate_ko/translation_bundles.jsonl` when `translate-ko` is run
 - `work/tts/seg_0001_final.wav`
 - `work/rvc_train/rvc_train_manifest.json`

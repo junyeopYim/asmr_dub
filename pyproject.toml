@@ -26,12 +26,23 @@ hf = ["transformers>=4.56", "torch", "accelerate"]
 separation = ["demucs"]
 diarization = ["pyannote.audio>=4,<5"]
 dev = ["pytest>=8", "ruff>=0.5"]
+qwen-asr = [
+    "qwen-asr",
+]
 qwen = [
     "qwen-tts>=0.1.1",
 ]
 
 [project.scripts]
 asmr-dub = "asmr_dub_pipeline.cli:app"
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "qwen" },
+    { extra = "qwen-asr" },
+  ],
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["asmr_dub_pipeline"]

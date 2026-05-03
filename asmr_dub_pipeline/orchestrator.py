@@ -47,6 +47,13 @@ def run_pipeline(
     use_trained_gpt: bool = False,
     target_language: str | None = None,
     asr_backend: str | None = None,
+    asr_preset: str | None = None,
+    asr_vad_off: bool | None = None,
+    asr_diagnostics: bool | None = None,
+    asr_device: str | None = None,
+    asr_compute_type: str | None = None,
+    asr_batched_inference: bool | None = None,
+    asr_batch_size: int | None = None,
     voice_bank_path: Path | None = None,
     require_voice_bank: bool = False,
     source_separation_cache_project: Path | None = None,
@@ -56,6 +63,8 @@ def run_pipeline(
         gemma_backend = "mock"
     normalized_gemma_backend = gemma_backend.replace("-", "_")
     normalized_asr_backend = asr_backend.replace("-", "_") if asr_backend else None
+    if mock:
+        normalized_asr_backend = "mock"
     use_korean_text_lane = not mock and normalized_gemma_backend == "llama_cpp"
     init_project(project_dir)
     cfg = load_project_config(project_dir)
@@ -64,6 +73,9 @@ def run_pipeline(
         save_project_config(cfg, project_dir / "pipeline.yaml")
     if normalized_asr_backend is not None:
         cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "asr_backend": normalized_asr_backend})
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    if asr_preset is not None:
+        cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "asr_preset": asr_preset.replace("-", "_")})
         save_project_config(cfg, project_dir / "pipeline.yaml")
     if mock and (
         cfg.rvc_backend != "mock"
@@ -94,7 +106,17 @@ def run_pipeline(
         )
     source_separation_step(project_dir, confirm_rights)
     if use_korean_text_lane:
-        transcribe_step(project_dir, asr_backend=normalized_asr_backend)
+        transcribe_step(
+            project_dir,
+            asr_backend=normalized_asr_backend,
+            asr_preset=asr_preset,
+            asr_vad_off=asr_vad_off,
+            asr_diagnostics=asr_diagnostics,
+            asr_device=asr_device,
+            asr_compute_type=asr_compute_type,
+            asr_batched_inference=asr_batched_inference,
+            asr_batch_size=asr_batch_size,
+        )
         segment_step(project_dir)
         if use_voice_bank:
             assign_speakers_step(
@@ -117,7 +139,17 @@ def run_pipeline(
                 require_all=True,
             )
         if use_few_shot:
-            transcribe_step(project_dir, asr_backend=normalized_asr_backend)
+            transcribe_step(
+                project_dir,
+                asr_backend=normalized_asr_backend,
+                asr_preset=asr_preset,
+                asr_vad_off=asr_vad_off,
+                asr_diagnostics=asr_diagnostics,
+                asr_device=asr_device,
+                asr_compute_type=asr_compute_type,
+                asr_batched_inference=asr_batched_inference,
+                asr_batch_size=asr_batch_size,
+            )
         analyze_step(project_dir, gemma_backend)
         script_step(project_dir, gemma_backend)
         if use_few_shot:

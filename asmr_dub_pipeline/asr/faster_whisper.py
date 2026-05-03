@@ -60,6 +60,10 @@ class FasterWhisperASRBackend(ASRBackend):
         model_id: str,
         language: str = "ja",
         local_files_only: bool = True,
+        device: str = "auto",
+        compute_type: str = "default",
+        batched_inference: bool = False,
+        batch_size: int = 8,
         beam_size: int = 5,
         best_of: int = 5,
         condition_on_previous_text: bool = False,
@@ -73,6 +77,10 @@ class FasterWhisperASRBackend(ASRBackend):
         self.model_id = model_id
         self.language = language
         self.local_files_only = local_files_only
+        self.device = device
+        self.compute_type = compute_type
+        self.batched_inference = batched_inference
+        self.batch_size = batch_size
         self.beam_size = beam_size
         self.best_of = best_of
         self.condition_on_previous_text = condition_on_previous_text
@@ -83,6 +91,7 @@ class FasterWhisperASRBackend(ASRBackend):
         self.initial_prompt = initial_prompt.strip() if initial_prompt else None
         self.hotwords = hotwords.strip() if hotwords else None
         self._model: Any | None = None
+        self._batched_model: Any | None = None
 
     def _get_model(self) -> Any:
         try:
@@ -99,12 +108,28 @@ class FasterWhisperASRBackend(ASRBackend):
         try:
             self._model = WhisperModel(
                 model_size_or_path,
-                device="auto",
+                device=self.device,
+                compute_type=self.compute_type,
                 local_files_only=self.local_files_only,
             )
         except Exception as exc:
             raise ASRUnavailableError(f"faster-whisper model load failed: {exc}") from exc
         return self._model
+
+    def _get_transcriber(self, use_batched: bool) -> Any:
+        model = self._get_model()
+        if not use_batched:
+            return model
+        if self._batched_model is not None:
+            return self._batched_model
+        try:
+            from faster_whisper import BatchedInferencePipeline
+        except ImportError as exc:
+            raise ASRUnavailableError(
+                "faster-whisper BatchedInferencePipeline is not available in this installation."
+            ) from exc
+        self._batched_model = BatchedInferencePipeline(model=model)
+        return self._batched_model
 
     def transcribe_with_options(
         self,
@@ -113,6 +138,8 @@ class FasterWhisperASRBackend(ASRBackend):
         **overrides: Any,
     ) -> list[ASRChunk]:
         _ = segments
+        use_batched = bool(overrides.pop("batched_inference", self.batched_inference))
+        batch_size = int(overrides.pop("batch_size", self.batch_size))
         options = {
             "language": self.language,
             "beam_size": self.beam_size,
@@ -126,8 +153,11 @@ class FasterWhisperASRBackend(ASRBackend):
             "hotwords": self.hotwords,
         }
         options.update(overrides)
+        if use_batched:
+            options["batch_size"] = batch_size
+            options.setdefault("without_timestamps", False)
         try:
-            model = self._get_model()
+            model = self._get_transcriber(use_batched)
             raw_segments, info = model.transcribe(
                 str(audio_path),
                 **options,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import httpx
 import numpy as np
 import pytest
 
+from asmr_dub_pipeline import cli as cli_module
 from asmr_dub_pipeline import orchestrator
 from asmr_dub_pipeline.asr.base import ASRChunk, map_chunks_to_segments
 from asmr_dub_pipeline.audio.features import duration_sec, write_audio
@@ -202,6 +204,85 @@ def test_transcribe_asr_text_review_mock_selects_domain_candidate(
         {"candidate_id": "original", "text": "もっと大きな手帳が来る"},
         {"candidate_id": "domain_replacement", "text": "もっと大きな絶頂が来る"},
     ]
+
+
+def test_transcribe_asr_audio_review_passes_clip_to_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_text_review_enabled=True,
+            asr_text_review_backend="llama_server_audio",
+            asr_text_review_audio_padding_sec=0.05,
+            gemma_text_server_auto_start=False,
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text="もっと大きな手帳が来る",
+                    language="ja",
+                    confidence=0.99,
+                )
+            ]
+
+    review_calls: list[tuple[str, Path, list[dict[str, object]]]] = []
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def review_asr_candidates_with_audio(
+            self,
+            items: list[dict[str, object]],
+            batch_id: str,
+            audio_path: Path,
+        ) -> dict[str, dict[str, object]]:
+            assert audio_path.exists()
+            review_calls.append((batch_id, audio_path, items))
+            return {
+                "chunk_0001": {
+                    "chunk_id": "chunk_0001",
+                    "decision": "replace",
+                    "selected_candidate_id": "domain_replacement",
+                    "confidence": 0.99,
+                    "reason": "audio and context support 絶頂.",
+                    "risk_terms": ["手帳"],
+                }
+            }
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert review_calls
+    assert manifest.segments[0].source_script is not None
+    assert manifest.segments[0].source_script.text == "もっと大きな絶頂が来る"
+    summary = json.loads(Path(manifest.artifacts["asr_text_review_summary"]).read_text("utf-8"))
+    assert summary["backend"] == "llama_server_audio"
+    assert summary["audio_input"]["enabled"] is True
+    assert summary["audio_input"]["created"] == 1
+    assert summary["items"][0]["audio_clip"]["path"] == str(review_calls[0][1])
 
 
 def test_asr_text_review_generates_retranscribe_candidates(
@@ -451,6 +532,86 @@ def test_asr_repair_replaces_suspicious_chunk_with_no_vad_candidate(
     assert backend.calls[0][1]["hotwords"] is None
 
 
+def test_asr_repair_tries_next_candidate_when_first_candidate_prompt_leaks(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((24_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, start, end, sample_rate, channels
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return [
+                    ASRChunk(
+                        start=0.0,
+                        end=1.0,
+                        text="ご視聴ありがとうございました",
+                        language="ja",
+                        confidence=0.99,
+                    )
+                ]
+            return [
+                ASRChunk(
+                    start=0.2,
+                    end=1.3,
+                    text="ゾクゾクしますね",
+                    language="ja",
+                    confidence=0.95,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    backend = FakeBackend()
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [
+            ASRChunk(
+                start=4.0,
+                end=5.4,
+                text="付属しますね",
+                language="ja",
+                confidence=0.82,
+            )
+        ],
+        backend=backend,
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=8.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+    )
+
+    assert len(backend.calls) >= 2
+    assert summary["repaired"] == 1
+    assert summary["items"][0]["accepted_candidate_id"] != summary["items"][0]["attempts"][0]["candidate_id"]
+    assert summary["items"][0]["attempts"][0]["prompt_leaked"] is True
+    assert repaired[0].text == "ゾクゾクしますね"
+
+
 def test_asr_repair_splits_long_suspicious_group_before_retranscribe(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -664,6 +825,171 @@ def test_asr_text_replacements_normalize_known_domain_mishears() -> None:
     assert chunks[1].text == "媚薬を塗り込んで"
 
 
+def test_asr_text_replacements_include_observed_midcheck_mishears() -> None:
+    replacements = ProjectConfig().asr_text_replacements
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="女体科の薬で全身生還体になる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="君の志士は拘束されている",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=12.0,
+                text="簡易版最終マシーンでドリーム最終を継続",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=12.0,
+                end=16.0,
+                text="エネルギー速化しています ああ 速化",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=16.0,
+                end=20.0,
+                text="雨宿りをするために駆け込んだ親城",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=20.0,
+                end=24.0,
+                text="愛 催眠へと引きずり込む 血のお耳も敏感になる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=24.0,
+                end=28.0,
+                text="いいえ 気が揺らぐ ぶり気持ちよくなろうね",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        replacements,
+    )
+
+    assert summary["chunks_changed"] == 7
+    assert summary["total_replacements"] == 13
+    assert chunks[0].text == "女体化の薬で全身性感帯になる"
+    assert chunks[1].text == "君の四肢は拘束されている"
+    assert chunks[2].text == "簡易版採集マシーンでドリーム採集を継続"
+    assert chunks[3].text == "エネルギー不足しています ああ 不足"
+    assert chunks[4].text == "雨宿りをするために駆け込んだ神社"
+    assert chunks[5].text == "甘い催眠へと引きずり込む 右のお耳も敏感になる"
+    assert chunks[6].text == "意識が揺らぐ たっぷり気持ちよくなろうね"
+
+
+def test_transcribe_writes_unified_asr_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_text_review_enabled=False,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text="釣りが来ちゃう",
+                    language="ja",
+                    confidence=0.74,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper", confirm_rights=True)
+
+    diagnostics_path = Path(manifest.artifacts["asr_diagnostics"])
+    summary_path = Path(manifest.artifacts["asr_diagnostics_summary"])
+    diagnostics = json.loads(diagnostics_path.read_text("utf-8"))
+    summary = json.loads(summary_path.read_text("utf-8"))
+    assert diagnostics["raw_asr_chunks"][0]["text"] == "釣りが来ちゃう"
+    assert diagnostics["repaired_asr_chunks"][0]["text"] == "釣りが来ちゃう"
+    assert diagnostics["final_asr_chunks"][0]["text"] == "絶頂が来ちゃう"
+    assert diagnostics["final_asr_chunks"][0]["text_density"] > 0
+    assert diagnostics["final_asr_chunks"][0]["replacement_hits"][0]["source"] == "釣りが来ちゃう"
+    assert diagnostics["vad"]["vad_filter"] is True
+    assert summary["raw_asr_chunk_count"] == 1
+    assert summary["final_asr_chunk_count"] == 1
+    assert summary["text_replacements"]["total_replacements"] == 1
+    assert manifest.artifacts["asr_input_diagnostics"]
+
+
+def test_transcribe_qwen_repair_fallback_skips_when_dependency_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_qwen_repair_fallback_enabled=True,
+            asr_repair_enabled=True,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(start=0.0, end=2.0, text="付属しますね", language="ja", confidence=0.7)
+            ]
+
+        def transcribe_with_options(
+            self,
+            _audio_path: Path,
+            _segments: list[Segment],
+            **_kwargs: object,
+        ) -> list[ASRChunk]:
+            return [
+                ASRChunk(start=0.0, end=2.0, text="付属しますね", language="ja", confidence=0.7)
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+    monkeypatch.setattr(pipeline_steps, "_qwen_asr_dependency_available", lambda: False)
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper", confirm_rights=True)
+
+    diagnostics = json.loads(Path(manifest.artifacts["asr_diagnostics"]).read_text("utf-8"))
+    assert diagnostics["qwen_repair_fallback"]["enabled"] is True
+    assert diagnostics["qwen_repair_fallback"]["available"] is False
+    assert any("qwen-asr" in warning for warning in manifest.warnings)
+
+
 def test_source_script_and_korean_translation_schema_round_trip() -> None:
     segment = sample_segment()
     segment.source_script = SourceScript(
@@ -718,7 +1044,14 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().asr_repair_padding_sec == pytest.approx(1.0)
     assert ProjectConfig().asr_repair_max_chunks == 160
     assert "もちなとい" in ProjectConfig().asr_repair_suspicious_text_patterns
+    assert ProjectConfig(asr_text_review_backend="llama_server_audio").asr_text_review_backend == "llama_server_audio"
+    assert ProjectConfig().asr_text_review_audio_padding_sec == pytest.approx(0.4)
+    assert "女体化" in ProjectConfig().asr_hotwords
+    assert "性感帯" in ProjectConfig().asr_hotwords
+    assert "採集マシーン" in ProjectConfig().asr_hotwords
     assert ProjectConfig().asr_text_replacements["釣りが来ちゃう"] == "絶頂が来ちゃう"
+    assert ProjectConfig().asr_text_replacements["女体科"] == "女体化"
+    assert ProjectConfig().asr_text_replacements["生還体"] == "性感帯"
     assert ProjectConfig().source_separation_backend == "demucs"
     assert ProjectConfig().source_separation_model == "htdemucs"
     assert ProjectConfig().gsv_trim_edge_silence is True
@@ -1349,7 +1682,7 @@ def test_translate_ko_retranslates_legacy_deterministic_numeric_results(
 
     monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
 
-    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
 
     manifest = load_manifest(tmp_project_dir)
     translation = manifest.segments[0].translation_ko
@@ -1393,7 +1726,7 @@ def test_translate_ko_force_retranslate_ignores_resumed_translations(
 
     monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
 
-    translate_ko_step(tmp_project_dir, gemma_text_backend="mock")
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
     first_manifest = load_manifest(tmp_project_dir)
     first_translation = first_manifest.segments[0].translation_ko
     assert first_translation is not None
@@ -1616,6 +1949,64 @@ def test_llama_server_translation_client_reviews_asr_candidates() -> None:
     prompt = requests[0]["messages"][0]["content"]
     assert "japanese_asr_candidate_review" in prompt
     assert "もっと大きな絶頂が来る" in prompt
+
+
+def test_llama_server_translation_client_reviews_asr_candidates_with_audio(tmp_path: Path) -> None:
+    requests: list[dict[str, object]] = []
+    audio_path = tmp_path / "chunk_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+    response = [
+        {
+            "chunk_id": "chunk_0001",
+            "decision": "replace",
+            "selected_candidate_id": "domain_replacement",
+            "confidence": 0.94,
+            "reason": "Attached audio supports 絶頂.",
+            "risk_terms": ["手帳"],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]},
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=0,
+        n_predict=128,
+    )
+    reviews = client.review_asr_candidates_with_audio(
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "audio_clip_path": str(audio_path),
+                "context_before": [{"text": "もっと大きな"}],
+                "context_after": [{"text": "行く"}],
+                "candidates": [
+                    {"candidate_id": "original", "text": "もっと大きな手帳が来る"},
+                    {"candidate_id": "domain_replacement", "text": "もっと大きな絶頂が来る"},
+                ],
+            }
+        ],
+        "asr_review_0001",
+        audio_path,
+    )
+
+    assert reviews["chunk_0001"]["selected_candidate_id"] == "domain_replacement"
+    content = requests[0]["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "japanese_asr_audio_candidate_review" in content[0]["text"]
+    assert "You cannot hear the audio" not in content[0]["text"]
+    assert "audio_clip_path" not in content[0]["text"]
+    assert content[1]["type"] == "input_audio"
+    assert content[1]["input_audio"]["format"] == "wav"
+    assert base64.b64decode(content[1]["input_audio"]["data"]) == audio_path.read_bytes()
 
 
 def test_llama_server_translation_client_rejects_non_candidate_asr_text() -> None:
@@ -2012,6 +2403,45 @@ def test_transcribe_and_translate_mock_steps_write_artifacts(
     assert summary["translated"] == len(manifest.segments)
 
 
+def test_translate_ko_skips_manual_review_segments_even_with_source_text(
+    tmp_project_dir: Path,
+) -> None:
+    segment = sample_segment(start=0.0, end=18.0)
+    segment.status = "needs_manual_review"
+    segment.errors.append("asr_sparse_text_density")
+    segment.source_script = SourceScript(
+        text="ム",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=18.0,
+        confidence=0.95,
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["transcribe"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].translation_ko is None
+    assert manifest.stage_state["translate-ko"]["translated"] == 0
+    assert manifest.stage_state["translate-ko"]["needs_manual_review"] == 1
+    rows = [
+        json.loads(line)
+        for line in Path(manifest.artifacts["translation_bundles"]).read_text().splitlines()
+    ]
+    assert rows == [
+        {
+            "segment_id": "seg_0001",
+            "status": "needs_manual_review",
+            "reason": "segment status is needs_manual_review",
+            "source_text": "ム",
+            "translation_ko": None,
+        }
+    ]
+
+
 def test_korean_script_blocks_japanese_fallback_text(tmp_project_dir: Path) -> None:
     segment = Segment(
         id="seg_0001",
@@ -2069,6 +2499,54 @@ def test_transcribe_and_translate_mock_cli(
     manifest = load_manifest(tmp_project_dir)
     assert manifest.segments[0].source_script is not None
     assert manifest.segments[0].translation_ko is not None
+
+
+def test_transcribe_cli_accepts_asr_debug_options(
+    cli_runner,
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_transcribe_step(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest()
+
+    monkeypatch.setattr(cli_module, "transcribe_step", fake_transcribe_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "transcribe",
+            "-p",
+            str(tmp_project_dir),
+            "--asr-backend",
+            "faster_whisper",
+            "--asr-preset",
+            "whisper",
+            "--asr-vad-off",
+            "--asr-diagnostics",
+            "--asr-device",
+            "cuda",
+            "--asr-compute-type",
+            "float16",
+            "--asr-batched",
+            "--asr-batch-size",
+            "16",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["asr_preset"] == "whisper"
+    assert kwargs["asr_vad_off"] is True
+    assert kwargs["asr_diagnostics"] is True
+    assert kwargs["asr_device"] == "cuda"
+    assert kwargs["asr_compute_type"] == "float16"
+    assert kwargs["asr_batched_inference"] is True
+    assert kwargs["asr_batch_size"] == 16
 
 
 def test_translate_ko_requires_transcribe_stage(tiny_wav_path: Path, tmp_project_dir: Path) -> None:

@@ -2,9 +2,20 @@ background_gain_db: -18.0
 base_seed: 12345
 candidate_count: 1
 asr_backend: faster_whisper
+asr_preset: default
 asr_language: ja
 asr_local_files_only: true
 asr_model_id: Systran/faster-whisper-large-v3
+asr_device: auto
+asr_compute_type: default
+asr_batched_inference: false
+asr_batch_size: 8
+asr_diagnostics_enabled: true
+asr_qwen_repair_fallback_enabled: false
+asr_vad_filter: true
+asr_vad_parameters:
+  min_silence_duration_ms: 300
+  speech_pad_ms: 200
 asr_resegment_from_chunks: true
 asr_resegment_merge_gap_sec: 0.6
 asr_resegment_min_sec: 1.0

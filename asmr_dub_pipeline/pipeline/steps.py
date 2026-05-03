@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import re
@@ -19,7 +20,12 @@ import numpy as np
 import soundfile as sf
 from rich.markup import escape
 
-from asmr_dub_pipeline.asr import ASRChunk, create_asr_backend, map_chunks_to_segments
+from asmr_dub_pipeline.asr import (
+    ASRChunk,
+    ASRUnavailableError,
+    create_asr_backend,
+    map_chunks_to_segments,
+)
 from asmr_dub_pipeline.audio import ffmpeg
 from asmr_dub_pipeline.audio.duration import duration_ratio, suggest_speed_factor
 from asmr_dub_pipeline.audio.features import (
@@ -27,7 +33,9 @@ from asmr_dub_pipeline.audio.features import (
     duration_sec,
     load_audio,
     peak_dbfs,
+    resample_linear,
     rms_dbfs,
+    to_mono,
     trim_edge_silence,
     write_audio,
 )
@@ -709,17 +717,25 @@ def _asr_text_matches_suspicious_pattern(
     text: str,
     suspicious_text_patterns: list[str] | tuple[str, ...],
 ) -> bool:
+    return bool(_asr_suspicious_pattern_hits(text, suspicious_text_patterns))
+
+
+def _asr_suspicious_pattern_hits(
+    text: str,
+    suspicious_text_patterns: list[str] | tuple[str, ...],
+) -> list[str]:
+    hits: list[str] = []
     for pattern in suspicious_text_patterns:
         pattern = pattern.strip()
         if not pattern:
             continue
         try:
             if re.search(pattern, text):
-                return True
+                hits.append(pattern)
         except re.error:
             if pattern in text:
-                return True
-    return False
+                hits.append(pattern)
+    return hits
 
 
 def _asr_chunk_needs_repair(
@@ -761,22 +777,61 @@ def _apply_asr_text_replacements_to_chunks(
     chunks: list[ASRChunk],
     replacements: dict[str, str],
 ) -> tuple[list[ASRChunk], int]:
+    normalized_chunks, summary = _apply_asr_text_replacements_to_chunks_with_summary(
+        chunks,
+        replacements,
+    )
+    return normalized_chunks, int(summary["chunks_changed"])
+
+
+def _replacement_hits(text: str, replacements: dict[str, str]) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for source, target in replacements.items():
+        if not source:
+            continue
+        count = text.count(source)
+        if count > 0:
+            hits.append({"source": source, "target": target, "count": count})
+    return hits
+
+
+def _apply_asr_text_replacements_to_chunks_with_summary(
+    chunks: list[ASRChunk],
+    replacements: dict[str, str],
+) -> tuple[list[ASRChunk], dict[str, Any]]:
     if not replacements:
-        return chunks, 0
-    replaced_count = 0
+        return chunks, {"chunks_changed": 0, "total_replacements": 0, "items": []}
+    chunks_changed = 0
+    total_replacements = 0
+    items: list[dict[str, Any]] = []
     normalized_chunks: list[ASRChunk] = []
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks, start=1):
         text = chunk.text
         normalized = text
-        for source, target in replacements.items():
-            if source:
-                normalized = normalized.replace(source, target)
+        hits = _replacement_hits(text, replacements)
+        for hit in hits:
+            normalized = normalized.replace(str(hit["source"]), str(hit["target"]))
         if normalized != text:
-            replaced_count += 1
+            chunks_changed += 1
+            total_replacements += sum(int(hit["count"]) for hit in hits)
+            items.append(
+                {
+                    "chunk_id": f"chunk_{index:04d}",
+                    "start": round(chunk.start, 3),
+                    "end": round(chunk.end, 3),
+                    "original_text": text,
+                    "replaced_text": normalized,
+                    "hits": hits,
+                }
+            )
             normalized_chunks.append(chunk.model_copy(update={"text": normalized}))
         else:
             normalized_chunks.append(chunk)
-    return normalized_chunks, replaced_count
+    return normalized_chunks, {
+        "chunks_changed": chunks_changed,
+        "total_replacements": total_replacements,
+        "items": items,
+    }
 
 
 def _asr_repair_candidate_is_better(
@@ -875,6 +930,156 @@ def _transcribe_with_backend_options(
     return backend.transcribe(audio_path, segments)
 
 
+def _asr_repair_candidate_options(cfg: Any) -> list[dict[str, Any]]:
+    clean_options: dict[str, Any] = {
+        "vad_filter": False,
+        "vad_parameters": None,
+        "condition_on_previous_text": False,
+        "word_timestamps": False,
+        "hallucination_silence_threshold": None,
+        "initial_prompt": None,
+        "hotwords": None,
+    }
+    vad_parameters = dict(getattr(cfg, "asr_vad_parameters", {}) or {})
+    prompted_options: dict[str, Any] = {
+        "vad_filter": bool(getattr(cfg, "asr_vad_filter", True)),
+        "vad_parameters": vad_parameters or None,
+        "condition_on_previous_text": False,
+        "word_timestamps": bool(getattr(cfg, "asr_word_timestamps", False)),
+        "hallucination_silence_threshold": getattr(cfg, "asr_hallucination_silence_threshold", None),
+        "initial_prompt": str(getattr(cfg, "asr_initial_prompt", "") or "").strip() or None,
+        "hotwords": str(getattr(cfg, "asr_hotwords", "") or "").strip() or None,
+    }
+    base_padding = float(getattr(cfg, "asr_repair_padding_sec", 1.0))
+    hallucination_threshold = getattr(cfg, "asr_hallucination_silence_threshold", None) or 1.0
+    return [
+        {
+            "candidate_id": "no_vad_clean",
+            "padding_sec": base_padding,
+            "overrides": clean_options,
+        },
+        {
+            "candidate_id": "vad_no_hotwords",
+            "padding_sec": base_padding,
+            "overrides": {**prompted_options, "hotwords": None},
+        },
+        {
+            "candidate_id": "vad_no_prompt",
+            "padding_sec": base_padding,
+            "overrides": {**prompted_options, "initial_prompt": None},
+        },
+        {
+            "candidate_id": "wide_no_vad_clean",
+            "padding_sec": max(base_padding * 2.0, base_padding + 0.8),
+            "overrides": clean_options,
+        },
+        {
+            "candidate_id": "word_ts_hallucination_guard",
+            "padding_sec": base_padding,
+            "overrides": {
+                **clean_options,
+                "word_timestamps": True,
+                "hallucination_silence_threshold": hallucination_threshold,
+            },
+        },
+    ]
+
+
+def _asr_repair_candidate_score(
+    original: ASRChunk,
+    candidate_chunks: list[ASRChunk],
+    *,
+    cfg: Any,
+    prompt_leaked: bool,
+) -> tuple[bool, float, str]:
+    candidate_text = _asr_candidate_text(candidate_chunks)
+    original_text = original.text.strip()
+    if not candidate_text:
+        return False, -100.0, "empty_candidate"
+    if prompt_leaked:
+        return False, -90.0, "prompt_or_hallucination_leak"
+    if _asr_candidate_looks_prompt_leaked(original_text, cfg) and not _asr_candidate_looks_prompt_leaked(candidate_text, cfg):
+        leak_improvement = 2.0
+    else:
+        leak_improvement = 0.0
+    accepted = _asr_repair_candidate_is_better(
+        original,
+        candidate_chunks,
+        confidence_threshold=cfg.asr_repair_confidence_threshold,
+        sparse_min_sec=cfg.asr_repair_sparse_min_sec,
+        sparse_min_chars_per_sec=cfg.asr_repair_sparse_min_chars_per_sec,
+        suspicious_text_patterns=cfg.asr_repair_suspicious_text_patterns,
+    )
+    if not accepted:
+        return False, -10.0 + leak_improvement, "not_confidently_better_than_original"
+    candidate_confidence = _asr_candidate_confidence(candidate_chunks)
+    original_confidence = original.confidence
+    confidence_delta = 0.0
+    if candidate_confidence is not None and original_confidence is not None:
+        confidence_delta = candidate_confidence - original_confidence
+    original_suspicious = _asr_text_matches_suspicious_pattern(
+        original_text,
+        cfg.asr_repair_suspicious_text_patterns,
+    )
+    candidate_suspicious = _asr_text_matches_suspicious_pattern(
+        candidate_text,
+        cfg.asr_repair_suspicious_text_patterns,
+    )
+    suspicious_improvement = 2.0 if original_suspicious and not candidate_suspicious else 0.0
+    original_density = _asr_text_density(original)
+    candidate_duration = max(0.001, candidate_chunks[-1].end - candidate_chunks[0].start)
+    candidate_density = len(candidate_text) / candidate_duration
+    density_delta = min(2.0, max(-2.0, candidate_density - original_density))
+    length_ratio = len(candidate_text) / max(1, len(original_text))
+    length_score = 0.5 if 0.6 <= length_ratio <= 1.8 else -0.5
+    score = (
+        suspicious_improvement
+        + leak_improvement
+        + confidence_delta
+        + density_delta * 0.25
+        + length_score
+    )
+    return True, score, "accepted"
+
+
+def _asr_repair_attempt_payload(
+    *,
+    candidate_id: str,
+    clip_start: float,
+    clip_end: float,
+    candidate_chunks: list[ASRChunk],
+    prompt_leaked: bool,
+    accepted: bool,
+    score: float,
+    reason: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    candidate_text = _asr_candidate_text(candidate_chunks)
+    return {
+        "candidate_id": candidate_id,
+        "clip_start": round(clip_start, 3),
+        "clip_end": round(clip_end, 3),
+        "accepted": accepted,
+        "score": round(score, 6),
+        "reason": reason,
+        "prompt_leaked": prompt_leaked,
+        "candidate_text": candidate_text,
+        "confidence": _asr_candidate_confidence(candidate_chunks),
+        "duration": round(
+            max(0.0, candidate_chunks[-1].end - candidate_chunks[0].start) if candidate_chunks else 0.0,
+            3,
+        ),
+        "text_density": round(
+            len(candidate_text)
+            / max(0.001, candidate_chunks[-1].end - candidate_chunks[0].start)
+            if candidate_chunks
+            else 0.0,
+            6,
+        ),
+        "error": error,
+    }
+
+
 def _split_asr_chunks_for_repair(
     chunks: list[ASRChunk],
     *,
@@ -903,6 +1108,7 @@ def _repair_asr_chunks(
     repair_audio_path: Path,
     audio_duration_sec: float,
     cfg: Any,
+    qwen_fallback_backend: Any | None = None,
 ) -> tuple[list[ASRChunk], dict[str, Any]]:
     summary: dict[str, Any] = {
         "enabled": bool(cfg.asr_repair_enabled),
@@ -971,47 +1177,6 @@ def _repair_asr_chunks(
         attempted += 1
         group_start = group[0].start
         group_end = group[-1].end
-        clip_start = max(0.0, group_start - cfg.asr_repair_padding_sec)
-        clip_end = min(audio_duration_sec, group_end + cfg.asr_repair_padding_sec)
-        clip_path = repair_dir / f"repair_{attempted:04d}.wav"
-        ffmpeg.slice_audio(
-            repair_audio_path,
-            clip_start,
-            clip_end,
-            clip_path,
-            sample_rate=cfg.gemma_sample_rate,
-            channels=1,
-        )
-        candidate_local = _transcribe_with_backend_options(
-            backend,
-            clip_path,
-            [],
-            vad_filter=False,
-            vad_parameters=None,
-            condition_on_previous_text=False,
-            word_timestamps=False,
-            hallucination_silence_threshold=None,
-            initial_prompt=None,
-            hotwords=None,
-        )
-        candidate_text = _asr_candidate_text(candidate_local)
-        prompt_leaked = _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
-        candidate_abs = [
-            candidate.model_copy(
-                update={
-                    "start": max(group_start, min(group_end, clip_start + candidate.start)),
-                    "end": max(group_start, min(group_end, clip_start + candidate.end)),
-                }
-            )
-            for candidate in candidate_local
-        ]
-        candidate_abs = _valid_asr_chunks(
-            candidate_abs,
-            audio_duration_sec,
-            max_chunk_sec=cfg.asr_resegment_max_sec,
-            sparse_chunk_max_sec=cfg.asr_sparse_chunk_max_sec,
-            sparse_chunk_min_chars_per_sec=cfg.asr_sparse_chunk_min_chars_per_sec,
-        )
         original = ASRChunk(
             start=group_start,
             end=group_end,
@@ -1019,28 +1184,113 @@ def _repair_asr_chunks(
             language=group[0].language,
             confidence=_asr_candidate_confidence(group),
         )
-        accepted = _asr_repair_candidate_is_better(
-            original,
-            candidate_abs,
-            confidence_threshold=cfg.asr_repair_confidence_threshold,
-            sparse_min_sec=cfg.asr_repair_sparse_min_sec,
-            sparse_min_chars_per_sec=cfg.asr_repair_sparse_min_chars_per_sec,
-            suspicious_text_patterns=cfg.asr_repair_suspicious_text_patterns,
-        )
-        if prompt_leaked:
-            accepted = False
+        option_specs = _asr_repair_candidate_options(cfg)
+        if qwen_fallback_backend is not None:
+            option_specs.append(
+                {
+                    "candidate_id": "qwen_asr_fallback",
+                    "padding_sec": float(getattr(cfg, "asr_repair_padding_sec", 1.0)),
+                    "overrides": {},
+                    "backend": qwen_fallback_backend,
+                }
+            )
+        attempts: list[dict[str, Any]] = []
+        best_candidate: list[ASRChunk] = []
+        best_candidate_id: str | None = None
+        best_score = -math.inf
+        for option in option_specs:
+            candidate_id = str(option["candidate_id"])
+            padding_sec = float(option["padding_sec"])
+            clip_start = max(0.0, group_start - padding_sec)
+            clip_end = min(audio_duration_sec, group_end + padding_sec)
+            clip_path = repair_dir / f"repair_{attempted:04d}_{candidate_id}.wav"
+            try:
+                ffmpeg.slice_audio(
+                    repair_audio_path,
+                    clip_start,
+                    clip_end,
+                    clip_path,
+                    sample_rate=cfg.gemma_sample_rate,
+                    channels=1,
+                )
+                candidate_backend = option.get("backend", backend)
+                candidate_local = _transcribe_with_backend_options(
+                    candidate_backend,
+                    clip_path,
+                    [],
+                    **dict(option.get("overrides") or {}),
+                )
+                candidate_text = _asr_candidate_text(candidate_local)
+                prompt_leaked = _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
+                candidate_abs = [
+                    candidate.model_copy(
+                        update={
+                            "start": max(group_start, min(group_end, clip_start + candidate.start)),
+                            "end": max(group_start, min(group_end, clip_start + candidate.end)),
+                        }
+                    )
+                    for candidate in candidate_local
+                ]
+                candidate_abs = _valid_asr_chunks(
+                    candidate_abs,
+                    audio_duration_sec,
+                    max_chunk_sec=cfg.asr_resegment_max_sec,
+                    sparse_chunk_max_sec=cfg.asr_sparse_chunk_max_sec,
+                    sparse_chunk_min_chars_per_sec=cfg.asr_sparse_chunk_min_chars_per_sec,
+                )
+                accepted, score, reason = _asr_repair_candidate_score(
+                    original,
+                    candidate_abs,
+                    cfg=cfg,
+                    prompt_leaked=prompt_leaked,
+                )
+                attempts.append(
+                    _asr_repair_attempt_payload(
+                        candidate_id=candidate_id,
+                        clip_start=clip_start,
+                        clip_end=clip_end,
+                        candidate_chunks=candidate_abs,
+                        prompt_leaked=prompt_leaked,
+                        accepted=accepted,
+                        score=score,
+                        reason=reason,
+                    )
+                )
+                if accepted and score > best_score:
+                    best_score = score
+                    best_candidate = candidate_abs
+                    best_candidate_id = candidate_id
+                    if score >= 0.5:
+                        break
+            except Exception as exc:
+                attempts.append(
+                    _asr_repair_attempt_payload(
+                        candidate_id=candidate_id,
+                        clip_start=clip_start,
+                        clip_end=clip_end,
+                        candidate_chunks=[],
+                        prompt_leaked=False,
+                        accepted=False,
+                        score=-100.0,
+                        reason="transcribe_failed",
+                        error=str(exc),
+                    )
+                )
+        accepted = bool(best_candidate)
         summary["items"].append(
             {
                 "start": round(group_start, 3),
                 "end": round(group_end, 3),
                 "accepted": accepted,
-                "prompt_leaked": prompt_leaked,
+                "accepted_candidate_id": best_candidate_id,
+                "prompt_leaked": any(bool(attempt.get("prompt_leaked")) for attempt in attempts),
                 "original_text": original.text,
-                "candidate_text": _asr_candidate_text(candidate_abs),
+                "candidate_text": _asr_candidate_text(best_candidate),
+                "attempts": attempts,
             }
         )
         if accepted:
-            repaired_chunks.extend(candidate_abs)
+            repaired_chunks.extend(best_candidate)
             summary["repaired"] += 1
         else:
             repaired_chunks.extend(group)
@@ -1252,6 +1502,78 @@ def _add_generated_asr_review_candidates(
     return generated
 
 
+def _attach_asr_review_audio_clips(
+    review_items: list[dict[str, Any]],
+    *,
+    project_dir: Path,
+    review_audio_path: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "created": 0,
+        "padding_sec": float(getattr(cfg, "asr_text_review_audio_padding_sec", 0.4)),
+        "error": None,
+        "items": [],
+    }
+    if not review_audio_path.exists():
+        summary["error"] = f"review audio not found: {review_audio_path}"
+        return summary
+
+    review_dir = project_dir / "work" / "transcribe" / "asr_text_review_audio_clips"
+    padding_sec = max(0.0, float(summary["padding_sec"]))
+    for item in review_items:
+        chunk_id = str(item.get("chunk_id") or "chunk")
+        start = float(item["start"])
+        end = float(item["end"])
+        clip_start = max(0.0, start - padding_sec)
+        clip_end = min(audio_duration_sec, end + padding_sec)
+        if clip_end <= clip_start:
+            summary["items"].append(
+                {
+                    "chunk_id": chunk_id,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "created": False,
+                    "error": "empty_audio_window",
+                }
+            )
+            continue
+        clip_path = review_dir / f"{chunk_id}.wav"
+        try:
+            ffmpeg.slice_audio(
+                review_audio_path,
+                clip_start,
+                clip_end,
+                clip_path,
+                sample_rate=cfg.gemma_sample_rate,
+                channels=1,
+            )
+        except Exception as exc:
+            summary["items"].append(
+                {
+                    "chunk_id": chunk_id,
+                    "start": round(clip_start, 3),
+                    "end": round(clip_end, 3),
+                    "created": False,
+                    "error": str(exc),
+                }
+            )
+            continue
+        item["audio_clip_path"] = str(clip_path)
+        item["audio_clip"] = {
+            "path": str(clip_path),
+            "start": round(clip_start, 3),
+            "end": round(clip_end, 3),
+            "duration": round(clip_end - clip_start, 3),
+            "padding_sec": padding_sec,
+        }
+        summary["created"] += 1
+        summary["items"].append({"chunk_id": chunk_id, **item["audio_clip"], "created": True})
+    return summary
+
+
 def _review_asr_chunks_with_text_model(
     chunks: list[ASRChunk],
     *,
@@ -1270,6 +1592,7 @@ def _review_asr_chunks_with_text_model(
         "manual_review": 0,
         "skipped": 0,
         "generated_candidates": 0,
+        "audio_input": {"enabled": False, "created": 0, "error": None, "items": []},
         "error": None,
         "items": [],
     }
@@ -1297,18 +1620,44 @@ def _review_asr_chunks_with_text_model(
     )
 
     backend_kind = cfg.asr_text_review_backend.replace("-", "_")
-    if backend_kind not in {"llama_server", "mock"}:
+    if backend_kind not in {"llama_server", "llama_server_audio", "mock"}:
         summary["error"] = f"unsupported backend: {cfg.asr_text_review_backend}"
         return chunks, summary
+    audio_review_enabled = backend_kind == "llama_server_audio"
+    if audio_review_enabled:
+        summary["audio_input"] = _attach_asr_review_audio_clips(
+            review_items,
+            project_dir=project_dir,
+            review_audio_path=review_audio_path,
+            audio_duration_sec=audio_duration_sec,
+            cfg=cfg,
+        )
+        if summary["audio_input"].get("error"):
+            summary["error"] = str(summary["audio_input"]["error"])
+            return chunks, summary
+        missing_audio = [
+            str(item.get("chunk_id"))
+            for item in review_items
+            if not str(item.get("audio_clip_path") or "").strip()
+        ]
+        if missing_audio:
+            summary["error"] = "ASR audio review could not create audio clips for: " + ", ".join(
+                missing_audio[:5]
+            )
+            return chunks, summary
 
     review_by_chunk_id = {str(item["chunk_id"]): item for item in review_items}
     selected_text_by_chunk_id: dict[str, str] = {}
     review_results: dict[str, dict[str, Any]] = {}
-    model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
+    model_name = (
+        cfg.gemma_llama_cpp_model_path
+        if backend_kind in {"llama_server", "llama_server_audio"}
+        else "mock"
+    )
     base_url = cfg.gemma_text_server_url.rstrip("/")
 
     def create_review_client() -> Any:
-        if backend_kind == "llama_server":
+        if backend_kind in {"llama_server", "llama_server_audio"}:
             return LlamaServerTranslationClient(
                 base_url,
                 timeout_sec=cfg.gemma_text_timeout_sec,
@@ -1320,12 +1669,17 @@ def _review_asr_chunks_with_text_model(
         return MockTranslationClient(model=model_name)
 
     server_manager = None
-    if backend_kind == "llama_server":
+    if backend_kind in {"llama_server", "llama_server_audio"}:
         server_manager = ManagedGemmaTextServer(
             enabled=cfg.gemma_text_server_auto_start,
             base_url=base_url,
             command=(
-                _gemma_text_server_command(cfg, base_url=base_url, lane_index=0)
+                _gemma_text_server_command(
+                    cfg,
+                    base_url=base_url,
+                    lane_index=0,
+                    include_mmproj=audio_review_enabled,
+                )
                 if cfg.gemma_text_server_auto_start
                 else []
             ),
@@ -1338,12 +1692,19 @@ def _review_asr_chunks_with_text_model(
         if server_manager is not None:
             server_manager.start()
         client = create_review_client()
-        for batch_index, batch in enumerate(
-            _chunked(review_items, cfg.asr_text_review_batch_size),
-            start=1,
-        ):
+        review_batches = ([item] for item in review_items) if audio_review_enabled else _chunked(
+            review_items,
+            cfg.asr_text_review_batch_size,
+        )
+        for batch_index, batch in enumerate(review_batches, start=1):
             batch_id = f"asr_review_{batch_index:04d}"
-            review_results.update(client.review_asr_candidates(batch, batch_id))
+            if audio_review_enabled:
+                audio_path = Path(str(batch[0]["audio_clip_path"]))
+                review_results.update(
+                    client.review_asr_candidates_with_audio(batch, batch_id, audio_path)
+                )
+            else:
+                review_results.update(client.review_asr_candidates(batch, batch_id))
     except Exception as exc:
         summary["error"] = str(exc)
         return chunks, summary
@@ -1389,6 +1750,7 @@ def _review_asr_chunks_with_text_model(
                 "original_text": candidate_by_id.get("original", ""),
                 "selected_text": selected_text,
                 "candidates": list(item.get("candidates", [])),
+                "audio_clip": item.get("audio_clip"),
                 "reason": review.get("reason"),
                 "risk_terms": review.get("risk_terms", []),
                 "suspicious_patterns": item.get("suspicious_patterns", []),
@@ -2344,11 +2706,94 @@ def _gemma_backend_config(cfg: Any, model_id: str | None = None) -> dict[str, An
     }
 
 
+ASR_PRESET_OVERRIDES: dict[str, dict[str, Any]] = {
+    "conservative": {
+        "asr_vad_filter": True,
+        "asr_vad_parameters": {
+            "threshold": 0.45,
+            "min_silence_duration_ms": 650,
+            "speech_pad_ms": 350,
+            "max_speech_duration_s": 18.0,
+        },
+        "asr_word_timestamps": True,
+        "asr_hallucination_silence_threshold": 1.0,
+        "asr_condition_on_previous_text": False,
+        "asr_sparse_chunk_max_sec": 24.0,
+        "asr_sparse_chunk_min_chars_per_sec": 0.65,
+    },
+    "whisper": {
+        "asr_vad_filter": True,
+        "asr_vad_parameters": {
+            "threshold": 0.25,
+            "min_silence_duration_ms": 850,
+            "speech_pad_ms": 650,
+            "max_speech_duration_s": 20.0,
+        },
+        "asr_word_timestamps": True,
+        "asr_hallucination_silence_threshold": 1.0,
+        "asr_condition_on_previous_text": False,
+        "asr_sparse_chunk_max_sec": 24.0,
+        "asr_sparse_chunk_min_chars_per_sec": 0.55,
+        "asr_repair_enabled": True,
+        "asr_repair_padding_sec": 1.4,
+    },
+    "no_vad_repair": {
+        "asr_vad_filter": False,
+        "asr_vad_parameters": {},
+        "asr_word_timestamps": True,
+        "asr_hallucination_silence_threshold": 1.0,
+        "asr_condition_on_previous_text": False,
+        "asr_repair_enabled": True,
+        "asr_repair_padding_sec": 1.2,
+    },
+}
+
+
+def _effective_asr_config(
+    cfg: Any,
+    *,
+    asr_preset: str | None = None,
+    asr_vad_off: bool | None = None,
+    asr_diagnostics: bool | None = None,
+    asr_device: str | None = None,
+    asr_compute_type: str | None = None,
+    asr_batched_inference: bool | None = None,
+    asr_batch_size: int | None = None,
+) -> Any:
+    payload = cfg.model_dump(mode="json")
+    preset = (asr_preset or payload.get("asr_preset") or "default").replace("-", "_")
+    payload["asr_preset"] = preset
+    overrides = ASR_PRESET_OVERRIDES.get(preset, {})
+    for key, value in overrides.items():
+        if key == "asr_vad_parameters":
+            payload[key] = {**dict(payload.get(key) or {}), **dict(value)}
+        else:
+            payload[key] = value
+    if asr_vad_off:
+        payload["asr_vad_filter"] = False
+        payload["asr_vad_parameters"] = {}
+    if asr_diagnostics is not None:
+        payload["asr_diagnostics_enabled"] = bool(asr_diagnostics)
+    if asr_device is not None:
+        payload["asr_device"] = asr_device
+    if asr_compute_type is not None:
+        payload["asr_compute_type"] = asr_compute_type
+    if asr_batched_inference is not None:
+        payload["asr_batched_inference"] = bool(asr_batched_inference)
+    if asr_batch_size is not None:
+        payload["asr_batch_size"] = int(asr_batch_size)
+    return type(cfg).model_validate(payload)
+
+
 def _asr_backend_config(cfg: Any) -> dict[str, Any]:
     return {
         "model_id": cfg.asr_model_id,
         "language": cfg.asr_language,
         "local_files_only": cfg.asr_local_files_only,
+        "device": cfg.asr_device,
+        "compute_type": cfg.asr_compute_type,
+        "batched_inference": cfg.asr_batched_inference,
+        "batch_size": cfg.asr_batch_size,
         "beam_size": cfg.asr_beam_size,
         "best_of": cfg.asr_best_of,
         "condition_on_previous_text": cfg.asr_condition_on_previous_text,
@@ -2367,6 +2812,467 @@ def _asr_backend_config(cfg: Any) -> dict[str, Any]:
         "qwen_max_inference_batch_size": cfg.qwen_asr_max_inference_batch_size,
         "qwen_max_new_tokens": cfg.qwen_asr_max_new_tokens,
     }
+
+
+def _manifest_warning_once(manifest: PipelineManifest, warning: str) -> None:
+    if warning not in manifest.warnings:
+        manifest.warnings.append(warning)
+
+
+def _asr_audio_metrics(path: Path) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "duration_sec": 0.0,
+        "sample_rate": None,
+        "channels": None,
+        "rms_dbfs": None,
+        "peak_dbfs": None,
+        "clipping_ratio": None,
+        "error": None,
+    }
+    if not path.exists():
+        metrics["error"] = "missing"
+        return metrics
+    try:
+        info = sf.info(str(path))
+        metrics["duration_sec"] = round(float(info.frames) / float(info.samplerate), 6) if info.samplerate else 0.0
+        metrics["sample_rate"] = int(info.samplerate)
+        metrics["channels"] = int(info.channels)
+        peak = 0.0
+        sum_squares = 0.0
+        sample_count = 0
+        clipped = 0
+        for block in sf.blocks(str(path), blocksize=65536, always_2d=True, dtype="float32"):
+            abs_block = np.abs(block)
+            peak = max(peak, float(np.max(abs_block)) if abs_block.size else 0.0)
+            sum_squares += float(np.sum(np.square(block)))
+            sample_count += int(block.size)
+            clipped += int(np.sum(abs_block >= 0.999))
+        rms = math.sqrt(sum_squares / sample_count) if sample_count > 0 else 0.0
+        metrics["rms_dbfs"] = round(20.0 * math.log10(rms), 3) if rms > 0 else -120.0
+        metrics["peak_dbfs"] = round(20.0 * math.log10(peak), 3) if peak > 0 else -120.0
+        metrics["clipping_ratio"] = round(clipped / sample_count, 8) if sample_count > 0 else 0.0
+    except Exception as exc:
+        metrics["error"] = str(exc)
+    return metrics
+
+
+def _asr_reference_duration(manifest: PipelineManifest, project_dir: Path) -> float | None:
+    if manifest.source_info and manifest.source_info.duration_sec > 0:
+        return manifest.source_info.duration_sec
+    for key in ("gemma_mono_16k", "original_stereo_48k"):
+        raw = manifest.artifacts.get(key)
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            path = project_dir / path
+        try:
+            return duration_sec(path)
+        except Exception:
+            continue
+    return None
+
+
+def _asr_candidate_reject_reasons(
+    metrics: dict[str, Any],
+    *,
+    cfg: Any,
+    expected_sample_rate: int,
+    expected_channels: int,
+    reference_duration_sec: float | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if not metrics.get("exists"):
+        return ["missing"]
+    if metrics.get("error"):
+        return [f"read_error:{metrics['error']}"]
+    if metrics.get("sample_rate") != expected_sample_rate or metrics.get("channels") != expected_channels:
+        reasons.append("format_mismatch")
+    duration = float(metrics.get("duration_sec") or 0.0)
+    if duration <= 0.05:
+        reasons.append("empty_or_too_short")
+    if reference_duration_sec and reference_duration_sec > 0 and duration > 0:
+        delta = abs(duration - reference_duration_sec)
+        if delta > 1.0 and delta / reference_duration_sec > cfg.asr_input_duration_tolerance:
+            reasons.append(
+                f"duration_mismatch:{duration:.3f}s_vs_{reference_duration_sec:.3f}s"
+            )
+    rms_value = metrics.get("rms_dbfs")
+    peak_value = metrics.get("peak_dbfs")
+    rms = float(rms_value) if rms_value is not None else -120.0
+    peak = float(peak_value) if peak_value is not None else -120.0
+    if rms <= cfg.asr_input_min_rms_dbfs or peak <= cfg.asr_input_min_peak_dbfs:
+        reasons.append(f"too_quiet:rms={rms:.1f}dbfs,peak={peak:.1f}dbfs")
+    clipping = float(metrics.get("clipping_ratio") or 0.0)
+    if clipping > 0.02:
+        reasons.append(f"clipping:{clipping:.4f}")
+    return reasons
+
+
+def _resolve_manifest_artifact_path(project_dir: Path, manifest: PipelineManifest, key: str) -> Path | None:
+    raw = manifest.artifacts.get(key)
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else project_dir / path
+
+
+def _derive_original_mono_16k(project_dir: Path, manifest: PipelineManifest, cfg: Any) -> Path | None:
+    existing = _resolve_manifest_artifact_path(project_dir, manifest, "asr_original_mono_16k")
+    if existing and existing.exists():
+        return existing
+    source = _resolve_manifest_artifact_path(project_dir, manifest, "original_stereo_48k")
+    if source is None and manifest.source_info:
+        source = Path(manifest.source_info.path)
+    if source is None or not source.exists():
+        return None
+    output = project_dir / "work" / "audio" / "asr_original_mono_16k.wav"
+    try:
+        ffmpeg.extract_mono_16k(source, output)
+    except Exception:
+        data, sample_rate = load_audio(source)
+        mono = resample_linear(to_mono(data), sample_rate, cfg.gemma_sample_rate)
+        write_audio(output, mono[:, None] if mono.ndim == 1 else mono, cfg.gemma_sample_rate)
+    manifest.artifacts["asr_original_mono_16k"] = str(output)
+    return output
+
+
+def _select_asr_audio_input(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    backend_kind: str,
+    cfg: Any,
+) -> tuple[Path, Path, dict[str, Any]]:
+    reference_duration = _asr_reference_duration(manifest, project_dir)
+    candidates: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    def add_candidate(source: str, path: Path | None, *, strict_quality: bool) -> None:
+        if path is None:
+            candidates.append({"source": source, "path": None, "metrics": None, "reject_reasons": ["missing"]})
+            return
+        metrics = _asr_audio_metrics(path)
+        reject_reasons = _asr_candidate_reject_reasons(
+            metrics,
+            cfg=cfg,
+            expected_sample_rate=cfg.gemma_sample_rate,
+            expected_channels=1,
+            reference_duration_sec=reference_duration,
+        )
+        if not strict_quality:
+            reject_reasons = [
+                reason
+                for reason in reject_reasons
+                if reason.startswith(("missing", "read_error", "format_mismatch", "empty_or_too_short"))
+            ]
+        candidates.append(
+            {
+                "source": source,
+                "path": str(path),
+                "metrics": metrics,
+                "reject_reasons": reject_reasons,
+            }
+        )
+
+    add_candidate(
+        "source_vocals_mono_16k",
+        _resolve_manifest_artifact_path(project_dir, manifest, "source_vocals_mono_16k"),
+        strict_quality=backend_kind != "mock",
+    )
+    add_candidate(
+        "gemma_mono_16k",
+        _resolve_manifest_artifact_path(project_dir, manifest, "gemma_mono_16k"),
+        strict_quality=False,
+    )
+    selected = next((candidate for candidate in candidates if not candidate["reject_reasons"]), None)
+    if selected is None:
+        add_candidate(
+            "original_derived_mono_16k",
+            _derive_original_mono_16k(project_dir, manifest, cfg),
+            strict_quality=False,
+        )
+        selected = next((candidate for candidate in candidates if not candidate["reject_reasons"]), None)
+    else:
+        candidates.append(
+            {
+                "source": "original_derived_mono_16k",
+                "path": None,
+                "metrics": None,
+                "reject_reasons": ["not_evaluated"],
+            }
+        )
+    if selected is None:
+        selected = next((candidate for candidate in candidates if candidate.get("path")), None)
+    if selected is None or not selected.get("path"):
+        raise ValueError("No usable ASR input audio was found. Run extract first.")
+
+    for candidate in candidates:
+        if candidate["source"] == selected["source"]:
+            continue
+        reasons = candidate.get("reject_reasons") or []
+        if reasons and reasons != ["not_evaluated"]:
+            warning = f"ASR input candidate {candidate['source']} rejected: {', '.join(reasons)}"
+            warnings.append(warning)
+            _manifest_warning_once(manifest, warning)
+
+    audio_path = Path(str(selected["path"]))
+    _validate_audio_contract(audio_path, cfg.gemma_sample_rate, 1, selected["source"])
+    if selected["source"] == "source_vocals_mono_16k":
+        mix_audio_path = _resolve_manifest_artifact_path(project_dir, manifest, "source_vocals_48k")
+    else:
+        mix_audio_path = None
+    if mix_audio_path is None or not mix_audio_path.exists():
+        mix_audio_path = _resolve_manifest_artifact_path(project_dir, manifest, "original_stereo_48k")
+    if mix_audio_path is None or not mix_audio_path.exists():
+        mix_audio_path = audio_path
+
+    diagnostics = {
+        "backend": backend_kind,
+        "reference_duration_sec": reference_duration,
+        "selected": {
+            "source": selected["source"],
+            "path": selected["path"],
+            "metrics": selected["metrics"],
+        },
+        "mix_audio_path": str(mix_audio_path),
+        "candidates": candidates,
+        "warnings": warnings,
+    }
+    return audio_path, mix_audio_path, diagnostics
+
+
+def _qwen_asr_dependency_available() -> bool:
+    return importlib.util.find_spec("qwen_asr") is not None
+
+
+def _create_qwen_repair_fallback_backend(
+    cfg: Any,
+    manifest: PipelineManifest,
+) -> tuple[Any | None, dict[str, Any]]:
+    summary: dict[str, Any] = {
+        "enabled": bool(getattr(cfg, "asr_qwen_repair_fallback_enabled", False)),
+        "available": False,
+        "backend": "qwen_asr",
+        "skipped_reason": None,
+    }
+    if not summary["enabled"]:
+        summary["skipped_reason"] = "disabled"
+        return None, summary
+    if not _qwen_asr_dependency_available():
+        summary["skipped_reason"] = "qwen-asr is not installed"
+        _manifest_warning_once(
+            manifest,
+            "qwen-asr is not installed; ASR repair will continue with faster-whisper candidates only.",
+        )
+        return None, summary
+    try:
+        backend = create_asr_backend("qwen_asr", _asr_backend_config(cfg))
+    except ASRUnavailableError as exc:
+        summary["skipped_reason"] = str(exc)
+        _manifest_warning_once(
+            manifest,
+            f"qwen-asr repair fallback unavailable: {exc}",
+        )
+        return None, summary
+    summary["available"] = True
+    return backend, summary
+
+
+def _asr_chunk_diagnostics(
+    chunks: list[ASRChunk],
+    *,
+    cfg: Any,
+    replacements: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    replacements = replacements or {}
+    patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
+        getattr(cfg, "asr_text_review_suspicious_text_patterns", []) or []
+    )
+    rows: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        duration = max(0.0, chunk.end - chunk.start)
+        text = chunk.text.strip()
+        rows.append(
+            {
+                "chunk_id": f"chunk_{index:04d}",
+                "start": round(chunk.start, 3),
+                "end": round(chunk.end, 3),
+                "duration": round(duration, 3),
+                "text": text,
+                "language": chunk.language,
+                "confidence": chunk.confidence,
+                "text_density": round(len(text) / max(0.001, duration), 6),
+                "suspicious_pattern_hits": _asr_suspicious_pattern_hits(text, patterns),
+                "prompt_leak": _asr_candidate_looks_prompt_leaked(text, cfg),
+                "replacement_hits": _replacement_hits(text, replacements),
+            }
+        )
+    return rows
+
+
+def _filter_final_asr_chunks_for_hallucinations(
+    chunks: list[ASRChunk],
+    *,
+    cfg: Any,
+) -> tuple[list[ASRChunk], list[dict[str, Any]]]:
+    kept: list[ASRChunk] = []
+    dropped: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        text = chunk.text.strip()
+        duration = max(0.0, chunk.end - chunk.start)
+        density = len(text) / max(0.001, duration)
+        prompt_leak = _asr_candidate_looks_prompt_leaked(text, cfg)
+        sparse_prompt_leak = (
+            prompt_leak
+            and duration >= max(2.0, float(getattr(cfg, "asr_repair_sparse_min_sec", 12.0)) * 0.5)
+            and density < max(1.0, float(getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)))
+        )
+        repeated_outro = prompt_leak and text.count("ご視聴") >= 1 and duration >= 4.0
+        if sparse_prompt_leak or repeated_outro:
+            dropped.append(
+                {
+                    "chunk_id": f"chunk_{index:04d}",
+                    "start": round(chunk.start, 3),
+                    "end": round(chunk.end, 3),
+                    "text": text,
+                    "reason": "sparse_prompt_leak" if sparse_prompt_leak else "repeated_outro_hallucination",
+                    "text_density": round(density, 6),
+                    "duration": round(duration, 3),
+                }
+            )
+            continue
+        kept.append(chunk)
+    return kept, dropped
+
+
+def _source_script_asr_review_reasons(source_script: SourceScript | None, cfg: Any) -> list[str]:
+    if source_script is None or not source_script.text.strip():
+        return ["missing_asr_text"]
+    text = source_script.text.strip()
+    reasons: list[str] = []
+    if _asr_candidate_looks_prompt_leaked(text, cfg):
+        reasons.append("asr_prompt_or_hallucination_leak")
+    patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
+        getattr(cfg, "asr_text_review_suspicious_text_patterns", []) or []
+    )
+    hits = _asr_suspicious_pattern_hits(text, patterns)
+    if hits:
+        reasons.append("asr_suspicious_pattern:" + ",".join(hits[:5]))
+    if (
+        source_script.confidence is not None
+        and source_script.confidence < getattr(cfg, "asr_text_review_confidence_threshold", 0.78)
+    ):
+        reasons.append(f"asr_low_confidence:{source_script.confidence:.3f}")
+    duration = max(0.001, source_script.end - source_script.start)
+    if (
+        duration >= getattr(cfg, "asr_repair_sparse_min_sec", 12.0)
+        and len(text) / duration < getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)
+    ):
+        reasons.append("asr_sparse_text_density")
+    return reasons
+
+
+def _write_asr_diagnostics_artifacts(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    backend_kind: str,
+    backend_name: str,
+    cfg: Any,
+    input_diagnostics: dict[str, Any],
+    raw_chunks: list[ASRChunk],
+    repaired_chunks: list[ASRChunk],
+    final_chunks: list[ASRChunk],
+    repair_summary: dict[str, Any],
+    text_review_summary: dict[str, Any],
+    replacements_summary: dict[str, Any],
+    filtered_summary: list[dict[str, Any]],
+    qwen_fallback_summary: dict[str, Any],
+) -> None:
+    transcribe_dir = project_dir / "work" / "transcribe"
+    input_path = transcribe_dir / "asr_input_diagnostics.json"
+    write_json_atomic(input_path, input_diagnostics)
+    manifest.artifacts["asr_input_diagnostics"] = str(input_path)
+    if not getattr(cfg, "asr_diagnostics_enabled", True):
+        return
+    vad_parameters = dict(getattr(cfg, "asr_vad_parameters", {}) or {})
+    final_chunk_rows = _asr_chunk_diagnostics(
+        final_chunks,
+        cfg=cfg,
+        replacements=getattr(cfg, "asr_text_replacements", {}),
+    )
+    for row in final_chunk_rows:
+        for item in replacements_summary.get("items", []):
+            if (
+                abs(float(row["start"]) - float(item.get("start", -1))) <= 0.001
+                and abs(float(row["end"]) - float(item.get("end", -1))) <= 0.001
+                and str(row["text"]) == str(item.get("replaced_text", ""))
+            ):
+                row["replacement_hits"] = list(item.get("hits", []))
+                break
+    diagnostics = {
+        "backend": backend_kind,
+        "backend_name": backend_name,
+        "preset": getattr(cfg, "asr_preset", "default"),
+        "runtime": {
+            "device": getattr(cfg, "asr_device", "auto"),
+            "compute_type": getattr(cfg, "asr_compute_type", "default"),
+            "batched_inference": bool(getattr(cfg, "asr_batched_inference", False)),
+            "batch_size": int(getattr(cfg, "asr_batch_size", 8)),
+        },
+        "input_audio": input_diagnostics,
+        "vad": {
+            "vad_filter": bool(getattr(cfg, "asr_vad_filter", False)),
+            "vad_parameters": vad_parameters,
+            "word_timestamps": bool(getattr(cfg, "asr_word_timestamps", False)),
+            "hallucination_silence_threshold": getattr(
+                cfg,
+                "asr_hallucination_silence_threshold",
+                None,
+            ),
+        },
+        "raw_asr_chunks": _asr_chunk_diagnostics(raw_chunks, cfg=cfg),
+        "repaired_asr_chunks": _asr_chunk_diagnostics(repaired_chunks, cfg=cfg),
+        "final_asr_chunks": final_chunk_rows,
+        "repair": repair_summary,
+        "text_review": text_review_summary,
+        "text_replacements": replacements_summary,
+        "filtered_chunks": filtered_summary,
+        "qwen_repair_fallback": qwen_fallback_summary,
+    }
+    summary = {
+        "backend": backend_kind,
+        "backend_name": backend_name,
+        "preset": getattr(cfg, "asr_preset", "default"),
+        "runtime": {
+            "device": getattr(cfg, "asr_device", "auto"),
+            "compute_type": getattr(cfg, "asr_compute_type", "default"),
+            "batched_inference": bool(getattr(cfg, "asr_batched_inference", False)),
+            "batch_size": int(getattr(cfg, "asr_batch_size", 8)),
+        },
+        "asr_input_source": input_diagnostics.get("selected", {}).get("source"),
+        "raw_asr_chunk_count": len(raw_chunks),
+        "repaired_asr_chunk_count": len(repaired_chunks),
+        "final_asr_chunk_count": len(final_chunks),
+        "repair_attempted": repair_summary.get("attempted", 0),
+        "repair_repaired": repair_summary.get("repaired", 0),
+        "text_review_attempted": text_review_summary.get("attempted", 0),
+        "text_review_replaced": text_review_summary.get("replaced", 0),
+        "text_replacements": replacements_summary,
+        "filtered_chunk_count": len(filtered_summary),
+        "needs_manual_review": sum(1 for segment in manifest.segments if segment.status == "needs_manual_review"),
+        "warnings": input_diagnostics.get("warnings", []),
+        "qwen_repair_fallback": qwen_fallback_summary,
+    }
+    diagnostics_path = transcribe_dir / "asr_diagnostics.json"
+    summary_path = transcribe_dir / "asr_diagnostics_summary.json"
+    write_json_atomic(diagnostics_path, diagnostics)
+    write_json_atomic(summary_path, summary)
+    manifest.artifacts["asr_diagnostics"] = str(diagnostics_path)
+    manifest.artifacts["asr_diagnostics_summary"] = str(summary_path)
 
 
 def _format_server_command(command: list[str], base_url: str, lane_index: int) -> list[str]:
@@ -2388,6 +3294,7 @@ def _gemma_text_server_command(
     *,
     base_url: str | None = None,
     lane_index: int = 0,
+    include_mmproj: bool = False,
 ) -> list[str]:
     effective_base_url = base_url or cfg.gemma_text_server_url
     if cfg.gemma_text_server_command:
@@ -2399,6 +3306,7 @@ def _gemma_text_server_command(
     return default_llama_server_command(
         base_url=effective_base_url,
         model_path=cfg.gemma_llama_cpp_model_path,
+        mmproj_path=cfg.gemma_llama_cpp_mmproj_path if include_mmproj else None,
         ctx_size=cfg.gemma_llama_cpp_ctx_size,
         gpu_layers=cfg.gemma_llama_cpp_gpu_layers,
         n_predict=cfg.gemma_text_n_predict,
@@ -2410,6 +3318,13 @@ def transcribe_step(
     asr_backend: str | None = None,
     confirm_rights: bool = False,
     asr_text_review: bool | None = None,
+    asr_preset: str | None = None,
+    asr_vad_off: bool | None = None,
+    asr_diagnostics: bool | None = None,
+    asr_device: str | None = None,
+    asr_compute_type: str | None = None,
+    asr_batched_inference: bool | None = None,
+    asr_batch_size: int | None = None,
 ) -> PipelineManifest:
     manifest = load_manifest(project_dir)
     _load_config_into_manifest(project_dir, manifest)
@@ -2419,9 +3334,23 @@ def transcribe_step(
             {**cfg.model_dump(mode="json"), "asr_text_review_enabled": asr_text_review}
         )
         manifest.project_config = cfg
+    cfg = _effective_asr_config(
+        cfg,
+        asr_preset=asr_preset,
+        asr_vad_off=asr_vad_off,
+        asr_diagnostics=asr_diagnostics,
+        asr_device=asr_device,
+        asr_compute_type=asr_compute_type,
+        asr_batched_inference=asr_batched_inference,
+        asr_batch_size=asr_batch_size,
+    )
+    manifest.project_config = cfg
     backend_kind = asr_backend or cfg.asr_backend
     total = len(manifest.segments)
-    _log_stage_start("transcribe", f"backend={backend_kind}, segments={total}")
+    _log_stage_start(
+        "transcribe",
+        f"backend={backend_kind}, preset={cfg.asr_preset}, segments={total}",
+    )
     _require_audio_stage_rights(manifest, "transcribe", confirm_rights, metadata={"backend": backend_kind})
     if backend_kind != "mock" and "source_vocals_mono_16k" not in manifest.artifacts:
         manifest = source_separation_step(project_dir, confirm_rights=confirm_rights)
@@ -2432,35 +3361,37 @@ def transcribe_step(
                 {**cfg.model_dump(mode="json"), "asr_text_review_enabled": asr_text_review}
             )
             manifest.project_config = cfg
+        cfg = _effective_asr_config(
+            cfg,
+            asr_preset=asr_preset,
+            asr_vad_off=asr_vad_off,
+            asr_diagnostics=asr_diagnostics,
+            asr_device=asr_device,
+            asr_compute_type=asr_compute_type,
+            asr_batched_inference=asr_batched_inference,
+            asr_batch_size=asr_batch_size,
+        )
+        manifest.project_config = cfg
         total = len(manifest.segments)
-    if backend_kind != "mock" and "source_vocals_mono_16k" not in manifest.artifacts:
-        raise ValueError(
-            "Real ASR transcription requires source-separated vocals. Run source-separation "
-            "with backend auto/demucs/mock before transcribe, or set source_separation_backend "
-            "to an available separator."
-        )
-    audio_path = Path(
-        manifest.artifacts["source_vocals_mono_16k"]
-        if backend_kind != "mock"
-        else manifest.artifacts.get(
-            "source_vocals_mono_16k",
-            manifest.artifacts.get("gemma_mono_16k", project_dir / "work/audio/gemma_mono_16k.wav"),
-        )
-    )
-    _validate_audio_contract(audio_path, cfg.gemma_sample_rate, 1, audio_path.stem)
-    mix_audio_path = Path(
-        manifest.artifacts.get(
-            "source_vocals_48k",
-            manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav"),
-        )
+    audio_path, mix_audio_path, input_diagnostics = _select_asr_audio_input(
+        project_dir,
+        manifest,
+        backend_kind=backend_kind,
+        cfg=cfg,
     )
     seeded_for_transcribe = _seed_segments_for_transcribe(project_dir, manifest, audio_path, mix_audio_path)
     total = len(manifest.segments)
     backend = create_asr_backend(backend_kind, _asr_backend_config(cfg))
     audio_duration = duration_sec(audio_path)
-    chunks = backend.transcribe(audio_path, manifest.segments)
-    raw_asr_chunk_count = len(chunks)
+    raw_chunks = backend.transcribe(audio_path, manifest.segments)
+    chunks = [chunk.model_copy() for chunk in raw_chunks]
+    raw_asr_chunk_count = len(raw_chunks)
     asr_text_replacement_count = 0
+    asr_text_replacements_summary: dict[str, Any] = {
+        "chunks_changed": 0,
+        "total_replacements": 0,
+        "items": [],
+    }
     repair_summary: dict[str, Any] = {
         "enabled": False,
         "attempted": 0,
@@ -2480,7 +3411,20 @@ def transcribe_step(
         "error": None,
         "items": [],
     }
+    qwen_fallback_backend = None
+    qwen_fallback_summary: dict[str, Any] = {
+        "enabled": False,
+        "available": False,
+        "backend": "qwen_asr",
+        "skipped_reason": "disabled",
+    }
+    repaired_chunks = [chunk.model_copy() for chunk in chunks]
+    filtered_final_chunks: list[dict[str, Any]] = []
     if backend_kind != "mock":
+        qwen_fallback_backend, qwen_fallback_summary = _create_qwen_repair_fallback_backend(
+            cfg,
+            manifest,
+        )
         repair_audio_path = Path(manifest.artifacts.get("gemma_mono_16k", audio_path))
         chunks, repair_summary = _repair_asr_chunks(
             chunks,
@@ -2489,7 +3433,9 @@ def transcribe_step(
             repair_audio_path=repair_audio_path,
             audio_duration_sec=audio_duration,
             cfg=cfg,
+            qwen_fallback_backend=qwen_fallback_backend,
         )
+        repaired_chunks = [chunk.model_copy() for chunk in chunks]
         repair_summary_path = project_dir / "work" / "transcribe" / "asr_repair_summary.json"
         write_json_atomic(repair_summary_path, repair_summary)
         manifest.artifacts["asr_repair_summary"] = str(repair_summary_path)
@@ -2504,10 +3450,16 @@ def transcribe_step(
         text_review_summary_path = project_dir / "work" / "transcribe" / "asr_text_review_summary.json"
         write_json_atomic(text_review_summary_path, text_review_summary)
         manifest.artifacts["asr_text_review_summary"] = str(text_review_summary_path)
-        chunks, asr_text_replacement_count = _apply_asr_text_replacements_to_chunks(
+        chunks, asr_text_replacements_summary = _apply_asr_text_replacements_to_chunks_with_summary(
             chunks,
             cfg.asr_text_replacements,
         )
+        asr_text_replacement_count = int(asr_text_replacements_summary["chunks_changed"])
+        chunks, filtered_final_chunks = _filter_final_asr_chunks_for_hallucinations(
+            chunks,
+            cfg=cfg,
+        )
+    final_chunks = [chunk.model_copy() for chunk in chunks]
     resegmented_from_chunks = False
     previous_segment_count = len(manifest.segments)
     manual_segments_path = project_dir / "work" / "segments" / "manifests" / "segments_manual.json"
@@ -2543,18 +3495,27 @@ def transcribe_step(
     started_at = monotonic()
     last_logged_at = started_at
     with_text = 0
+    manual_review_count = 0
     for index, segment in enumerate(manifest.segments, start=1):
         source_script = mapped.get(segment.id)
         segment.source_script = source_script
+        review_reasons = _source_script_asr_review_reasons(source_script, cfg)
+        if review_reasons:
+            segment.status = "needs_manual_review"
+            manual_review_count += 1
+            for reason in review_reasons:
+                if reason not in segment.errors:
+                    segment.errors.append(reason)
         if source_script and source_script.text:
             with_text += 1
-            status = "transcribed"
+            status = "needs_manual_review" if review_reasons else "transcribed"
         else:
             status = "needs_manual_review"
         rows.append(
             {
                 "segment_id": segment.id,
                 "status": status,
+                "review_reasons": review_reasons,
                 "source_script": source_script.model_dump(mode="json") if source_script else None,
             }
         )
@@ -2569,11 +3530,34 @@ def transcribe_step(
     manifest.artifacts["segments_transcribed"] = str(out_path)
     if resegmented_from_chunks:
         manifest.artifacts["segments_asr_resegmented"] = str(out_path)
+    _write_asr_diagnostics_artifacts(
+        project_dir,
+        manifest,
+        backend_kind=backend_kind,
+        backend_name=backend.name,
+        cfg=cfg,
+        input_diagnostics=input_diagnostics,
+        raw_chunks=raw_chunks,
+        repaired_chunks=repaired_chunks,
+        final_chunks=final_chunks,
+        repair_summary=repair_summary,
+        text_review_summary=text_review_summary,
+        replacements_summary=asr_text_replacements_summary,
+        filtered_summary=filtered_final_chunks,
+        qwen_fallback_summary=qwen_fallback_summary,
+    )
     mark_stage(
         manifest,
         "transcribe",
         "completed",
         backend=backend_kind,
+        backend_name=backend.name,
+        asr_preset=cfg.asr_preset,
+        asr_device=cfg.asr_device,
+        asr_compute_type=cfg.asr_compute_type,
+        asr_batched_inference=cfg.asr_batched_inference,
+        asr_batch_size=cfg.asr_batch_size,
+        asr_input_source=input_diagnostics.get("selected", {}).get("source"),
         segment_count=total,
         previous_segment_count=previous_segment_count,
         raw_asr_chunk_count=raw_asr_chunk_count,
@@ -2588,7 +3572,7 @@ def transcribe_step(
         seeded_for_transcribe=seeded_for_transcribe,
         resegmented_from_chunks=resegmented_from_chunks,
         transcribed=with_text,
-        needs_manual_review=total - with_text,
+        needs_manual_review=max(total - with_text, manual_review_count),
     )
     save_manifest(project_dir, manifest)
     _log_stage_complete("transcribe", manifest, f"backend={backend_kind}")
@@ -2730,6 +3714,17 @@ def translate_ko_step(
                     "source_text": segment.source_script.text if segment.source_script else "",
                     "translation_ko": translation.model_dump(mode="json"),
                     "resumed": True,
+                }
+            )
+        elif segment.status in SKIP_STATUSES:
+            needs_manual_review += 1
+            rows.append(
+                {
+                    "segment_id": segment.id,
+                    "status": "needs_manual_review",
+                    "reason": f"segment status is {segment.status}",
+                    "source_text": segment.source_script.text if segment.source_script else "",
+                    "translation_ko": None,
                 }
             )
         elif segment.source_script and segment.source_script.text.strip():
