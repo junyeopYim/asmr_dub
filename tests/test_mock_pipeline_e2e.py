@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 from conftest import sha256, write_tiny_wav
 
@@ -158,6 +159,21 @@ def test_extract_folder_input_prefers_clean_asr_parts(
     assert Path(manifest.artifacts["gemma_mono_16k"]).exists()
     assert manifest.source_info is not None
     assert manifest.source_info.raw["folder_input"]["asr_source_status"] == "separate_asr_parts"
+
+
+def test_extract_folder_input_blocks_minor_sexualized_filenames(
+    tmp_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    folder = tmp_path / "RJDIR"
+    write_tiny_wav(folder / "TSSS 完パケ音声 mp3" / "06-2 男の子 H有（SE有）.wav", duration=0.7)
+
+    with pytest.raises(ValueError, match="minor sexualized"):
+        extract_step(folder, tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["extract"]["status"] == "failed"
+    assert manifest.stage_state["extract"]["safety_blocked"] == 1
 
 
 def test_folder_input_planner_prefers_main_group_over_diff_tracks(tmp_path: Path) -> None:

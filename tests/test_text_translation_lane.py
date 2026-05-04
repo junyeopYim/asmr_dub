@@ -4286,6 +4286,41 @@ def test_korean_script_fails_stage_for_minor_sexualized_tts_text(tmp_project_dir
     assert "tts_safety_minor_sexualized_content" in manifest.segments[0].errors[-1]
 
 
+def test_korean_script_fails_stage_for_boy_sexualized_source_text(tmp_project_dir: Path) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="男の子 H有",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="남자아이 장면입니다.",
+            ko_natural="남자아이 장면입니다.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    with pytest.raises(ValueError, match="minor sexualized"):
+        korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["korean-script"]["status"] == "failed"
+    assert manifest.stage_state["korean-script"]["safety_blocked"] == 1
+    assert "tts_safety_minor_sexualized_content" in manifest.segments[0].errors[-1]
+
+
 def test_korean_script_allows_adult_content_warning_without_minor_subject(tmp_project_dir: Path) -> None:
     segment = Segment(
         id="seg_0001",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
+from asmr_dub_pipeline.script.text_qc import has_minor_sexualized_content
 
 
 def run_extract_stage(ctx: PipelineContext, input_path: Path, confirm_rights: bool, merge_parts: bool = False) -> PipelineManifest:
@@ -25,6 +26,11 @@ def run_extract_stage(ctx: PipelineContext, input_path: Path, confirm_rights: bo
         folder_plan = plan_folder_input(input_path)
         if not folder_plan.should_prepare:
             raise ValueError(folder_plan.reason)
+        _block_minor_sexualized_input_names(
+            project_dir,
+            manifest,
+            [folder_plan.requested_path, *folder_plan.mix_parts, *folder_plan.asr_parts],
+        )
         stereo, mono = prepare_folder_input_audio(folder_plan, project_dir)
         folder_metadata = folder_input_metadata(
             folder_plan,
@@ -66,6 +72,11 @@ def run_extract_stage(ctx: PipelineContext, input_path: Path, confirm_rights: bo
         merge_plan = plan_numbered_part_merge(input_path)
         if merge_plan.status in {"missing_first_part", "missing_numbered_part"}:
             raise ValueError(merge_plan.reason)
+        _block_minor_sexualized_input_names(
+            project_dir,
+            manifest,
+            [merge_plan.requested_path, *merge_plan.parts],
+        )
         if merge_plan.should_merge:
             prepared_input_path = merge_numbered_parts_to_audio(merge_plan, project_dir)
             input_merge_metadata = _input_merge_metadata(
@@ -88,6 +99,7 @@ def run_extract_stage(ctx: PipelineContext, input_path: Path, confirm_rights: bo
                 reason=merge_plan.reason,
                 merged_path=None,
             )
+    _block_minor_sexualized_input_names(project_dir, manifest, [prepared_input_path])
     stereo, mono = extract_project_audio(prepared_input_path, project_dir)
     manifest.source_info = probe_with_fallback(prepared_input_path)
     if input_merge_metadata:
@@ -106,3 +118,30 @@ def run_extract_stage(ctx: PipelineContext, input_path: Path, confirm_rights: bo
     save_manifest(project_dir, manifest)
     _log_stage_complete("extract", manifest, "audio prepared")
     return ctx.update_manifest(manifest)
+
+
+def _block_minor_sexualized_input_names(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    paths: list[Path],
+) -> None:
+    blocked_by_key = {
+        str(path.resolve()): path
+        for path in paths
+        if has_minor_sexualized_content(" ".join(path.parts[-4:]))
+    }
+    blocked = list(blocked_by_key.values())
+    if not blocked:
+        return
+    mark_stage(
+        manifest,
+        "extract",
+        "failed",
+        safety_blocked=len(blocked),
+        safety_blocked_paths=[str(path) for path in blocked[:20]],
+    )
+    save_manifest(project_dir, manifest)
+    raise ValueError(
+        "extract blocked minor sexualized input names before audio processing "
+        f"({len(blocked)} path(s))."
+    )
