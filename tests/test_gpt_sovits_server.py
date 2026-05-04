@@ -265,6 +265,22 @@ def test_default_gsv_python_skips_venv_without_server_deps(monkeypatch, tmp_path
     assert gsv_server._default_gsv_python() == str(base)
 
 
+def test_default_gsv_python_falls_back_to_current_venv_before_base(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base" / "bin" / "python"
+    venv = tmp_path / ".venv" / "bin" / "python"
+    monkeypatch.delenv("ASMR_DUB_GSV_PYTHON", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(gsv_server.sys, "base_prefix", str(base.parent.parent))
+    monkeypatch.setattr(gsv_server.sys, "executable", str(venv))
+    monkeypatch.setattr(gsv_server.shutil, "which", lambda name: None)
+    monkeypatch.setattr(gsv_server, "_python_has_modules", lambda _python, _modules: False)
+
+    assert gsv_server._default_gsv_python() == str(venv)
+
+
 def test_default_gsv_python_checks_api_startup_text_deps(monkeypatch, tmp_path: Path) -> None:
     override = tmp_path / "incomplete_gsv_env" / "bin" / "python"
     base = tmp_path / "base" / "bin" / "python"

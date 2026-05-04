@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SHIM_DIR = Path(__file__).resolve().parent / "shims"
 GSV_SERVER_REQUIRED_MODULES = (
+    "numpy",
     "transformers",
     "torch",
     "torchaudio",
@@ -122,6 +123,10 @@ def _default_gsv_python() -> str:
     candidates: list[str] = []
     if os.environ.get("ASMR_DUB_GSV_PYTHON"):
         candidates.append(os.environ["ASMR_DUB_GSV_PYTHON"])
+    if sys.executable:
+        candidates.append(sys.executable)
+    if os.environ.get("VIRTUAL_ENV"):
+        candidates.append(str(Path(os.environ["VIRTUAL_ENV"]) / "bin" / "python"))
     base_prefix = Path(getattr(sys, "base_prefix", "") or "")
     if base_prefix:
         candidates.append(str(base_prefix / "bin" / "python"))
@@ -129,7 +134,6 @@ def _default_gsv_python() -> str:
         resolved = shutil.which(name)
         if resolved:
             candidates.append(resolved)
-    candidates.append(sys.executable or "python")
     for candidate in _dedupe_text(candidates):
         if _python_has_modules(candidate, GSV_SERVER_REQUIRED_MODULES):
             return candidate
