@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from threading import Lock
@@ -391,6 +392,44 @@ def test_rvc_batch_skips_already_converted_segments(tmp_project_dir: Path, monke
     assert seen_batches == [["seg_0002", "seg_0003"]]
     assert manifest.stage_state["rvc"]["status"] == "completed"
     assert all(segment.rvc and segment.rvc.accepted for segment in manifest.segments)
+
+
+def test_rvc_rerun_refreshes_completed_segment_when_tts_is_newer(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = ProjectConfig(rvc_backend="mock")
+    segment = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    completed_output = _write_exact_wav(tmp_project_dir / "work" / "rvc" / "seg_0001_final.wav", duration=1.0)
+    segment.status = "rvc_converted"
+    assert segment.tts is not None
+    assert segment.tts.selected_candidate_path is not None
+    segment.rvc = RVCMetadata(
+        backend="mock",
+        input_path=segment.tts.selected_candidate_path,
+        output_path=str(completed_output),
+        selected_profile_name="rmvpe_index045",
+        accepted=True,
+    )
+    now = time.time()
+    os.utime(completed_output, (now - 30, now - 30))
+    os.utime(segment.tts.selected_candidate_path, (now + 30, now + 30))
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[segment])
+    seen_inputs: list[Path] = []
+    original_convert = pipeline_steps.RVCMockClient.convert
+
+    def counting_convert(self, input_path: Path, output_path: Path, **kwargs: object):
+        seen_inputs.append(input_path)
+        return original_convert(self, input_path, output_path, **kwargs)
+
+    monkeypatch.setattr(pipeline_steps.RVCMockClient, "convert", counting_convert)
+
+    manifest = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True)
+
+    assert seen_inputs == [Path(segment.tts.selected_candidate_path)]
+    assert manifest.segments[0].status == "rvc_converted"
+    assert manifest.segments[0].rvc is not None
+    assert manifest.segments[0].rvc.accepted is True
 
 
 def test_regenerate_needs_step_rebuilds_only_regeneration_segments(

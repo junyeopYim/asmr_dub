@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
+from asmr_dub_pipeline.rvc import output_fresh_for_input
 
 
 def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None, only_segment_ids: set[str] | None = None) -> PipelineManifest:
@@ -80,8 +81,12 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
             segment.status = "failed"
             segment.errors.append(message)
             return None, segment.id
-        raw_tts_path = segment.rvc.input_path if segment.rvc and segment.rvc.input_path else segment.tts.selected_candidate_path
-        input_path = Path(raw_tts_path)
+        input_path = _resolve_manifest_path(project_dir, segment.tts.selected_candidate_path)
+        if input_path is None:
+            message = "RVC requires segment.tts.selected_candidate_path from synth."
+            segment.status = "failed"
+            segment.errors.append(message)
+            return None, segment.id
         if not input_path.exists():
             message = f"RVC input does not exist: {input_path}"
             segment.status = "failed"
@@ -272,11 +277,12 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
             return False
         if not segment.rvc.output_path:
             return False
-        output_path = Path(segment.rvc.output_path).expanduser()
-        if not output_path.is_absolute():
-            output_path = project_dir / output_path
+        output_path = _resolve_manifest_path(project_dir, segment.rvc.output_path)
+        input_path = _resolve_manifest_path(project_dir, segment.tts.selected_candidate_path if segment.tts else None)
+        if output_path is None or input_path is None:
+            return False
         try:
-            return output_path.exists() and output_path.stat().st_size > 0
+            return output_fresh_for_input(output_path, input_path)
         except OSError:
             return False
 
