@@ -3988,6 +3988,40 @@ def test_translate_ko_diagnostics_record_split_and_single_retry_failure(
     assert "single JSON parse failed" in final_by_id["seg_0002"]["rejected_reasons"][0]
 
 
+def test_translate_ko_fails_before_model_for_minor_sexualized_source_text(
+    tmp_project_dir: Path,
+) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="未成熟な女の子がエッチな快感を覚える",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["transcribe"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    with pytest.raises(ValueError, match="minor sexualized"):
+        translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["translate-ko"]["status"] == "failed"
+    assert manifest.stage_state["translate-ko"]["safety_blocked"] == 1
+    assert manifest.segments[0].status == "needs_manual_review"
+    assert "translate-ko safety blocked source" in manifest.segments[0].errors[-1]
+    diagnostics = json.loads(Path(manifest.artifacts["translation_diagnostics"]).read_text("utf-8"))
+    assert diagnostics["quality_counters"]["source_minor_sexualized_content"] == 1
+
+
 def test_korean_script_skips_existing_manual_review_translation(tmp_project_dir: Path) -> None:
     segment = Segment(
         id="seg_0001",

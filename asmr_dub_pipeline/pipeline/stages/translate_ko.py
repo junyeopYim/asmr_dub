@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
+from asmr_dub_pipeline.script.text_qc import has_minor_sexualized_content
 
 
 def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None = None, confirm_rights: bool = False, force_retranslate: bool = False, retry_failed: bool = False, repair_only: bool = False, force_retranslate_failed: bool = False) -> PipelineManifest:
@@ -40,6 +41,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     asr_homophone_postprocessed = 0
     numeric_counting_postprocessed = 0
     asr_backcheck_count = 0
+    safety_blocked = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
     for segment in manifest.segments:
@@ -51,6 +53,25 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                     "status": "no_speech_detected",
                     "reason": f"segment status is {segment.status}",
                     "source_text": "",
+                    "translation_ko": None,
+                }
+            )
+            continue
+        source_text = segment.source_script.text if segment.source_script else ""
+        if source_text.strip() and has_minor_sexualized_content(source_text):
+            safety_blocked += 1
+            needs_manual_review += 1
+            quality_counters["source_minor_sexualized_content"] += 1
+            segment.status = "needs_manual_review"
+            message = "translate-ko safety blocked source: tts_safety_minor_sexualized_content"
+            if message not in segment.errors:
+                segment.errors.append(message)
+            rows.append(
+                {
+                    "segment_id": segment.id,
+                    "status": "needs_manual_review",
+                    "reason": message,
+                    "source_text": source_text,
                     "translation_ko": None,
                 }
             )
@@ -273,6 +294,24 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
 
     if rows:
         persist_partial()
+    if safety_blocked:
+        mark_stage(
+            manifest,
+            "translate-ko",
+            "failed",
+            backend=backend_kind,
+            model=model_name,
+            translated=translated,
+            needs_manual_review=needs_manual_review,
+            no_speech_detected=no_speech_detected,
+            safety_blocked=safety_blocked,
+            quality_counters=dict(sorted(quality_counters.items())),
+        )
+        save_manifest(project_dir, manifest)
+        raise ValueError(
+            "translate-ko blocked minor sexualized source content before translation "
+            f"({safety_blocked} segment(s))."
+        )
 
     def translate_batch_with_retries(
         batch: list[Segment],
