@@ -404,3 +404,22 @@ def test_score_qc_warns_for_too_much_leading_or_trailing_silence(tmp_path: Path)
     assert metrics["trailing_silence_sec"] >= 0.54
     assert "too_much_silence" in qc.issues
     assert qc.status == "needs_regeneration"
+
+
+def test_score_qc_allows_short_asmr_edge_pause_on_long_segment(tmp_path: Path) -> None:
+    data = np.concatenate(
+        [
+            np.zeros((_frame(0.08), 2), dtype=np.float32),
+            _sine(8.80, amplitude=0.06),
+            np.zeros((_frame(0.64), 2), dtype=np.float32),
+        ],
+        axis=0,
+    )
+    pause_path = _write_wav(tmp_path / "soft_tail_pause.wav", data)
+    metrics = measure_audio_qc(pause_path, target_duration_sec=9.52)
+
+    qc = score_qc(metrics, {"recommendation": "pass"})
+
+    assert metrics["trailing_silence_sec"] >= 0.63
+    assert "too_much_silence" not in qc.issues
+    assert qc.status == "ok"

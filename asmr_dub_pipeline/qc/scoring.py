@@ -8,7 +8,8 @@ from asmr_dub_pipeline.gemma.schemas import GemmaQCResult
 from asmr_dub_pipeline.schemas import QCMetadata
 
 ASMR_MAX_RMS_DBFS = -18.0
-ASMR_MAX_EDGE_SILENCE_SEC = 0.40
+ASMR_MAX_SINGLE_EDGE_SILENCE_SEC = 1.20
+ASMR_MAX_TOTAL_EDGE_SILENCE_RATIO = 0.35
 
 
 def score_qc(audio_metrics: dict[str, Any], gemma_qc: dict[str, Any] | None = None) -> QCMetadata:
@@ -39,7 +40,14 @@ def score_qc(audio_metrics: dict[str, Any], gemma_qc: dict[str, Any] | None = No
         issues.append("too_loud_for_asmr")
     leading_silence = float(audio_metrics.get("leading_silence_sec") or 0.0)
     trailing_silence = float(audio_metrics.get("trailing_silence_sec") or 0.0)
-    if leading_silence > ASMR_MAX_EDGE_SILENCE_SEC or trailing_silence > ASMR_MAX_EDGE_SILENCE_SEC:
+    duration_sec = max(0.0, float(audio_metrics.get("duration_sec") or 0.0))
+    edge_silence = leading_silence + trailing_silence
+    edge_ratio = edge_silence / duration_sec if duration_sec > 0.0 else 0.0
+    if (
+        leading_silence > ASMR_MAX_SINGLE_EDGE_SILENCE_SEC
+        or trailing_silence > ASMR_MAX_SINGLE_EDGE_SILENCE_SEC
+        or edge_ratio > ASMR_MAX_TOTAL_EDGE_SILENCE_RATIO
+    ):
         issues.append("too_much_silence")
     unsafe = bool(gemma_qc.get("unsafe_or_rights_issue", False))
     repetition = bool(gemma_qc.get("repetition_detected", False))
