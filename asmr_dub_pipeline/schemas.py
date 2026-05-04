@@ -12,6 +12,7 @@ SCHEMA_VERSION = "1.0"
 
 SegmentStatus = Literal[
     "raw",
+    "transcribed",
     "analyzed",
     "scripted",
     "synthesized",
@@ -20,6 +21,7 @@ SegmentStatus = Literal[
     "ok",
     "needs_regeneration",
     "needs_manual_review",
+    "no_speech_detected",
     "failed",
 ]
 Emotion = Literal["gentle", "sleepy", "reassuring", "playful", "serious", "neutral"]

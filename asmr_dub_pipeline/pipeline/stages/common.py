@@ -54,9 +54,13 @@ from asmr_dub_pipeline.audio.mixing import (
 )
 from asmr_dub_pipeline.audio.preprocess import (
     extract_project_audio,
+    folder_input_metadata,
     merge_numbered_parts_to_audio,
+    plan_folder_input,
     plan_numbered_part_merge,
+    prepare_folder_input_audio,
     probe_with_fallback,
+    translate_media_stem_to_korean,
 )
 from asmr_dub_pipeline.audio.quality import AudioQualityMetrics, measure_source_voice_quality
 from asmr_dub_pipeline.audio.segmentation import (
@@ -170,7 +174,8 @@ from asmr_dub_pipeline.voice_bank import (
     validate_voice_bank_models,
 )
 
-SKIP_STATUSES = {"needs_manual_review", "failed"}
+NO_SPEECH_STATUSES = {"no_speech_detected"}
+SKIP_STATUSES = {"needs_manual_review", "failed", *NO_SPEECH_STATUSES}
 GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
     "Connection refused",
     "Connection reset",
@@ -180,15 +185,60 @@ GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
 LEGACY_DETERMINISTIC_NUMERIC_TRANSLATION_NOTE = "deterministic_numeric_source"
 NUMERIC_COUNTING_POSTPROCESS_NOTE = "numeric_counting_postprocess"
 KOREAN_DIGIT_PRONUNCIATION_POSTPROCESS_NOTE = "korean_digit_pronunciation_postprocess"
+KOREAN_ORDINAL_POSTPROCESS_NOTE = "korean_ordinal_postprocess"
+KOREAN_ASR_HOMOPHONE_POSTPROCESS_NOTE = "korean_asr_homophone_postprocess"
+KOREAN_ONOMATOPOEIA_POSTPROCESS_NOTE = "korean_onomatopoeia_postprocess"
+KOREAN_FLUENCY_POSTPROCESS_NOTE = "korean_fluency_postprocess"
 NUMERIC_ONLY_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 NUMERIC_TOKEN_RE = re.compile(r"\d+")
 RAW_DIGIT_RE = re.compile(r"(?<![A-Za-z_])\d+(?![A-Za-z_])")
+JAPANESE_SECOND_ORDINAL_RE = re.compile(r"第\s*(?:二|2|２)\s*の")
+KOREAN_BAD_SECOND_ORDINAL_RE = re.compile(r"제\s*이의\s*")
 KOREAN_TRANSLATION_KANA_RE = re.compile(r"[\u3040-\u30ffー]")
 KOREAN_TRANSLATION_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 KOREAN_TRANSLATION_LATIN_RE = re.compile(r"[A-Za-z]")
+KOREAN_GURIGURI_TRANSLITERATION_RE = re.compile(
+    r"(?<![가-힣])(?:그리그리|그리(?:\s*,?\s*그리)+)(?![가-힣])"
+)
+JAPANESE_HIRAGANA_RE = re.compile(r"[\u3041-\u309fー]")
+JAPANESE_KATAKANA_RE = re.compile(r"[\u30a0-\u30ffー]")
+JAPANESE_KANJI_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+JAPANESE_STRONG_SPLIT_CHARS = set(" \t\n\r。、，,.！？!?…♪")
+JAPANESE_SOFT_SPLIT_END_CHARS = set("よねわぞぜ")
+JAPANESE_PARTICLE_SPLIT_START_CHARS = set("はがをにでともへや")
+JAPANESE_SMALL_KANA_CHARS = set("ぁぃぅぇぉゃゅょっァィゥェォャュョッ")
+JAPANESE_COMMON_SEGMENT_STARTS = (
+    "だから",
+    "だって",
+    "でも",
+    "では",
+    "です",
+    "そして",
+    "それで",
+    "それから",
+    "それは",
+    "それも",
+    "ただ",
+    "また",
+    "まだ",
+    "もう",
+    "まず",
+    "次に",
+    "この",
+    "その",
+    "あの",
+    "どこ",
+    "ここ",
+    "そこ",
+    "ある",
+    "いい",
+    "はい",
+    "ゆっくり",
+)
 SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS = ("변비약", "비약", "체감")
 KOREAN_DRAFT_MIX_ALLOWED_QC_ISSUES = {"duration_ratio_out_of_range", "too_much_silence"}
 PROGRESS_LOG_SECONDS = 30.0
+TRANSLATION_REJECTION_ERROR_PREFIX = "Korean translation rejected before TTS: "
 JAPANESE_TTS_LANGUAGES = {"ja", "jp", "jpn", "japanese"}
 KOREAN_TTS_LANGUAGES = {"ko", "kr", "kor", "korean"}
 NATIVE_KOREAN_COUNT_ONES = {
@@ -586,8 +636,10 @@ def _split_long_asr_chunk(chunk: ASRChunk, *, max_chunk_sec: float) -> list[ASRC
     text = chunk.text.strip()
     if not text:
         return []
-    chars_per_part = max(1, int(math.ceil(len(text) / part_count)))
-    parts = [text[index : index + chars_per_part].strip() for index in range(0, len(text), chars_per_part)]
+    split_points = _preferred_asr_text_split_points(text, part_count)
+    start_indexes = [0, *split_points]
+    end_indexes = [*split_points, len(text)]
+    parts = [text[start:end].strip() for start, end in zip(start_indexes, end_indexes, strict=True)]
     parts = [part for part in parts if part]
     if len(parts) <= 1:
         return [chunk]
@@ -598,6 +650,81 @@ def _split_long_asr_chunk(chunk: ASRChunk, *, max_chunk_sec: float) -> list[ASRC
         end = chunk.end if index == len(parts) - 1 else chunk.start + part_duration * (index + 1)
         split_chunks.append(chunk.model_copy(update={"start": start, "end": end, "text": part}))
     return split_chunks
+
+
+def _preferred_asr_text_split_points(text: str, part_count: int) -> list[int]:
+    if part_count <= 1 or len(text) <= 1:
+        return []
+    split_points: list[int] = []
+    previous = 0
+    for split_index in range(1, part_count):
+        target = round(len(text) * split_index / part_count)
+        min_index = previous + 1
+        max_index = len(text) - (part_count - split_index)
+        if min_index > max_index:
+            break
+        point = _preferred_asr_text_split_point(
+            text,
+            target=target,
+            min_index=min_index,
+            max_index=max_index,
+            part_count=part_count,
+        )
+        split_points.append(point)
+        previous = point
+    return split_points
+
+
+def _preferred_asr_text_split_point(
+    text: str,
+    *,
+    target: int,
+    min_index: int,
+    max_index: int,
+    part_count: int,
+) -> int:
+    window = max(8, math.ceil(len(text) / part_count * 0.45))
+    window_min = max(min_index, target - window)
+    window_max = min(max_index, target + window)
+    candidates = range(window_min, window_max + 1)
+    scored = [
+        (_asr_text_split_boundary_score(text, index), -abs(index - target), -index, index)
+        for index in candidates
+    ]
+    preferred = [item for item in scored if item[0] > 0]
+    if preferred:
+        return max(preferred)[3]
+    return min(max(target, min_index), max_index)
+
+
+def _asr_text_split_boundary_score(text: str, index: int) -> int:
+    if index <= 0 or index >= len(text):
+        return 0
+    left = text[index - 1]
+    right = text[index]
+    if left.isspace() or right.isspace():
+        return 100
+    if left in JAPANESE_STRONG_SPLIT_CHARS or right in JAPANESE_STRONG_SPLIT_CHARS:
+        return 95
+    if any(text[:index].endswith(suffix) for suffix in ("ください", "でした", "ました", "ません", "です", "ます")):
+        return 85
+    if left in JAPANESE_SOFT_SPLIT_END_CHARS:
+        return 70
+    if JAPANESE_KANJI_RE.fullmatch(left) and right in JAPANESE_PARTICLE_SPLIT_START_CHARS:
+        return 60
+    if _looks_like_japanese_word_internal_split(left, right):
+        return 0
+    return 0
+
+
+def _looks_like_japanese_word_internal_split(left: str, right: str) -> bool:
+    if JAPANESE_KANJI_RE.fullmatch(left) and JAPANESE_HIRAGANA_RE.fullmatch(right):
+        return True
+    if JAPANESE_HIRAGANA_RE.fullmatch(left) and JAPANESE_HIRAGANA_RE.fullmatch(right):
+        return left in JAPANESE_SMALL_KANA_CHARS or right in JAPANESE_SMALL_KANA_CHARS
+    if JAPANESE_KATAKANA_RE.fullmatch(left) and JAPANESE_KATAKANA_RE.fullmatch(right):
+        return left in JAPANESE_SMALL_KANA_CHARS or right in JAPANESE_SMALL_KANA_CHARS or right == "ー"
+    return False
 
 
 def _group_asr_chunks_for_tts(
@@ -721,9 +848,10 @@ def _asr_suspicious_pattern_hits(
             continue
         try:
             if re.search(pattern, text):
-                hits.append(pattern)
+                if pattern not in hits:
+                    hits.append(pattern)
         except re.error:
-            if pattern in text:
+            if pattern in text and pattern not in hits:
                 hits.append(pattern)
     return hits
 
@@ -884,14 +1012,16 @@ def _asr_repair_candidate_is_better(
     return candidate_density > max(original_density * 1.2, sparse_min_chars_per_sec)
 
 
-ASR_PROMPT_LEAK_MARKERS = (
+ASR_HARD_PROMPT_LEAK_MARKERS = (
     "Sound Hodori",
     "사운드",
     "호돌이",
     "Instagram",
     "Twitter",
     "ご視聴",
-    "ありがとうございました",
+    "ご覧いただきありがとうございます",
+    "ご覧頂きありがとうございます",
+    "最後までご覧",
     "次の動画",
     "お会いしましょう",
     "チャンネル登録",
@@ -902,13 +1032,21 @@ ASR_PROMPT_LEAK_MARKERS = (
     "さくら ジンジン 痺れる",
     "気持ちいい イっちゃう 飛んじゃってください",
 )
+ASR_SOFT_ENDING_MARKERS = (
+    "ありがとうございました",
+    "お疲れ様",
+)
+ASR_PROMPT_LEAK_MARKERS = ASR_HARD_PROMPT_LEAK_MARKERS
+ASR_SOURCE_VOCALS_RELATIVE_QUIET_MAX_RMS_DBFS = -45.0
+ASR_SOURCE_VOCALS_RELATIVE_QUIET_MIN_RMS_DELTA_DB = 24.0
+ASR_SOURCE_VOCALS_RELATIVE_QUIET_MIN_PEAK_DELTA_DB = 6.0
 
 
 def _asr_candidate_looks_prompt_leaked(text: str, cfg: Any) -> bool:
     normalized = " ".join(text.split())
     if not normalized:
         return False
-    if any(marker in normalized for marker in ASR_PROMPT_LEAK_MARKERS):
+    if any(marker in normalized for marker in ASR_HARD_PROMPT_LEAK_MARKERS):
         return True
     if normalized.count("おやすみ") >= 2:
         return True
@@ -2004,6 +2142,315 @@ def _apply_korean_digit_pronunciation_postprocess(
     return rewritten_count
 
 
+def _repair_second_ordinal_translation_text(text: str) -> str:
+    rewritten = KOREAN_BAD_SECOND_ORDINAL_RE.sub("두 번째 ", text)
+    rewritten = re.sub(r"\s+", " ", rewritten)
+    rewritten = re.sub(r"\s+([,.!?…])", r"\1", rewritten)
+    return rewritten.strip()
+
+
+def _apply_korean_ordinal_postprocess(
+    segments: list[Segment],
+    diagnostics: list[dict[str, Any]],
+    quality_counters: Counter[str],
+) -> int:
+    rewritten_count = 0
+    for segment in segments:
+        translation = segment.translation_ko
+        if translation is None or KOREAN_ORDINAL_POSTPROCESS_NOTE in translation.notes:
+            continue
+        source_text = _translation_source_text(segment)
+        if not JAPANESE_SECOND_ORDINAL_RE.search(source_text):
+            continue
+        combined = f"{translation.ko_literal} {translation.ko_natural}"
+        if not KOREAN_BAD_SECOND_ORDINAL_RE.search(combined):
+            continue
+        before = translation.model_dump(mode="json")
+        notes = list(translation.notes)
+        notes.append(KOREAN_ORDINAL_POSTPROCESS_NOTE)
+        repaired = translation.model_copy(
+            update={
+                "ko_literal": _repair_second_ordinal_translation_text(translation.ko_literal),
+                "ko_natural": _repair_second_ordinal_translation_text(translation.ko_natural),
+                "notes": notes,
+            }
+        )
+        segment.translation_ko = repaired
+        quality_counters["ordinal_mistranslation_repaired"] += 1
+        diagnostics.append(
+            {
+                "segment_id": segment.id,
+                "source_text": source_text,
+                "repair_reasons": ["ordinal_mistranslation"],
+                "before": before,
+                "after": repaired.model_dump(mode="json"),
+                "accepted": not KOREAN_BAD_SECOND_ORDINAL_RE.search(
+                    f"{repaired.ko_literal} {repaired.ko_natural}"
+                ),
+            }
+        )
+        rewritten_count += 1
+    return rewritten_count
+
+
+def _source_suggests_akume_asr_homophone(segment: Segment) -> bool:
+    source_text = _translation_source_text(segment)
+    compact = re.sub(r"\s+", "", source_text)
+    homophone_tokens = ("悪夢", "悪目", "明け目", "アカメ")
+    if not any(token in compact for token in homophone_tokens):
+        return False
+    if any(token in compact for token in ("悪夢落ち", "悪目落ち", "明け目落ち")):
+        return True
+    return any(term in compact for term in ("メスイキ", "イキ", "絶頂", "快楽", "快感", "気持ちいい", "イク", "行く"))
+
+
+def _source_suggests_josou_asr_homophone(segment: Segment) -> bool:
+    return "助走" in re.sub(r"\s+", "", _translation_source_text(segment))
+
+
+def _source_suggests_guriguri_onomatopoeia(segment: Segment) -> bool:
+    source_text = _translation_source_text(segment)
+    compact = re.sub(r"\s+", "", source_text)
+    return "グリグリ" in compact or bool(re.search(r"(^|[\s、。,.])グリ([\s、。,.]|$)", source_text))
+
+
+def _repair_akume_homophone_translation_text(text: str) -> str:
+    rewritten = text
+    replacements = (
+        ("암컷 절정 악몽이", "암컷 절정이"),
+        ("암컷 절정 악몽을", "암컷 절정을"),
+        ("암컷 절정 악몽은", "암컷 절정은"),
+        ("암컷 절정 악몽", "암컷 절정"),
+        ("암컷 절정의 악몽이", "암컷 절정이"),
+        ("암컷 절정의 악몽을", "암컷 절정을"),
+        ("암컷 절정의 악몽은", "암컷 절정은"),
+        ("암컷 절정의 악몽", "암컷 절정"),
+        ("메스이키 악몽이", "메스이키 절정이"),
+        ("메스이키 악몽을", "메스이키 절정을"),
+        ("메스이키 악몽은", "메스이키 절정은"),
+        ("메스이키 악몽", "메스이키 절정"),
+        ("메스 이키 악몽이", "메스이키 절정이"),
+        ("메스 이키 악몽을", "메스이키 절정을"),
+        ("메스 이키 악몽은", "메스이키 절정은"),
+        ("메스 이키 악몽", "메스이키 절정"),
+        ("악몽으로 떨어지는 길", "절정에 빠지는 길"),
+        ("악몽으로 떨어지는", "절정에 빠지는"),
+        ("악몽에 빠지는 길", "절정에 빠지는 길"),
+        ("악몽에 빠지는", "절정에 빠지는"),
+        ("눈이 뒤집히는 타락의 길", "절정에 빠지는 길"),
+        ("눈이 뒤집히는 타락", "절정"),
+        ("악몽을 꾸세요", "절정하세요"),
+        ("악몽을 꾸고", "절정하고"),
+        ("악몽을 꾸면서", "절정하면서"),
+        ("악몽을 겪어보고", "아크메를 해보고"),
+        ("악몽을 겪고", "아크메를 하고"),
+        ("악몽을 결정", "아크메를 결정"),
+        ("악몽을 너무 결정해서", "아크메를 너무 해서"),
+        ("악몽 추락", "아크메락"),
+        ("악몽의 추락", "아크메락"),
+        ("악몽 속으로 떨어진 순간", "아크메락 순간"),
+        ("악몽 속으로 추락하고", "아크메락하고"),
+        ("악몽 여배우", "아크메 여배우"),
+        ("악몽 배우", "아크메 배우"),
+        ("악몽을", "아크메를"),
+        ("악몽이", "아크메가"),
+        ("악몽은", "아크메는"),
+        ("악몽으로", "아크메로"),
+        ("악몽에", "아크메에"),
+        ("악몽", "아크메"),
+    )
+    for source, target in replacements:
+        rewritten = rewritten.replace(source, target)
+    rewritten = re.sub(r"\s+", " ", rewritten)
+    rewritten = re.sub(r"\s+([,.!?…])", r"\1", rewritten)
+    return rewritten.strip()
+
+
+def _repair_josou_homophone_translation_text(text: str) -> str:
+    rewritten = text
+    replacements = (
+        ("도움닫기를", "여장을"),
+        ("도움닫기라는", "여장이라는"),
+        ("도움닫기였", "여장이었"),
+        ("도움닫기예요", "여장이에요"),
+        ("도움닫기", "여장"),
+        ("달려들고 싶어지면", "여장하고 싶어지면"),
+        ("달려들고 싶어질", "여장하고 싶어질"),
+        ("달려들고 싶어", "여장하고 싶어"),
+        ("조주를", "여장을"),
+        ("조주라는", "여장이라는"),
+        ("조주였", "여장이었"),
+        ("조주예요", "여장이에요"),
+        ("조주", "여장"),
+    )
+    for source, target in replacements:
+        rewritten = rewritten.replace(source, target)
+    rewritten = re.sub(r"\s+", " ", rewritten)
+    rewritten = re.sub(r"\s+([,.!?…])", r"\1", rewritten)
+    return rewritten.strip()
+
+
+def _repair_guriguri_onomatopoeia_translation_text(text: str) -> str:
+    rewritten = KOREAN_GURIGURI_TRANSLITERATION_RE.sub("문질문질", text)
+    rewritten = re.sub(r"\s+", " ", rewritten)
+    rewritten = re.sub(r"\s+([,.!?…])", r"\1", rewritten)
+    return rewritten.strip()
+
+
+def _repair_korean_fluency_translation_text(text: str) -> tuple[str, list[str]]:
+    rewritten = text
+    repair_reasons: list[str] = []
+    if "끝져가는" in rewritten:
+        rewritten = rewritten.replace("끝져가는", "끝나가는")
+        repair_reasons.append("broken_korean_ending")
+    rewritten = re.sub(r"\s+", " ", rewritten)
+    rewritten = re.sub(r"\s+([,.!?…])", r"\1", rewritten)
+    return rewritten.strip(), repair_reasons
+
+
+def _apply_korean_asr_homophone_postprocess(
+    segments: list[Segment],
+    diagnostics: list[dict[str, Any]],
+    quality_counters: Counter[str],
+) -> int:
+    rewritten_count = 0
+    for segment in segments:
+        translation = segment.translation_ko
+        if translation is None:
+            continue
+        source_text = _translation_source_text(segment)
+        repair_reasons: list[str] = []
+        ko_literal = translation.ko_literal
+        ko_natural = translation.ko_natural
+        if _source_suggests_akume_asr_homophone(segment):
+            ko_literal = _repair_akume_homophone_translation_text(ko_literal)
+            ko_natural = _repair_akume_homophone_translation_text(ko_natural)
+            if ko_literal != translation.ko_literal or ko_natural != translation.ko_natural:
+                repair_reasons.append("asr_homophone_akume")
+        if _source_suggests_josou_asr_homophone(segment):
+            before_literal = ko_literal
+            before_natural = ko_natural
+            ko_literal = _repair_josou_homophone_translation_text(ko_literal)
+            ko_natural = _repair_josou_homophone_translation_text(ko_natural)
+            if ko_literal != before_literal or ko_natural != before_natural:
+                repair_reasons.append("asr_homophone_josou")
+        if not repair_reasons:
+            continue
+        before = translation.model_dump(mode="json")
+        notes = list(translation.notes)
+        if KOREAN_ASR_HOMOPHONE_POSTPROCESS_NOTE not in notes:
+            notes.append(KOREAN_ASR_HOMOPHONE_POSTPROCESS_NOTE)
+        repaired = translation.model_copy(
+            update={
+                "ko_literal": ko_literal,
+                "ko_natural": ko_natural,
+                "notes": notes,
+            }
+        )
+        segment.translation_ko = repaired
+        quality_counters["asr_homophone_repaired"] += 1
+        diagnostics.append(
+            {
+                "segment_id": segment.id,
+                "source_text": source_text,
+                "repair_reasons": repair_reasons,
+                "before": before,
+                "after": repaired.model_dump(mode="json"),
+                "accepted": not any(
+                    bad in f"{repaired.ko_literal} {repaired.ko_natural}"
+                    for bad in ("악몽", "도움닫기", "조주")
+                ),
+            }
+        )
+        rewritten_count += 1
+    return rewritten_count
+
+
+def _apply_korean_onomatopoeia_postprocess(
+    segments: list[Segment],
+    diagnostics: list[dict[str, Any]],
+    quality_counters: Counter[str],
+) -> int:
+    rewritten_count = 0
+    for segment in segments:
+        translation = segment.translation_ko
+        if translation is None or not _source_suggests_guriguri_onomatopoeia(segment):
+            continue
+        ko_literal = _repair_guriguri_onomatopoeia_translation_text(translation.ko_literal)
+        ko_natural = _repair_guriguri_onomatopoeia_translation_text(translation.ko_natural)
+        if ko_literal == translation.ko_literal and ko_natural == translation.ko_natural:
+            continue
+        before = translation.model_dump(mode="json")
+        notes = list(translation.notes)
+        if KOREAN_ONOMATOPOEIA_POSTPROCESS_NOTE not in notes:
+            notes.append(KOREAN_ONOMATOPOEIA_POSTPROCESS_NOTE)
+        repaired = translation.model_copy(
+            update={
+                "ko_literal": ko_literal,
+                "ko_natural": ko_natural,
+                "notes": notes,
+            }
+        )
+        segment.translation_ko = repaired
+        quality_counters["onomatopoeia_transliteration_repaired"] += 1
+        diagnostics.append(
+            {
+                "segment_id": segment.id,
+                "source_text": _translation_source_text(segment),
+                "repair_reasons": ["onomatopoeia_guriguri"],
+                "before": before,
+                "after": repaired.model_dump(mode="json"),
+                "accepted": not KOREAN_GURIGURI_TRANSLITERATION_RE.search(
+                    f"{repaired.ko_literal} {repaired.ko_natural}"
+                ),
+            }
+        )
+        rewritten_count += 1
+    return rewritten_count
+
+
+def _apply_korean_fluency_postprocess(
+    segments: list[Segment],
+    diagnostics: list[dict[str, Any]],
+    quality_counters: Counter[str],
+) -> int:
+    rewritten_count = 0
+    for segment in segments:
+        translation = segment.translation_ko
+        if translation is None:
+            continue
+        ko_literal, literal_reasons = _repair_korean_fluency_translation_text(translation.ko_literal)
+        ko_natural, natural_reasons = _repair_korean_fluency_translation_text(translation.ko_natural)
+        repair_reasons = sorted({*literal_reasons, *natural_reasons})
+        if not repair_reasons or (ko_literal == translation.ko_literal and ko_natural == translation.ko_natural):
+            continue
+        before = translation.model_dump(mode="json")
+        notes = list(translation.notes)
+        if KOREAN_FLUENCY_POSTPROCESS_NOTE not in notes:
+            notes.append(KOREAN_FLUENCY_POSTPROCESS_NOTE)
+        repaired = translation.model_copy(
+            update={
+                "ko_literal": ko_literal,
+                "ko_natural": ko_natural,
+                "notes": notes,
+            }
+        )
+        segment.translation_ko = repaired
+        quality_counters["fluency_repaired"] += 1
+        diagnostics.append(
+            {
+                "segment_id": segment.id,
+                "source_text": _translation_source_text(segment),
+                "repair_reasons": repair_reasons,
+                "before": before,
+                "after": repaired.model_dump(mode="json"),
+                "accepted": "끝져가는" not in f"{repaired.ko_literal} {repaired.ko_natural}",
+            }
+        )
+        rewritten_count += 1
+    return rewritten_count
+
+
 def _native_korean_count_number(value: int) -> str | None:
     if value in NATIVE_KOREAN_COUNT_ONES:
         return NATIVE_KOREAN_COUNT_ONES[value]
@@ -2136,7 +2583,86 @@ def _translation_issue_codes(segment: Segment) -> list[str]:
         "열여덟까지" in combined or "쓸 수 있는" in combined or "사용할 수 있는" in combined
     ):
         issues.append("domain_mistranslation")
+    if JAPANESE_SECOND_ORDINAL_RE.search(source_text) and KOREAN_BAD_SECOND_ORDINAL_RE.search(combined):
+        issues.append("ordinal_mistranslation")
+    if _natural_translation_omits_repeated_source_phrase(source_text, translation):
+        issues.append("natural_repetition_omission")
     return list(dict.fromkeys(issues))
+
+
+def _compact_translation_repeat_text(text: str) -> str:
+    return re.sub(r"[\s、。，,.!?！？…]+", "", text)
+
+
+def _has_repeated_phrase(text: str, *, min_chars: int = 8) -> bool:
+    compact = _compact_translation_repeat_text(text)
+    if len(compact) < min_chars * 2:
+        return False
+    seen: set[str] = set()
+    for index in range(0, len(compact) - min_chars + 1):
+        phrase = compact[index : index + min_chars]
+        if phrase in seen:
+            return True
+        seen.add(phrase)
+    return False
+
+
+def _natural_translation_omits_repeated_source_phrase(
+    source_text: str,
+    translation: Any,
+) -> bool:
+    if not _has_repeated_phrase(source_text):
+        return False
+    literal = _compact_translation_repeat_text(str(getattr(translation, "ko_literal", "")))
+    natural = _compact_translation_repeat_text(str(getattr(translation, "ko_natural", "")))
+    if len(literal) < 40 or len(natural) < 1:
+        return False
+    return len(natural) / len(literal) < 0.75
+
+
+def _source_split_inside_japanese_word(left_text: str, right_text: str) -> bool:
+    left = left_text.strip()
+    right = right_text.strip()
+    if not left or not right:
+        return False
+    if right.startswith(JAPANESE_COMMON_SEGMENT_STARTS):
+        return False
+    combined = f"{left}{right}"
+    split_index = len(left)
+    if _asr_text_split_boundary_score(combined, split_index) > 0:
+        return False
+    return _looks_like_japanese_word_internal_split(left[-1], right[0])
+
+
+def _translation_boundary_issue_codes(segments: list[Segment]) -> dict[str, list[str]]:
+    issues: dict[str, list[str]] = {}
+    for left, right in zip(segments, segments[1:], strict=False):
+        left_source = _translation_source_text(left)
+        right_source = _translation_source_text(right)
+        if not left_source or not right_source:
+            continue
+        if abs(float(right.start) - float(left.end)) > 0.05:
+            continue
+        if not _source_split_inside_japanese_word(left_source, right_source):
+            continue
+        for segment in (left, right):
+            issues.setdefault(segment.id, []).append("source_split_inside_japanese_word")
+    return issues
+
+
+def _translation_backcheck_ko_pattern_matches(
+    text: str,
+    pattern: str,
+    *,
+    source_text: str = "",
+) -> bool:
+    if not pattern:
+        return False
+    if pattern == "비약":
+        return bool(re.search(r"비약(?!\s*적)", text))
+    if pattern == "미약" and "媚薬" in source_text and "火薬" not in source_text:
+        return False
+    return pattern in text
 
 
 def _backcheck_severity(item: dict[str, Any]) -> str:
@@ -2144,13 +2670,26 @@ def _backcheck_severity(item: dict[str, Any]) -> str:
     if any(hit in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS for hit in hits):
         return "severe"
     ko_natural = str(item.get("ko_natural") or "")
-    if any(pattern in ko_natural for pattern in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS):
+    if any(
+        _translation_backcheck_ko_pattern_matches(ko_natural, pattern)
+        for pattern in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS
+    ):
         return "severe"
     return "warning"
 
 
 def _translation_rejection_message(reasons: list[str]) -> str:
-    return "Korean translation rejected before TTS: " + ", ".join(reasons)
+    return TRANSLATION_REJECTION_ERROR_PREFIX + ", ".join(reasons)
+
+
+def _clear_translation_rejection_errors(segment: Segment) -> None:
+    segment.errors = [
+        error
+        for error in segment.errors
+        if not error.startswith(TRANSLATION_REJECTION_ERROR_PREFIX)
+    ]
+    if segment.status in SKIP_STATUSES and not segment.errors:
+        segment.status = "raw"
 
 
 def _upsert_translation_row(
@@ -2173,6 +2712,7 @@ def _finalize_translation_acceptance(
 ) -> None:
     backcheck_by_segment_id = {str(item["segment_id"]): item for item in asr_backcheck_items}
     rows_by_segment_id = {str(row.get("segment_id") or ""): row for row in rows}
+    boundary_warning_codes = _translation_boundary_issue_codes(segments)
     for segment in segments:
         row = rows_by_segment_id.get(segment.id)
         if row is None:
@@ -2183,8 +2723,12 @@ def _finalize_translation_acceptance(
             continue
         rejected_reasons: list[str] = []
         issue_codes = _translation_issue_codes(segment)
+        issue_codes = list(dict.fromkeys(issue_codes))
+        warning_codes = list(dict.fromkeys(boundary_warning_codes.get(segment.id, [])))
         for issue in issue_codes:
             quality_counters[issue] += 1
+        for warning in warning_codes:
+            quality_counters[warning] += 1
         rejected_reasons.extend(issue_codes)
         backcheck = backcheck_by_segment_id.get(segment.id)
         if backcheck is not None:
@@ -2194,8 +2738,6 @@ def _finalize_translation_acceptance(
             if severity == "severe":
                 quality_counters["severe_backcheck"] += 1
                 rejected_reasons.append("severe_translation_smell")
-        if segment.status in SKIP_STATUSES and not rejected_reasons:
-            rejected_reasons.append(f"segment status is {segment.status}")
         if rejected_reasons:
             segment.status = "needs_manual_review"
             message = _translation_rejection_message(rejected_reasons)
@@ -2208,18 +2750,21 @@ def _finalize_translation_acceptance(
                     "source_text": source_text,
                     "translation_ko": translation.model_dump(mode="json") if translation else None,
                     "quality_issues": issue_codes,
+                    "quality_warnings": warning_codes,
                     "accepted": False,
                     "rejected_reasons": rejected_reasons,
                 }
             )
             _upsert_translation_row(rows, segment, row)
             continue
+        _clear_translation_rejection_errors(segment)
         row.update(
             {
                 "status": "translated",
                 "source_text": source_text,
                 "translation_ko": translation.model_dump(mode="json") if translation else None,
                 "quality_issues": [],
+                "quality_warnings": warning_codes,
                 "accepted": True,
                 "rejected_reasons": [],
             }
@@ -2265,7 +2810,12 @@ def _translation_asr_backcheck_item(segment: Segment, cfg: Any) -> dict[str, Any
     translation_hits = [
         pattern
         for pattern in cfg.asr_translation_backcheck_ko_patterns
-        if pattern and pattern in translation_text
+        if pattern
+        and _translation_backcheck_ko_pattern_matches(
+            translation_text,
+            pattern,
+            source_text=source_text,
+        )
     ]
     if not source_hits and not translation_hits:
         return None
@@ -2641,6 +3191,8 @@ def _seed_segments_for_transcribe(
     manifest: PipelineManifest,
     audio_path: Path,
     mix_audio_path: Path,
+    *,
+    write_audio_clips: bool = True,
 ) -> bool:
     if manifest.segments:
         return False
@@ -2655,7 +3207,11 @@ def _seed_segments_for_transcribe(
         keep_original_texture=True,
         status="raw",
     )
-    manifest.segments = write_segment_audio_clips([seed], audio_path, mix_audio_path, project_dir)
+    manifest.segments = (
+        write_segment_audio_clips([seed], audio_path, mix_audio_path, project_dir)
+        if write_audio_clips
+        else [seed]
+    )
     seed_path = project_dir / "work" / "segments" / "manifests" / "segments_transcribe_seed.json"
     _write_segments_manifest(seed_path, manifest.segments)
     manifest.artifacts["segments_transcribe_seed"] = str(seed_path)
@@ -2666,6 +3222,7 @@ def _seed_segments_for_transcribe(
         segment_count=len(manifest.segments),
         source_audio=str(audio_path),
         mix_audio=str(mix_audio_path),
+        audio_clips_written=write_audio_clips,
     )
     save_manifest(project_dir, manifest)
     return True
@@ -2851,6 +3408,45 @@ def _asr_audio_metrics(path: Path) -> dict[str, Any]:
     return metrics
 
 
+def _asr_metric_float(metrics: dict[str, Any] | None, key: str, default: float = -120.0) -> float:
+    if not metrics:
+        return default
+    value = metrics.get(key)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _reject_relative_quiet_source_vocals(candidates: list[dict[str, Any]]) -> None:
+    source = next((item for item in candidates if item.get("source") == "source_vocals_mono_16k"), None)
+    reference = next((item for item in candidates if item.get("source") == "gemma_mono_16k"), None)
+    if source is None or reference is None:
+        return
+    if source.get("reject_reasons") or reference.get("reject_reasons"):
+        return
+    source_rms = _asr_metric_float(source.get("metrics"), "rms_dbfs")
+    reference_rms = _asr_metric_float(reference.get("metrics"), "rms_dbfs")
+    source_peak = _asr_metric_float(source.get("metrics"), "peak_dbfs")
+    reference_peak = _asr_metric_float(reference.get("metrics"), "peak_dbfs")
+    rms_delta = reference_rms - source_rms
+    peak_delta = reference_peak - source_peak
+    if (
+        source_rms <= ASR_SOURCE_VOCALS_RELATIVE_QUIET_MAX_RMS_DBFS
+        and rms_delta >= ASR_SOURCE_VOCALS_RELATIVE_QUIET_MIN_RMS_DELTA_DB
+        and peak_delta >= ASR_SOURCE_VOCALS_RELATIVE_QUIET_MIN_PEAK_DELTA_DB
+    ):
+        source.setdefault("reject_reasons", []).append(
+            "relative_too_quiet_vs_gemma:"
+            f"rms_delta={rms_delta:.1f}db,"
+            f"peak_delta={peak_delta:.1f}db,"
+            f"source_rms={source_rms:.1f}dbfs,"
+            f"gemma_rms={reference_rms:.1f}dbfs"
+        )
+
+
 def _asr_reference_duration(manifest: PipelineManifest, project_dir: Path) -> float | None:
     if manifest.source_info and manifest.source_info.duration_sec > 0:
         return manifest.source_info.duration_sec
@@ -2980,6 +3576,7 @@ def _select_asr_audio_input(
         _resolve_manifest_artifact_path(project_dir, manifest, "gemma_mono_16k"),
         strict_quality=False,
     )
+    _reject_relative_quiet_source_vocals(candidates)
     selected = next((candidate for candidate in candidates if not candidate["reject_reasons"]), None)
     if selected is None:
         add_candidate(
@@ -3123,7 +3720,11 @@ def _filter_final_asr_chunks_for_hallucinations(
             and duration >= max(2.0, float(getattr(cfg, "asr_repair_sparse_min_sec", 12.0)) * 0.5)
             and density < max(1.0, float(getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)))
         )
-        repeated_outro = prompt_leak and text.count("ご視聴") >= 1 and duration >= 4.0
+        repeated_outro = (
+            prompt_leak
+            and any(marker in text for marker in ASR_HARD_PROMPT_LEAK_MARKERS)
+            and duration >= 4.0
+        )
         if sparse_prompt_leak or repeated_outro:
             dropped.append(
                 {
@@ -3295,6 +3896,7 @@ def _write_asr_diagnostics_artifacts(
         "text_replacements": replacements_summary,
         "filtered_chunk_count": len(filtered_summary),
         "needs_manual_review": sum(1 for segment in manifest.segments if segment.status == "needs_manual_review"),
+        "no_speech_detected": sum(1 for segment in manifest.segments if segment.status in NO_SPEECH_STATUSES),
         "warnings": input_diagnostics.get("warnings", []),
         "qwen_repair_fallback": qwen_fallback_summary,
     }

@@ -33,7 +33,7 @@ def require_confirmed_rights(
     if not confirm_rights:
         raise RightsError(RIGHTS_MESSAGE)
     source_path = str(input_path) if input_path else None
-    source_sha256 = sha256_file(input_path) if input_path and input_path.exists() else None
+    source_sha256 = sha256_file(input_path) if input_path and input_path.is_file() else None
     confirmed_at = utc_now()
     entry = {
         "confirmed_at": confirmed_at.isoformat(),
@@ -67,7 +67,7 @@ def record_rights_reliance(
     if not existing.confirmed:
         raise RightsError(RIGHTS_MESSAGE)
     source_path = str(input_path) if input_path else existing.source_path
-    source_sha256 = sha256_file(input_path) if input_path and input_path.exists() else existing.source_sha256
+    source_sha256 = sha256_file(input_path) if input_path and input_path.is_file() else existing.source_sha256
     entry = {
         "relied_at": utc_now().isoformat(),
         "command": command,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections import Counter
 from pathlib import Path
 
 import httpx
@@ -206,6 +207,211 @@ def test_transcribe_asr_review_mock_selects_domain_candidate(
     ]
 
 
+def test_transcribe_marks_empty_real_asr_as_no_speech(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class EmptyASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return []
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: EmptyASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+
+    assert manifest.segments[0].status == "no_speech_detected"
+    assert manifest.segments[0].analysis["asr_quality_gate"] == {
+        "decision": "no_speech",
+        "reasons": ["no_speech_detected"],
+        "tts_blocked": True,
+    }
+    assert "missing_asr_text" not in manifest.segments[0].errors
+    rows = [
+        json.loads(line)
+        for line in Path(manifest.artifacts["source_segments"]).read_text("utf-8").splitlines()
+    ]
+    assert rows[0]["status"] == "no_speech_detected"
+    summary = json.loads(Path(manifest.artifacts["asr_diagnostics_summary"]).read_text("utf-8"))
+    assert summary["no_speech_detected"] == 1
+    assert summary["needs_manual_review"] == 0
+    assert manifest.stage_state["transcribe"]["no_speech_detected"] == 1
+
+
+def test_transcribe_records_asr_quality_gate_for_suspicious_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_review_enabled=False,
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class SuspiciousASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text="チンジンの先頭を撫でます",
+                    language="ja",
+                    confidence=0.98,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: SuspiciousASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+
+    assert manifest.segments[0].status == "needs_manual_review"
+    gate = manifest.segments[0].analysis["asr_quality_gate"]
+    assert gate["decision"] == "block_tts"
+    assert gate["tts_blocked"] is True
+    assert gate["reasons"] == ["asr_suspicious_pattern:チンジン"]
+
+
+def test_transcribe_rerun_clears_resolved_asr_quality_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_review_enabled=False,
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class SequenceASRBackend:
+        name = "faster_whisper"
+        calls = 0
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            self.calls += 1
+            text = "チンジンの先頭を撫でます" if self.calls == 1 else "ジンジンの先端を撫でます"
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text=text,
+                    language="ja",
+                    confidence=0.98,
+                )
+            ]
+
+    backend = SequenceASRBackend()
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: backend)
+
+    first = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+    assert first.segments[0].status == "needs_manual_review"
+    assert any(error.startswith("asr_suspicious_pattern:") for error in first.segments[0].errors)
+
+    second = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+
+    assert second.segments[0].status == "transcribed"
+    assert second.segments[0].analysis["asr_quality_gate"] == {
+        "decision": "pass",
+        "reasons": [],
+        "tts_blocked": False,
+    }
+    assert not any(error.startswith("asr_suspicious_pattern:") for error in second.segments[0].errors)
+    rows = [
+        json.loads(line)
+        for line in Path(second.artifacts["source_segments"]).read_text("utf-8").splitlines()
+    ]
+    assert rows[0]["status"] == "transcribed"
+
+
+def test_transcribe_blocks_observed_garbled_domain_phrase_before_tts(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_review_enabled=False,
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class GarbledASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=1.0,
+                    text="意識が揺らぐ マンクロイプ 暗",
+                    language="ja",
+                    confidence=0.96,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: GarbledASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+
+    assert manifest.segments[0].status == "needs_manual_review"
+    gate = manifest.segments[0].analysis["asr_quality_gate"]
+    assert gate["decision"] == "block_tts"
+    assert gate["tts_blocked"] is True
+    assert gate["reasons"] == ["asr_suspicious_pattern:マンクロイプ"]
+
+
 def test_transcribe_asr_audio_review_passes_clip_to_client(
     monkeypatch: pytest.MonkeyPatch,
     tiny_wav_path: Path,
@@ -349,6 +555,56 @@ def test_asr_prompt_leak_filter_rejects_video_outro_text() -> None:
     assert leaked is True
 
 
+def test_asr_prompt_leak_filter_allows_dialogue_thanks_followed_by_story_text() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    text = "ありがとうございましたよしお前たち明日は今日よりもっと可愛くていやらしい女の子うん"
+
+    assert pipeline_steps._asr_candidate_looks_prompt_leaked(text, cfg) is False
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text=text,
+            language="ja",
+            backend="faster_whisper",
+            start=4554.03,
+            end=4565.755,
+        ),
+        cfg,
+    ) == []
+
+
+def test_asr_hallucination_filter_keeps_dialogue_thanks_but_drops_video_outro() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    chunks = [
+        ASRChunk(
+            start=0.0,
+            end=8.0,
+            text="ありがとうございましたよしお前たち明日は今日よりもっと可愛くて",
+            language="ja",
+            confidence=0.98,
+        ),
+        ASRChunk(
+            start=8.0,
+            end=14.0,
+            text="ご視聴ありがとうございました チャンネル登録 高評価お願いします",
+            language="ja",
+            confidence=0.98,
+        ),
+        ASRChunk(
+            start=14.0,
+            end=28.0,
+            text="最後までご覧いただきありがとうございます。",
+            language="ja",
+            confidence=0.98,
+        ),
+    ]
+
+    kept, dropped = pipeline_steps._filter_final_asr_chunks_for_hallucinations(chunks, cfg=cfg)
+
+    assert kept == [chunks[0]]
+    assert len(dropped) == 2
+    assert {item["reason"] for item in dropped} == {"repeated_outro_hallucination"}
+
+
 def test_asr_review_replacements_include_observed_adult_asr_artifacts() -> None:
     cfg = ProjectConfig(project_name="test-project")
 
@@ -387,6 +643,176 @@ def test_translation_asr_backcheck_flags_suspicious_korean_smell() -> None:
     assert any("ASR translation backcheck" in error for error in segment.errors)
 
 
+def test_translation_asr_backcheck_allows_legitimate_biyakjeok_translation() -> None:
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="飛躍的な快楽",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=1.0,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="비약적인 쾌락",
+        ko_natural="비약적인 쾌락이에요.",
+        model="mock",
+        batch_id="batch_0001",
+    )
+
+    items = pipeline_steps._apply_translation_asr_backcheck(
+        [segment],
+        ProjectConfig(project_name="test"),
+    )
+
+    assert items == []
+    assert not any("ASR translation backcheck" in error for error in segment.errors)
+
+
+def test_translation_asr_backcheck_allows_legitimate_biyaku_translation() -> None:
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="メス媚薬も効いてきています",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=1.0,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="암컷 미약도 듣고 있습니다",
+        ko_natural="암컷 미약도 듣고 있어요.",
+        model="mock",
+        batch_id="batch_0001",
+    )
+
+    items = pipeline_steps._apply_translation_asr_backcheck(
+        [segment],
+        ProjectConfig(project_name="test"),
+    )
+
+    assert items == []
+
+
+def test_translation_acceptance_warns_on_japanese_word_internal_segment_split() -> None:
+    left = sample_segment("seg_0001", start=0.0, end=1.0)
+    left.status = "needs_manual_review"
+    left.errors.append("Korean translation rejected before TTS: source_split_inside_japanese_word")
+    left.source_script = SourceScript(
+        text="この世は恥",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=1.0,
+    )
+    left.translation_ko = KoreanTranslation(
+        ko_literal="이 세상은 부끄",
+        ko_natural="이 세상은 온통 부끄",
+        model="mock",
+        batch_id="batch_0001",
+    )
+    right = sample_segment("seg_0002", start=1.0, end=2.0)
+    right.status = "needs_manual_review"
+    right.errors.append("Korean translation rejected before TTS: source_split_inside_japanese_word")
+    right.source_script = SourceScript(
+        text="ずかしいことでいっぱい",
+        language="ja",
+        backend="faster_whisper",
+        start=1.0,
+        end=2.0,
+    )
+    right.translation_ko = KoreanTranslation(
+        ko_literal="러운 일로 가득",
+        ko_natural="러운 일들로 가득해요.",
+        model="mock",
+        batch_id="batch_0001",
+    )
+    rows = [
+        {
+            "batch_id": "batch_0001",
+            "segment_id": left.id,
+            "status": "translated",
+            "translation_ko": left.translation_ko.model_dump(mode="json"),
+        },
+        {
+            "batch_id": "batch_0001",
+            "segment_id": right.id,
+            "status": "translated",
+            "translation_ko": right.translation_ko.model_dump(mode="json"),
+        },
+    ]
+    quality_counters: Counter[str] = Counter()
+
+    pipeline_steps._finalize_translation_acceptance(
+        rows,
+        [left, right],
+        [],
+        quality_counters,
+    )
+
+    assert [row["status"] for row in rows] == ["translated", "translated"]
+    assert quality_counters["source_split_inside_japanese_word"] == 2
+    assert rows[0]["quality_issues"] == []
+    assert rows[1]["quality_issues"] == []
+    assert rows[0]["quality_warnings"] == ["source_split_inside_japanese_word"]
+    assert rows[1]["quality_warnings"] == ["source_split_inside_japanese_word"]
+    assert left.status == "raw"
+    assert right.status == "raw"
+    assert left.errors == []
+    assert right.errors == []
+
+
+def test_source_split_inside_japanese_word_ignores_common_sentence_boundaries() -> None:
+    assert pipeline_steps._source_split_inside_japanese_word(
+        "もちろん逆もしかり あなたはとても優しい人",
+        "だからこそ 誰かがそばにいてあげないと",
+    ) is False
+    assert pipeline_steps._source_split_inside_japanese_word(
+        "その変態的状況にさらに興奮していた",
+        "気持ちいい",
+    ) is False
+    assert pipeline_steps._source_split_inside_japanese_word(
+        "この世は恥",
+        "ずかしいことでいっぱいよ",
+    ) is True
+
+
+def test_translation_acceptance_rejects_natural_pass_that_omits_source_repetition() -> None:
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text=(
+            "一生懸命締め付けますので私の穴を使って気持ちよくなってください"
+            "一生懸命締め付けますので私の穴を使って気持ちよくなってください"
+        ),
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=1.0,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal=(
+            "열심히 조여드릴 테니까 제 구멍을 써서 기분 좋아져 주세요. "
+            "열심히 조여드릴 테니까 제 구멍을 써서 기분 좋아져 주세요."
+        ),
+        ko_natural="열심히 조여드릴 테니까 제 구멍을 써서 기분 좋아져 주세요.",
+        model="mock",
+        batch_id="batch_0001",
+    )
+    rows = [
+        {
+            "batch_id": "batch_0001",
+            "segment_id": segment.id,
+            "status": "translated",
+            "translation_ko": segment.translation_ko.model_dump(mode="json"),
+        }
+    ]
+    quality_counters: Counter[str] = Counter()
+
+    pipeline_steps._finalize_translation_acceptance(rows, [segment], [], quality_counters)
+
+    assert rows[0]["status"] == "needs_manual_review"
+    assert rows[0]["quality_issues"] == ["natural_repetition_omission"]
+    assert quality_counters["natural_repetition_omission"] == 1
+
+
 def test_asr_resegment_splits_dense_long_chunks(tmp_project_dir: Path) -> None:
     segments = pipeline_steps._segments_from_asr_chunks(
         [
@@ -414,6 +840,42 @@ def test_asr_resegment_splits_dense_long_chunks(tmp_project_dir: Path) -> None:
     assert " ".join(segment.source_script.text for segment in segments if segment.source_script) == (
         "催眠じゃないなんて思う人 もいるかもしれませんが"
     )
+
+
+def test_asr_resegment_prefers_japanese_text_boundaries_for_long_chunks(
+    tmp_project_dir: Path,
+) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(
+                start=0.0,
+                end=29.18,
+                text=(
+                    "君は女の子なんだもの 男性なら平気なことでも"
+                    "可愛い女の子の君にとってはこの世は恥ずかしいことでいっぱいよ"
+                    "さあ 全てを受け入れて生まれ変わった自分を楽しみましょう"
+                ),
+                language="ja",
+                confidence=0.9,
+            ),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=40.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        max_segment_sec=20.0,
+        sparse_chunk_max_sec=30.0,
+        sparse_chunk_min_chars_per_sec=0.5,
+    )
+
+    texts = [segment.source_script.text for segment in segments if segment.source_script]
+
+    assert len(texts) == 2
+    assert all(text != "ずかしいことでいっぱいよさあ 全てを受け入れて生まれ変わった自分を楽しみましょう" for text in texts)
+    assert all(not text.endswith("恥") for text in texts)
+    assert "恥ずかしいことでいっぱい" in " ".join(texts)
 
 
 def test_asr_repair_flags_low_confidence_and_sparse_chunks() -> None:
@@ -995,6 +1457,187 @@ def test_asr_text_replacements_include_observed_midcheck_mishears() -> None:
     assert chunks[17].text == "耳奥まで触手が入ってくる"
     assert chunks[18].text == "耳奥まで触手が入ってくる"
     assert chunks[19].text == "この音声は18禁催眠音声です"
+
+
+def test_asr_text_replacements_include_observed_real_run_mishears() -> None:
+    replacements = ProjectConfig().asr_text_replacements
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="メスイキ悪夢決めたい メスイキアカメが止まらない",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="これが私の助走 助走しながら 助走して また助走をしたくなったら",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=12.0,
+                text="フェラチをして 気筒を舐め回すと 死を吹く",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=12.0,
+                end=16.0,
+                text="左の口岸が入ってきた スペンス入線 スペンス乳腺",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=16.0,
+                end=20.0,
+                text="処生できるよ 絶頂までのパウントダウン",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=20.0,
+                end=24.0,
+                text="幸せが足寄せて 成長を超える もう来る 成長が来る トロゲル",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=24.0,
+                end=28.0,
+                text="二なりの皆さん メス火薬で おっぱいも子宮も薄きっぱなし 陳腐を待っている",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=28.0,
+                end=32.0,
+                text="生きかけてる 息っぱなしや 息まくり",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=32.0,
+                end=36.0,
+                text="女体火薬で 全部くっぷくさせて 一年来る オナホシキューが負け息してる",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=36.0,
+                end=40.0,
+                text="こんなに窒内に出されたら 先ぽ ゴリゴリするの くりすこすこして 狩りの横の溝 私のフェラガを見て 愛部する",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        replacements,
+    )
+
+    assert summary["chunks_changed"] == 10
+    assert chunks[0].text == "メスイキアクメ決めたい メスイキアクメが止まらない"
+    assert chunks[1].text == "これが私の女装 女装しながら 女装して また女装をしたくなったら"
+    assert chunks[2].text == "フェラチオをして 亀頭を舐め回すと 潮を吹く"
+    assert chunks[3].text == "左の睾丸が入ってきた スキーン腺 スキーン腺"
+    assert chunks[4].text == "射精できるよ 絶頂までのカウントダウン"
+    assert chunks[5].text == "幸せが押し寄せて 絶頂を超える もう来る 絶頂が来る とろける"
+    assert chunks[6].text == "ふたなりの皆さん メス媚薬で おっぱいも子宮も疼きっぱなし チンポを待っている"
+    assert chunks[7].text == "イキかけてる イキっぱなしや イキまくり"
+    assert chunks[8].text == "女体化薬で 全部屈服させて 一気に来る オナホ子宮が負けイキしてる"
+    assert chunks[9].text == "こんなに膣内に出されたら 先っぽ ゴリゴリするの クリをすこすこして カリの横の溝 私のフェラ顔を見て 愛撫する"
+
+
+def test_asr_review_patterns_do_not_flag_repaired_fellatio_term() -> None:
+    cfg = ProjectConfig()
+
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="フェラチオをして 亀頭を舐め回すと",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=3.0,
+        ),
+        cfg,
+    ) == []
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="フェラチをして 気筒を舐め回すと",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=3.0,
+        ),
+        cfg,
+    ) == ["asr_suspicious_pattern:気筒,フェラチを"]
+
+
+def test_asr_review_flags_observed_unresolved_monha_fragment() -> None:
+    cfg = ProjectConfig()
+
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="モンハの著しい乱れを 同時絶頂が近いものと推測されます",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=12.0,
+        ),
+        cfg,
+    ) == ["asr_suspicious_pattern:モンハの著しい"]
+
+
+def test_asr_review_flags_observed_terminal_clitoris_fragment() -> None:
+    cfg = ProjectConfig()
+
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="幸せを感じることだけができる世界 クリト",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=9.4,
+        ),
+        cfg,
+    ) == ["asr_suspicious_pattern:クリト$"]
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="幸せを感じることだけができる世界 クリトリス",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=9.4,
+        ),
+        cfg,
+    ) == []
+
+
+def test_asr_review_patterns_do_not_flag_train_strap_as_fishing() -> None:
+    cfg = ProjectConfig()
+
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="釣り革につかまると 背後に人の気配を感じた",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=3.0,
+        ),
+        cfg,
+    ) == []
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="あっという間に釣りが来ちゃう",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=3.0,
+        ),
+        cfg,
+    ) == ["asr_suspicious_pattern:釣りが来"]
 
 
 def test_asr_text_replacements_handle_cascaded_yaml_order() -> None:
@@ -1742,6 +2385,363 @@ def test_numeric_counting_postprocess_normalizes_counting_runs() -> None:
     assert segments[4].translation_ko is not None
     assert segments[4].translation_ko.ko_natural == "팔십"
     assert "numeric_counting_postprocess" in segments[0].translation_ko.notes
+
+
+def test_korean_ordinal_postprocess_repairs_second_ordinal_mistranslation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="それはまるで第二の皮膚のように全身に貼り付いています",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="그것은 마치 제이의 피부처럼 온몸에 붙어 있습니다.",
+        ko_natural="마치 제이의 피부처럼 온몸에 붙어 있어요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+    diagnostics: list[dict[str, object]] = []
+    quality_counters: Counter[str] = Counter()
+
+    rewritten = pipeline_steps._apply_korean_ordinal_postprocess(
+        [segment],
+        diagnostics,
+        quality_counters,
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "마치 두 번째 피부처럼 온몸에 붙어 있어요."
+    assert "korean_ordinal_postprocess" in segment.translation_ko.notes
+    assert quality_counters["ordinal_mistranslation_repaired"] == 1
+    assert diagnostics[0]["repair_reasons"] == ["ordinal_mistranslation"]
+
+
+def test_korean_asr_homophone_postprocess_repairs_akume_mistranslation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="メスイキ悪夢が止まらない",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="암컷 절정 악몽이 멈추지 않습니다.",
+        ko_natural="암컷 절정 악몽이 멈추지 않아요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+    diagnostics: list[dict[str, object]] = []
+    quality_counters: Counter[str] = Counter()
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        diagnostics,
+        quality_counters,
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "암컷 절정이 멈추지 않아요."
+    assert "korean_asr_homophone_postprocess" in segment.translation_ko.notes
+    assert quality_counters["asr_homophone_repaired"] == 1
+    assert diagnostics[0]["repair_reasons"] == ["asr_homophone_akume"]
+
+
+def test_korean_asr_homophone_postprocess_repairs_akume_ochi_mistranslation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="完全敗北 悪夢落ちへの道を歩み始める 快感が込み上げ 行く",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="완전 패배, 악몽으로 떨어지는 길을 걷기 시작합니다.",
+        ko_natural="완전 패배... 악몽으로 떨어지는 길을 걷기 시작해요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        [],
+        Counter(),
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "완전 패배... 절정에 빠지는 길을 걷기 시작해요."
+
+
+def test_korean_asr_homophone_postprocess_repairs_akeme_ochi_mistranslation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="完全敗北 明け目落ちへの道を歩み始める 快感が込み上げ イク",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="완전 패배, 눈이 뒤집히는 타락의 길로 들어섭니다.",
+        ko_natural="완전 패배... 눈이 뒤집히는 타락의 길로 들어서고 있어요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        [],
+        Counter(),
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "완전 패배... 절정에 빠지는 길로 들어서고 있어요."
+
+
+def test_korean_asr_homophone_postprocess_repairs_remaining_akume_after_prior_note() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="メスイキ悪夢決めたい 快感が止まらない",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="메스이키 악몽을 결정하고 싶어.",
+        ko_natural="암컷으로서 가는 악몽을 꾸고 싶어.",
+        notes=["korean_asr_homophone_postprocess"],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        [],
+        Counter(),
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert "악몽" not in segment.translation_ko.ko_natural
+    assert segment.translation_ko.notes.count("korean_asr_homophone_postprocess") == 1
+
+
+def test_korean_asr_homophone_postprocess_repairs_akame_asr_variant() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="メスイキアカメが止まらない",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="암컷 절정의 악몽이 멈추지 않습니다.",
+        ko_natural="암컷 절정의 악몽이 멈추지 않아요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        [],
+        Counter(),
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "암컷 절정이 멈추지 않아요."
+
+
+def test_korean_asr_homophone_postprocess_repairs_josou_mistranslation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="これが私の助走",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="이것이 저의 도움닫기입니다.",
+        ko_natural="이게 저의 도움닫기예요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+    diagnostics: list[dict[str, object]] = []
+    quality_counters: Counter[str] = Counter()
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        diagnostics,
+        quality_counters,
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "이게 저의 여장이에요."
+    assert "korean_asr_homophone_postprocess" in segment.translation_ko.notes
+    assert quality_counters["asr_homophone_repaired"] == 1
+    assert diagnostics[0]["repair_reasons"] == ["asr_homophone_josou"]
+
+
+def test_korean_asr_homophone_postprocess_repairs_josou_verb_mistranslation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="また助走をしたくなったら聞きに来てね",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="다시 달려들고 싶어지면 들으러 오세요.",
+        ko_natural="다시 달려들고 싶어지면 들으러 오세요.",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+
+    rewritten = pipeline_steps._apply_korean_asr_homophone_postprocess(
+        [segment],
+        [],
+        Counter(),
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "다시 여장하고 싶어지면 들으러 오세요."
+
+
+def test_korean_onomatopoeia_postprocess_repairs_guriguri_transliteration() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="グリ 腰をもじもじ動かして 気持ちいいのね いいよ",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="그리 그리, 허리를 꼼지락꼼지락 움직여서 기분 좋은 거구나, 좋아",
+        ko_natural="그리 그리, 허리를 꼼지락거리는 게 기분 좋은가 보네, 좋아...",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+    diagnostics: list[dict[str, object]] = []
+    quality_counters: Counter[str] = Counter()
+
+    rewritten = pipeline_steps._apply_korean_onomatopoeia_postprocess(
+        [segment],
+        diagnostics,
+        quality_counters,
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "문질문질, 허리를 꼼지락거리는 게 기분 좋은가 보네, 좋아..."
+    assert "korean_onomatopoeia_postprocess" in segment.translation_ko.notes
+    assert quality_counters["onomatopoeia_transliteration_repaired"] == 1
+    assert diagnostics[0]["repair_reasons"] == ["onomatopoeia_guriguri"]
+
+
+def test_korean_onomatopoeia_postprocess_repairs_compact_guriguri_transliteration() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="やわらかくねじるように グリグリしてあげる",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="부드럽게 비틀듯이 그리그리 해줄게",
+        ko_natural="부드럽게 비틀듯이, 그리그리 해줄게",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+
+    rewritten = pipeline_steps._apply_korean_onomatopoeia_postprocess(
+        [segment],
+        [],
+        Counter(),
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_literal == "부드럽게 비틀듯이 문질문질 해줄게"
+    assert segment.translation_ko.ko_natural == "부드럽게 비틀듯이, 문질문질 해줄게"
+
+
+def test_korean_fluency_postprocess_repairs_observed_broken_ending_translation() -> None:
+    segment = sample_segment("seg_0001")
+    segment.source_script = SourceScript(
+        text="終わっていく日々に絶望を感じて",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=segment.start,
+        end=segment.end,
+    )
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="끝져가는 나날들에 절망을 느끼며",
+        ko_natural="끝져가는 나날들에 절망을 느끼며",
+        notes=[],
+        confidence=0.9,
+        model="fake",
+        batch_id="batch_0001",
+    )
+    diagnostics: list[dict[str, object]] = []
+    quality_counters: Counter[str] = Counter()
+
+    rewritten = pipeline_steps._apply_korean_fluency_postprocess(
+        [segment],
+        diagnostics,
+        quality_counters,
+    )
+
+    assert rewritten == 1
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "끝나가는 나날들에 절망을 느끼며"
+    assert "korean_fluency_postprocess" in segment.translation_ko.notes
+    assert quality_counters["fluency_repaired"] == 1
+    assert diagnostics[0]["repair_reasons"] == ["broken_korean_ending"]
 
 
 def test_numeric_counting_postprocess_handles_interleaved_countdown() -> None:

@@ -33,13 +33,28 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     quality_counters: Counter[str] = Counter()
     translated = 0
     needs_manual_review = 0
+    no_speech_detected = 0
     colloquialized = 0
     digit_pronunciation_postprocessed = 0
+    ordinal_postprocessed = 0
+    asr_homophone_postprocessed = 0
     numeric_counting_postprocessed = 0
     asr_backcheck_count = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
     for segment in manifest.segments:
+        if segment.status in NO_SPEECH_STATUSES:
+            no_speech_detected += 1
+            rows.append(
+                {
+                    "segment_id": segment.id,
+                    "status": "no_speech_detected",
+                    "reason": f"segment status is {segment.status}",
+                    "source_text": "",
+                    "translation_ko": None,
+                }
+            )
+            continue
         translation = segment.translation_ko
         failed_status = segment.status in SKIP_STATUSES
         retry_this_failed = retry_failed and failed_status
@@ -231,6 +246,8 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 "needs_manual_review": needs_manual_review,
                 "colloquialized": colloquialized,
                 "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
+                "ordinal_postprocessed": ordinal_postprocessed,
+                "asr_homophone_postprocessed": asr_homophone_postprocessed,
                 "numeric_counting_postprocessed": numeric_counting_postprocessed,
                 "asr_backcheck_count": asr_backcheck_count,
                 "concurrency": translation_worker_count,
@@ -486,6 +503,26 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         repaired_translation_bundles,
         quality_counters,
     )
+    ordinal_postprocessed = _apply_korean_ordinal_postprocess(
+        manifest.segments,
+        repaired_translation_bundles,
+        quality_counters,
+    )
+    asr_homophone_postprocessed = _apply_korean_asr_homophone_postprocess(
+        manifest.segments,
+        repaired_translation_bundles,
+        quality_counters,
+    )
+    _apply_korean_onomatopoeia_postprocess(
+        manifest.segments,
+        repaired_translation_bundles,
+        quality_counters,
+    )
+    _apply_korean_fluency_postprocess(
+        manifest.segments,
+        repaired_translation_bundles,
+        quality_counters,
+    )
     colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
     numeric_counting_postprocessed = _apply_korean_numeric_counting_postprocess(manifest.segments)
     asr_backcheck_items = _apply_translation_asr_backcheck(manifest.segments, cfg)
@@ -500,6 +537,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     )
     translated = sum(1 for row in rows if row.get("status") == "translated")
     needs_manual_review = sum(1 for row in rows if row.get("status") == "needs_manual_review")
+    no_speech_detected = sum(1 for row in rows if row.get("status") == "no_speech_detected")
     _write_jsonl_atomic(jsonl_path, rows)
     asr_backcheck_summary_path = project_dir / "work" / "translate_ko" / "asr_backcheck_summary.json"
     write_json_atomic(
@@ -517,8 +555,11 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         "segments": total,
         "translated": translated,
         "needs_manual_review": needs_manual_review,
+        "no_speech_detected": no_speech_detected,
         "colloquialized": colloquialized,
         "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
+        "ordinal_postprocessed": ordinal_postprocessed,
+        "asr_homophone_postprocessed": asr_homophone_postprocessed,
         "numeric_counting_postprocessed": numeric_counting_postprocessed,
         "asr_backcheck_count": asr_backcheck_count,
         "concurrency": translation_worker_count,
@@ -574,8 +615,11 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         model=model_name,
         translated=translated,
         needs_manual_review=needs_manual_review,
+        no_speech_detected=no_speech_detected,
         colloquialized=colloquialized,
         digit_pronunciation_postprocessed=digit_pronunciation_postprocessed,
+        ordinal_postprocessed=ordinal_postprocessed,
+        asr_homophone_postprocessed=asr_homophone_postprocessed,
         numeric_counting_postprocessed=numeric_counting_postprocessed,
         asr_backcheck_count=asr_backcheck_count,
         quality_counters=dict(sorted(quality_counters.items())),

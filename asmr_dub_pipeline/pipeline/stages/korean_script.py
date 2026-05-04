@@ -21,9 +21,17 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
 
     scripted = 0
     needs_manual_review = 0
+    no_speech_detected = 0
     started_at = monotonic()
     last_logged_at = started_at
     for index, segment in enumerate(manifest.segments, start=1):
+        if segment.status in NO_SPEECH_STATUSES:
+            no_speech_detected += 1
+            segment.script = None
+            last_logged_at = _log_segment_progress(
+                "korean-script", index, total, segment, manifest, started_at, last_logged_at
+            )
+            continue
         if segment.status in SKIP_STATUSES:
             needs_manual_review += 1
             segment.script = None
@@ -95,6 +103,7 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
         "completed",
         scripted=scripted,
         needs_manual_review=needs_manual_review,
+        no_speech_detected=no_speech_detected,
     )
     save_manifest(project_dir, manifest)
     _log_stage_complete("korean-script", manifest, "tts_language=ko")

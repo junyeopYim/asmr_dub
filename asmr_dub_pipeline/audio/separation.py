@@ -99,9 +99,46 @@ def _write_normalized_stems_streaming(
     sample_rate: int,
     mono_sample_rate: int,
 ) -> None:
-    _convert_audio_streaming(vocals_source, vocals_path, sample_rate=sample_rate, channels=2)
-    _convert_audio_streaming(background_source, background_path, sample_rate=sample_rate, channels=2)
-    _convert_audio_streaming(vocals_source, vocals_mono_path, sample_rate=mono_sample_rate, channels=1)
+    vocals_path.parent.mkdir(parents=True, exist_ok=True)
+    background_path.parent.mkdir(parents=True, exist_ok=True)
+    vocals_mono_path.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        [
+            "-y",
+            "-i",
+            str(vocals_source),
+            "-i",
+            str(background_source),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-ac",
+            "2",
+            "-ar",
+            str(sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            str(vocals_path),
+            "-map",
+            "1:a:0",
+            "-ac",
+            "2",
+            "-ar",
+            str(sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            str(background_path),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            str(mono_sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            str(vocals_mono_path),
+        ]
+    )
 
 
 def _write_normalized_stems_in_memory(

@@ -146,7 +146,9 @@ def test_few_shot_training_python_skips_project_venv_missing_deps(
         if python == str(base_python):
             return []
         if python in {"python", str(venv_python)}:
-            return ["transformers", "librosa"]
+            if "ffmpeg" in modules:
+                return ["ffmpeg"]
+            return []
         return None
 
     monkeypatch.setattr(few_shot, "_python_missing_imports", fake_missing_imports)
@@ -170,6 +172,51 @@ def test_few_shot_training_python_env_override(
     selected = few_shot._select_training_python(cfg, install, None, require_modules=True)
 
     assert selected == str(override)
+
+
+def test_few_shot_training_python_checks_text_and_semantic_deps(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _fake_gsv_install(tmp_project_dir / "gsv")
+    cfg = ProjectConfig(project_name="test", gsv_server_command=["python", str(api)])
+    install = discover_install(cfg)
+    base_python = tmp_project_dir / "conda" / "bin" / "python"
+    venv_python = tmp_project_dir / ".venv" / "bin" / "python"
+    monkeypatch.setenv("PATH", str(venv_python.parent))
+    monkeypatch.setattr(few_shot.sys, "executable", str(venv_python))
+    monkeypatch.setattr(few_shot.sys, "base_prefix", str(base_python.parent.parent))
+
+    def fake_missing_imports(python: str, modules) -> list[str] | None:
+        if python == str(base_python):
+            return []
+        if python in {"python", str(venv_python)}:
+            return [
+                module
+                for module in ("pyopenjtalk", "x_transformers")
+                if module in modules
+            ]
+        return None
+
+    monkeypatch.setattr(few_shot, "_python_missing_imports", fake_missing_imports)
+
+    selected = few_shot._select_training_python(cfg, install, None, require_modules=True)
+
+    assert selected == str(base_python)
+
+
+def test_python_missing_imports_rejects_wrong_ffmpeg_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_site = tmp_path / "fake_site"
+    fake_site.mkdir()
+    (fake_site / "ffmpeg.py").write_text("# wrong ffmpeg package without ffmpeg-python API\n", "utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(fake_site))
+
+    missing = few_shot._python_missing_imports(sys.executable, ["ffmpeg"])
+
+    assert missing == ["ffmpeg"]
 
 
 def test_few_shot_dataset_selects_source_segments(tmp_project_dir: Path) -> None:

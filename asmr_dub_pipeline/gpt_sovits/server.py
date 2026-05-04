@@ -26,7 +26,29 @@ from .client import GPTSoVITSError
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SHIM_DIR = Path(__file__).resolve().parent / "shims"
-GSV_SERVER_REQUIRED_MODULES = ("transformers", "torch", "librosa", "fastapi", "uvicorn")
+GSV_SERVER_REQUIRED_MODULES = (
+    "transformers",
+    "torch",
+    "torchaudio",
+    "librosa",
+    "fastapi",
+    "uvicorn",
+    "ffmpeg",
+    "peft",
+    "jieba",
+    "jieba_fast",
+    "fast_langdetect",
+    "split_lang",
+    "cn2an",
+    "pypinyin",
+    "pyopenjtalk",
+    "g2p_en",
+    "g2pk2",
+    "ko_pron",
+    "opencc",
+    "wordsegment",
+    "x_transformers",
+)
 
 
 def _host_port(base_url: str) -> tuple[str, int]:

@@ -53,7 +53,11 @@ GSV_TRAINING_REQUIRED_MODULES = (
     "peft",
     "torchaudio",
     "tqdm",
+    "ffmpeg",
+    "pyopenjtalk",
+    "x_transformers",
 )
+GSV_TRAINING_REQUIRED_MODULE_ATTRS = {"ffmpeg": "input"}
 
 
 @dataclass(frozen=True)
@@ -218,13 +222,30 @@ def _candidate_training_pythons(
 
 
 def _python_missing_imports(python: str, modules: Sequence[str]) -> list[str] | None:
-    code = (
-        "import importlib.util, sys; "
-        f"mods={list(modules)!r}; "
-        "missing=[m for m in mods if importlib.util.find_spec(m) is None]; "
-        "print('\\n'.join(missing)); "
-        "raise SystemExit(1 if missing else 0)"
-    )
+    code = f"""
+import importlib
+import importlib.util
+
+mods = {list(modules)!r}
+required_attrs = {GSV_TRAINING_REQUIRED_MODULE_ATTRS!r}
+missing = []
+for mod in mods:
+    if importlib.util.find_spec(mod) is None:
+        missing.append(mod)
+        continue
+    attr = required_attrs.get(mod)
+    if attr is None:
+        continue
+    try:
+        loaded = importlib.import_module(mod)
+    except Exception:
+        missing.append(mod)
+        continue
+    if not hasattr(loaded, attr):
+        missing.append(mod)
+print("\\n".join(missing))
+raise SystemExit(1 if missing else 0)
+"""
     try:
         result = subprocess.run(
             [python, "-s", "-c", code],

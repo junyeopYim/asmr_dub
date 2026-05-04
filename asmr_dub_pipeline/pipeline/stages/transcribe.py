@@ -7,6 +7,19 @@ from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.pipeline.stages.source_separation import run_source_separation_stage
 
 
+ASR_QUALITY_ERROR_PREFIXES = ("asr_suspicious_pattern:", "asr_repair_rejected")
+ASR_QUALITY_ERROR_VALUES = {"no_speech_detected"}
+
+
+def _clear_asr_quality_gate_errors(segment: Segment) -> None:
+    segment.errors = [
+        error
+        for error in segment.errors
+        if error not in ASR_QUALITY_ERROR_VALUES
+        and not any(error.startswith(prefix) for prefix in ASR_QUALITY_ERROR_PREFIXES)
+    ]
+
+
 def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, confirm_rights: bool = False, asr_review: bool | None = None, asr_preset: str | None = None, asr_vad_off: bool | None = None, asr_diagnostics: bool | None = None, asr_device: str | None = None, asr_compute_type: str | None = None, asr_batched_inference: bool | None = None, asr_batch_size: int | None = None) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
@@ -66,7 +79,14 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         backend_kind=backend_kind,
         cfg=cfg,
     )
-    seeded_for_transcribe = _seed_segments_for_transcribe(project_dir, manifest, audio_path, mix_audio_path)
+    write_seed_audio_clips = backend_kind == "mock" or not cfg.asr_resegment_from_chunks
+    seeded_for_transcribe = _seed_segments_for_transcribe(
+        project_dir,
+        manifest,
+        audio_path,
+        mix_audio_path,
+        write_audio_clips=write_seed_audio_clips,
+    )
     total = len(manifest.segments)
     backend = create_asr_backend(backend_kind, _asr_backend_config(cfg))
     audio_duration = duration_sec(audio_path)
@@ -183,10 +203,18 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
     last_logged_at = started_at
     with_text = 0
     manual_review_count = 0
+    no_speech_count = 0
+    whole_input_no_speech = backend_kind != "mock" and not final_chunks
     for index, segment in enumerate(manifest.segments, start=1):
         source_script = mapped.get(segment.id)
         segment.source_script = source_script
-        review_reasons = _source_script_asr_review_reasons(source_script, cfg)
+        source_has_text = bool(source_script and source_script.text.strip())
+        no_speech_segment = whole_input_no_speech and not source_has_text
+        review_reasons = (
+            ["no_speech_detected"]
+            if no_speech_segment
+            else _source_script_asr_review_reasons(source_script, cfg)
+        )
         repair_review_reasons = _source_script_rejected_repair_reasons(
             source_script,
             repair_summary,
@@ -194,15 +222,34 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         review_reasons.extend(
             reason for reason in repair_review_reasons if reason not in review_reasons
         )
-        if review_reasons:
+        _clear_asr_quality_gate_errors(segment)
+        if no_speech_segment:
+            segment.status = "no_speech_detected"
+            no_speech_count += 1
+        elif review_reasons:
             segment.status = "needs_manual_review"
             manual_review_count += 1
             for reason in review_reasons:
                 if reason not in segment.errors:
                     segment.errors.append(reason)
-        if source_script and source_script.text:
+        elif source_has_text:
+            segment.status = "transcribed"
+        segment.analysis["asr_quality_gate"] = {
+            "decision": (
+                "no_speech"
+                if no_speech_segment
+                else "block_tts"
+                if review_reasons
+                else "pass"
+            ),
+            "reasons": review_reasons,
+            "tts_blocked": bool(review_reasons),
+        }
+        if source_has_text:
             with_text += 1
             status = "needs_manual_review" if review_reasons else "transcribed"
+        elif no_speech_segment:
+            status = "no_speech_detected"
         else:
             status = "needs_manual_review"
         rows.append(
@@ -266,7 +313,8 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         seeded_for_transcribe=seeded_for_transcribe,
         resegmented_from_chunks=resegmented_from_chunks,
         transcribed=with_text,
-        needs_manual_review=max(total - with_text, manual_review_count),
+        no_speech_detected=no_speech_count,
+        needs_manual_review=max(total - with_text - no_speech_count, manual_review_count),
     )
     save_manifest(project_dir, manifest)
     _log_stage_complete("transcribe", manifest, f"backend={backend_kind}")

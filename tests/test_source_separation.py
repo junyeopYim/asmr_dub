@@ -96,6 +96,46 @@ def test_real_transcribe_runs_source_separation_and_uses_vocal_mono(
     assert manifest.stage_state["transcribe"]["status"] == "completed"
 
 
+def test_real_transcribe_defers_seed_audio_when_resegmenting(
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "transcribe_defers_seed_audio"
+    create_project_structure(project)
+    save_project_config(
+        ProjectConfig(
+            project_name=project.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=True,
+        ),
+        project / "pipeline.yaml",
+    )
+    extract_step(tiny_wav_path, project, confirm_rights=True)
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, audio_path: Path, segments: list[object]) -> list[ASRChunk]:
+            _ = audio_path, segments
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=0.5,
+                    text="テスト",
+                    language="ja",
+                    confidence=0.9,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert manifest.stage_state["transcribe-seed"]["audio_clips_written"] is False
+    assert manifest.stage_state["transcribe"]["resegmented_from_chunks"] is True
+
+
 def test_real_transcribe_falls_back_to_gemma_when_source_vocals_are_too_quiet(
     tiny_wav_path: Path,
     tmp_path: Path,
@@ -137,6 +177,52 @@ def test_real_transcribe_falls_back_to_gemma_when_source_vocals_are_too_quiet(
     assert input_summary["selected"]["source"] == "gemma_mono_16k"
     assert any("too_quiet" in warning for warning in input_summary["warnings"])
     assert "asr_diagnostics" in manifest.artifacts
+
+
+def test_real_transcribe_falls_back_when_source_vocals_are_quiet_relative_to_gemma(
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "transcribe_relative_quiet_fallback"
+    create_project_structure(project)
+    save_project_config(
+        ProjectConfig(
+            project_name=project.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+        ),
+        project / "pipeline.yaml",
+    )
+    extract_step(tiny_wav_path, project, confirm_rights=True)
+    manifest = load_manifest(project)
+    gemma_path = Path(manifest.artifacts["gemma_mono_16k"])
+    sample_rate = 16_000
+    t = np.linspace(0.0, 1.0, sample_rate, endpoint=False, dtype=np.float32)
+    write_audio(gemma_path, (0.10 * np.sin(2 * np.pi * 220 * t))[:, None], sample_rate)
+    quiet_vocals = project / "work" / "audio" / "source_vocals_mono_16k.wav"
+    write_audio(quiet_vocals, (0.001 * np.sin(2 * np.pi * 220 * t))[:, None], sample_rate)
+    manifest.artifacts["source_vocals_mono_16k"] = str(quiet_vocals)
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(project, manifest)
+    captured: dict[str, Path] = {}
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, audio_path: Path, segments: list[object]) -> list[ASRChunk]:
+            captured["audio_path"] = Path(audio_path)
+            return [ASRChunk(start=0.0, end=1.0, text="テスト", language="ja", confidence=0.9)]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert captured["audio_path"] == Path(manifest.artifacts["gemma_mono_16k"])
+    input_summary = json.loads(Path(manifest.artifacts["asr_input_diagnostics"]).read_text("utf-8"))
+    assert input_summary["selected"]["source"] == "gemma_mono_16k"
+    assert any("relative_too_quiet" in warning for warning in input_summary["warnings"])
 
 
 def test_transcribe_passes_project_asr_config_to_backend(
@@ -243,10 +329,14 @@ def test_demucs_postprocess_uses_ffmpeg_streaming_without_loading_stems(
 
     def fake_run_ffmpeg(args: list[str]) -> None:
         ffmpeg_calls.append(args)
-        output_path = Path(args[-1])
-        channels = int(args[args.index("-ac") + 1])
-        sample_rate = int(args[args.index("-ar") + 1])
-        write_audio(output_path, np.zeros((sample_rate // 20, channels), dtype=np.float32), sample_rate)
+        outputs = {
+            project / "work" / "audio" / "source_vocals_48k.wav": (48_000, 2),
+            project / "work" / "audio" / "background_only_48k.wav": (48_000, 2),
+            project / "work" / "audio" / "source_vocals_mono_16k.wav": (16_000, 1),
+        }
+        for output_path, (sample_rate, channels) in outputs.items():
+            if str(output_path) in args:
+                write_audio(output_path, np.zeros((sample_rate // 20, channels), dtype=np.float32), sample_rate)
 
     def fail_load_audio(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("demucs postprocess should stream via ffmpeg")
@@ -262,8 +352,22 @@ def test_demucs_postprocess_uses_ffmpeg_streaming_without_loading_stems(
     assert result.vocals_path.exists()
     assert result.vocals_mono_path.exists()
     assert result.background_path.exists()
-    assert [call[call.index("-ac") + 1] for call in ffmpeg_calls] == ["2", "2", "1"]
-    assert [call[call.index("-ar") + 1] for call in ffmpeg_calls] == ["48000", "48000", "16000"]
+    assert len(ffmpeg_calls) == 1
+    assert [value for index, value in enumerate(ffmpeg_calls[0]) if index > 0 and ffmpeg_calls[0][index - 1] == "-map"] == [
+        "0:a:0",
+        "1:a:0",
+        "0:a:0",
+    ]
+    assert [value for index, value in enumerate(ffmpeg_calls[0]) if index > 0 and ffmpeg_calls[0][index - 1] == "-ac"] == [
+        "2",
+        "2",
+        "1",
+    ]
+    assert [value for index, value in enumerate(ffmpeg_calls[0]) if index > 0 and ffmpeg_calls[0][index - 1] == "-ar"] == [
+        "48000",
+        "48000",
+        "16000",
+    ]
     metadata = json.loads(result.metadata_path.read_text("utf-8"))
     assert metadata["postprocess_method"] == "ffmpeg_streaming"
 

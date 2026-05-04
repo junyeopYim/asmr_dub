@@ -107,6 +107,59 @@ def test_extract_merge_parts_creates_canonical_audio_source(
     assert manifest.rights_audit.history[-1]["input_merge"]["status"] == "merged"
 
 
+def test_extract_folder_input_prefers_clean_asr_parts(
+    tmp_path: Path,
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "RJDIR"
+    mix_1 = write_tiny_wav(folder / "本編" / "01 プロローグ.wav", duration=0.7)
+    mix_2 = write_tiny_wav(folder / "本編" / "02 催眠誘導.wav", duration=0.8)
+    asr_1 = write_tiny_wav(folder / "効果音無し" / "01 プロローグ.wav", duration=0.7)
+    asr_2 = write_tiny_wav(folder / "効果音無し" / "02 催眠誘導.wav", duration=0.8)
+
+    def fake_concat_audio_to_wav(
+        input_paths: list[Path],
+        output_path: Path,
+        *,
+        sample_rate: int = 48_000,
+        channels: int = 2,
+    ) -> Path:
+        clips = []
+        for input_path in input_paths:
+            data, sr = sf.read(input_path, always_2d=True, dtype="float32")
+            if sr != sample_rate:
+                indexes = np.linspace(0, len(data) - 1, max(1, int(len(data) * sample_rate / sr)))
+                data = data[indexes.astype(np.int64)]
+            if channels == 1:
+                data = data.mean(axis=1, keepdims=True)
+            elif data.shape[1] < channels:
+                data = np.repeat(data[:, :1], channels, axis=1)
+            else:
+                data = data[:, :channels]
+            clips.append(data)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(output_path, np.concatenate(clips, axis=0), sample_rate)
+        return output_path
+
+    monkeypatch.setattr(preprocess.ffmpeg, "concat_audio_to_wav", fake_concat_audio_to_wav)
+
+    manifest = extract_step(folder, tmp_project_dir, confirm_rights=True)
+
+    folder_manifest = Path(manifest.artifacts["folder_input_manifest"])
+    metadata = json.loads(folder_manifest.read_text("utf-8"))
+    assert folder_manifest.exists()
+    assert metadata["status"] == "planned"
+    assert metadata["input_kind"] == "folder"
+    assert metadata["asr_source_status"] == "separate_asr_parts"
+    assert [part["path"] for part in metadata["mix_parts"]] == [str(mix_1.resolve()), str(mix_2.resolve())]
+    assert [part["path"] for part in metadata["asr_parts"]] == [str(asr_1.resolve()), str(asr_2.resolve())]
+    assert Path(manifest.artifacts["original_stereo_48k"]).exists()
+    assert Path(manifest.artifacts["gemma_mono_16k"]).exists()
+    assert manifest.source_info is not None
+    assert manifest.source_info.raw["folder_input"]["asr_source_status"] == "separate_asr_parts"
+
+
 def test_numbered_part_merge_planner_refuses_ambiguous_base_file(tmp_path: Path) -> None:
     write_tiny_wav(tmp_path / "RJAMB.wav")
     part_1 = write_tiny_wav(tmp_path / "RJAMB_1.wav")
@@ -150,6 +203,66 @@ def test_full_command_runs_mock_e2e_with_project(cli_runner, tiny_wav_path: Path
     assert manifest.artifacts["export"].endswith("_dub.wav")
     assert Path(manifest.artifacts["segments_final"]).exists()
     assert Path(manifest.artifacts["export"]).exists()
+
+
+def test_full_command_splits_folder_input_outputs(cli_runner, tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "RJFULL"
+    write_tiny_wav(folder / "本編" / "01 プロローグ.wav", duration=0.7)
+    write_tiny_wav(folder / "本編" / "02 催眠誘導.wav", duration=0.8)
+    write_tiny_wav(folder / "効果音無し" / "01 プロローグ.wav", duration=0.7)
+    write_tiny_wav(folder / "効果音無し" / "02 催眠誘導.wav", duration=0.8)
+    project = tmp_path / "folder_project"
+
+    def fake_concat_audio_to_wav(
+        input_paths: list[Path],
+        output_path: Path,
+        *,
+        sample_rate: int = 48_000,
+        channels: int = 2,
+    ) -> Path:
+        clips = []
+        for input_path in input_paths:
+            data, sr = sf.read(input_path, always_2d=True, dtype="float32")
+            if sr != sample_rate:
+                indexes = np.linspace(0, len(data) - 1, max(1, int(len(data) * sample_rate / sr)))
+                data = data[indexes.astype(np.int64)]
+            if channels == 1:
+                data = data.mean(axis=1, keepdims=True)
+            elif data.shape[1] < channels:
+                data = np.repeat(data[:, :1], channels, axis=1)
+            else:
+                data = data[:, :channels]
+            clips.append(data)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(output_path, np.concatenate(clips, axis=0), sample_rate)
+        return output_path
+
+    monkeypatch.setattr(preprocess.ffmpeg, "concat_audio_to_wav", fake_concat_audio_to_wav)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(folder),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = load_manifest(project)
+    output_dir = Path(manifest.artifacts["export"])
+    export_manifest = json.loads(Path(manifest.artifacts["export_manifest"]).read_text("utf-8"))
+    assert output_dir.is_dir()
+    assert export_manifest["folder_input"] is True
+    assert [Path(item["output"]).name for item in export_manifest["outputs"]] == [
+        "01_프롤로그_dub.wav",
+        "02_최면유도_dub.wav",
+    ]
+    assert all(Path(item["output"]).exists() for item in export_manifest["outputs"])
+    assert Path(manifest.artifacts["folder_input_manifest"]).exists()
 
 
 def test_full_merge_parts_uses_group_run_name_and_passes_flag(
@@ -225,6 +338,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.asr_batched_inference is True
     assert cfg.asr_batch_size == 16
     assert cfg.asr_diagnostics_enabled is True
+    assert cfg.asr_resegment_max_sec == 14.0
     assert cfg.asr_repair_enabled is True
     assert cfg.asr_review_enabled is True
     assert cfg.asr_review_generate_candidates is True
@@ -251,8 +365,8 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gemma_text_context_radius == 8
     assert cfg.gemma_text_concurrency == 4
     assert cfg.gemma_text_n_predict == 2048
-    assert cfg.gemma_text_span_size == 8
-    assert cfg.gemma_text_span_max_sec == 45.0
+    assert cfg.gemma_text_span_size == 12
+    assert cfg.gemma_text_span_max_sec == 90.0
     assert cfg.gemma_text_span_max_gap_sec == 3.0
     assert cfg.mix_allow_korean_timing_draft is False
     assert cfg.rvc_required is True
