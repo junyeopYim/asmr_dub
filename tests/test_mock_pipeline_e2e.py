@@ -388,6 +388,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.rvc_train_required is True
     assert cfg.rvc_train_backend == "command"
     assert cfg.rvc_train_timeout_sec == 43200.0
+    assert cfg.rvc_train_epochs == 20
     assert cfg.rvc_train_experiment_name == f"asmr-{tiny_wav_path.stem.lower()}-speaker-1"
     assert cfg.rvc_train_command
     assert str(fake_repo / "asmr_dub_pipeline/rvc/webui_train.py") in cfg.rvc_train_command
@@ -406,6 +407,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert "{preprocess_processes}" in cfg.rvc_train_command
     assert "{f0_workers}" in cfg.rvc_train_command
     assert "{feature_workers}" in cfg.rvc_train_command
+    assert "{epochs}" in cfg.rvc_train_command
     assert "{save_every_epoch}" in cfg.rvc_train_command
     assert "{reuse_intermediate_cache}" in cfg.rvc_train_command
     assert cfg.rvc_command

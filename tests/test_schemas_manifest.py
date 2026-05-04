@@ -59,6 +59,7 @@ def test_project_config_requires_rvc_by_default() -> None:
     assert cfg.rvc_train_required is True
     assert cfg.rvc_train_backend == "command"
     assert cfg.rvc_train_timeout_sec == 14400.0
+    assert cfg.rvc_train_epochs == 20
     assert cfg.rvc_train_batch_size == 0
     assert cfg.rvc_train_preprocess_processes == 0
     assert cfg.rvc_train_f0_workers == 0

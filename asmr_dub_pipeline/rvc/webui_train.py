@@ -350,7 +350,7 @@ def main() -> None:
     parser.add_argument("--output-index", required=True)
     parser.add_argument("--sample-rate", default="48k")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--save-every-epoch", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--processes", type=int, default=0)

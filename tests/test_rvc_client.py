@@ -53,6 +53,7 @@ def test_command_template_rejects_unknown_placeholder() -> None:
 
 def test_train_command_template_renders_speed_placeholders(tmp_path: Path) -> None:
     cfg = ProjectConfig(
+        rvc_train_epochs=20,
         rvc_train_batch_size=6,
         rvc_train_preprocess_processes=0,
         rvc_train_f0_workers=2,
@@ -69,6 +70,7 @@ def test_train_command_template_renders_speed_placeholders(tmp_path: Path) -> No
             "{preprocess_processes}",
             "{f0_workers}",
             "{feature_workers}",
+            "{epochs}",
             "{save_every_epoch}",
             "{reuse_intermediate_cache}",
         ],
@@ -80,7 +82,7 @@ def test_train_command_template_renders_speed_placeholders(tmp_path: Path) -> No
         cfg=cfg,
     )
 
-    assert command == ["train", "48k", "6", "0", "2", "2", "50", "true"]
+    assert command == ["train", "48k", "6", "0", "2", "2", "20", "50", "true"]
 
 
 def test_train_command_template_auto_batch_size_uses_gpu_memory(monkeypatch, tmp_path: Path) -> None:

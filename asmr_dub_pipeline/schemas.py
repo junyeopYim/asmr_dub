@@ -490,6 +490,7 @@ class RVCConfig(StrictBaseModel):
     train_timeout_sec: float = Field(default=14400.0, gt=0)
     train_experiment_name: str = "asmr-rvc-speaker-1"
     train_sample_rate: int = Field(default=48_000, ge=0)
+    train_epochs: int = Field(default=20, ge=1)
     train_batch_size: int = Field(default=0, ge=0, le=64)
     train_preprocess_processes: int = Field(default=0, ge=0)
     train_f0_workers: int = Field(default=0, ge=0)
@@ -809,6 +810,7 @@ _RVC_FLAT_FIELDS = [
     "train_timeout_sec",
     "train_experiment_name",
     "train_sample_rate",
+    "train_epochs",
     "train_batch_size",
     "train_preprocess_processes",
     "train_f0_workers",
