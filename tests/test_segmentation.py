@@ -6,6 +6,7 @@ import numpy as np
 import soundfile as sf
 
 from asmr_dub_pipeline.audio import segmentation
+from asmr_dub_pipeline.audio.preprocess import translate_media_stem_to_korean
 
 
 def _write_segmentable_audio(path: Path, sample_rate: int, channels: int) -> Path:
@@ -45,3 +46,9 @@ def test_energy_segments_reuses_loaded_audio_for_clip_writes(monkeypatch, tmp_pa
     for segment in segments:
         assert Path(segment.audio_for_gemma).exists()
         assert Path(segment.audio_for_mix).exists()
+
+
+def test_translate_media_stem_to_korean_handles_common_english_track_names() -> None:
+    assert translate_media_stem_to_korean("01_Install") == "01_설치"
+    assert translate_media_stem_to_korean("05_Nipple_exp") == "05_유두_확장"
+    assert translate_media_stem_to_korean("10_Vagina_Anal") == "10_질_애널"
