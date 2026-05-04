@@ -179,7 +179,6 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                     sample_rate=cfg.mix_sample_rate,
                     channels=2,
                 )
-                postprocess_tts_candidate(fitted_path, payload)
                 fitted_duration = duration_sec(fitted_path)
                 fitted_peak = peak_dbfs(fitted_path)
                 fitted_rms = rms_dbfs(fitted_path)

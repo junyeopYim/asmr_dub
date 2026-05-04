@@ -1062,9 +1062,13 @@ def test_synth_time_fits_audible_candidate_when_duration_gate_fails(
     ) -> Path:
         _ = input_path, sample_rate, channels
         sr = sample_rate or 48_000
-        t = np.arange(int(sr * target_duration_sec), dtype=np.float32) / sr
+        edge = int(sr * 0.8)
+        tone_frames = int(sr * max(0.1, target_duration_sec - 1.6))
+        t = np.arange(tone_frames, dtype=np.float32) / sr
         tone = 0.05 * np.sin(2 * np.pi * 220.0 * t)
-        write_audio(output_path, np.stack([tone, tone], axis=1), sr)
+        silence = np.zeros(edge, dtype=np.float32)
+        signal = np.concatenate([silence, tone, silence])
+        write_audio(output_path, np.stack([signal, signal], axis=1), sr)
         return output_path
 
     monkeypatch.setattr(steps, "GPTSoVITSClient", ShortClient)
