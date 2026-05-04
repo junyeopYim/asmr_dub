@@ -160,6 +160,20 @@ def test_extract_folder_input_prefers_clean_asr_parts(
     assert manifest.source_info.raw["folder_input"]["asr_source_status"] == "separate_asr_parts"
 
 
+def test_folder_input_planner_prefers_main_group_over_diff_tracks(tmp_path: Path) -> None:
+    folder = tmp_path / "RJDIFF"
+    main_1 = write_tiny_wav(folder / "TSSS 完パケ音声 mp3" / "01 本編.mp3", duration=0.7)
+    main_2 = write_tiny_wav(folder / "TSSS 完パケ音声 mp3" / "02 催眠誘導.mp3", duration=0.8)
+    write_tiny_wav(folder / "TSSS 完パケ音声 mp3" / "差分トラック mp3" / "04 H有（SE無）.mp3", duration=0.6)
+    write_tiny_wav(folder / "TSSS 完パケ音声 mp3" / "差分トラック mp3" / "05 remix.mp3", duration=0.6)
+    write_tiny_wav(folder / "TSSS 完パケ音声 mp3" / "差分トラック mp3" / "06 コピーしてお使いください.mp3", duration=0.6)
+
+    plan = preprocess.plan_folder_input(folder)
+
+    assert plan.status == "planned"
+    assert plan.mix_parts == (main_1.resolve(), main_2.resolve())
+
+
 def test_numbered_part_merge_planner_refuses_ambiguous_base_file(tmp_path: Path) -> None:
     write_tiny_wav(tmp_path / "RJAMB.wav")
     part_1 = write_tiny_wav(tmp_path / "RJAMB_1.wav")
