@@ -174,6 +174,35 @@ def test_few_shot_training_python_env_override(
     assert selected == str(override)
 
 
+def test_few_shot_training_env_includes_python_nvrtc_lib_dir(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _fake_gsv_install(tmp_project_dir / "gsv")
+    cfg = ProjectConfig(project_name="test", gsv_server_command=["python", str(api)])
+    install = discover_install(cfg)
+    venv = tmp_project_dir / "venv"
+    nvrtc_dir = venv / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13" / "lib"
+    nvrtc_dir.mkdir(parents=True)
+    (nvrtc_dir / "libnvrtc-builtins.so.13.0").write_bytes(b"")
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    monkeypatch.setattr(few_shot.sys, "prefix", str(venv))
+    monkeypatch.setattr(few_shot.sys, "base_prefix", str(tmp_project_dir / "base"))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing")
+    dataset = few_shot.FewShotDataset(
+        items=[],
+        wav_dir=tmp_project_dir / "wavs",
+        list_path=tmp_project_dir / "dataset.list",
+        total_duration_sec=0.0,
+    )
+
+    env = few_shot._base_env(cfg, dataset, install, s2_config_path=install.s2_config_path)
+
+    ld_paths = env["LD_LIBRARY_PATH"].split(os.pathsep)
+    assert ld_paths[0] == str(nvrtc_dir)
+    assert "/existing" in ld_paths
+
+
 def test_few_shot_training_python_checks_text_and_semantic_deps(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

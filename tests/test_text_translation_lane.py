@@ -4036,6 +4036,120 @@ def test_korean_script_blocks_foreign_symbols_and_truncated_fragments(
     assert issue in manifest.segments[0].errors[-1]
 
 
+def test_korean_script_softens_safe_truncated_connector_for_tts(tmp_project_dir: Path) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="でも",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="하지만,",
+            ko_natural="하지만,",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].status == "scripted"
+    assert manifest.segments[0].script is not None
+    assert manifest.segments[0].script.tts_text == "하지만..."
+    assert (
+        manifest.segments[0].analysis["pre_synth_text_qc_recovery"]
+        == "softened_truncated_sentence"
+    )
+
+
+def test_korean_script_softens_safe_truncated_malgo_connector(tmp_project_dir: Path) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="他のことは考えないで",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="다른 생각은 하지 말고",
+            ko_natural="다른 생각은 하지 말고",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].status == "scripted"
+    assert manifest.segments[0].script is not None
+    assert manifest.segments[0].script.tts_text == "다른 생각은 하지 말고..."
+
+
+def test_korean_script_recovers_previous_truncated_preflight_manual_review(
+    tmp_project_dir: Path,
+) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        status="needs_manual_review",
+        errors=[
+            "Korean TTS preflight blocked synthesis: korean_tts_suspicious_truncated_sentence",
+            "korean-script skipped segment status needs_manual_review.",
+        ],
+        source_script=SourceScript(
+            text="でも",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="하지만,",
+            ko_natural="하지만,",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.segments[0].status == "scripted"
+    assert manifest.segments[0].errors == []
+    assert manifest.segments[0].script is not None
+    assert manifest.segments[0].script.tts_text == "하지만..."
+
+
 def test_translate_ko_cli_accepts_repair_retry_options(
     cli_runner,
     tmp_project_dir: Path,

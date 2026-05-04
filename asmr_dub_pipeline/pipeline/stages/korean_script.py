@@ -33,15 +33,22 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
             )
             continue
         if segment.status in SKIP_STATUSES:
-            needs_manual_review += 1
-            segment.script = None
-            message = f"korean-script skipped segment status {segment.status}."
-            if message not in segment.errors:
-                segment.errors.append(message)
-            last_logged_at = _log_segment_progress(
-                "korean-script", index, total, segment, manifest, started_at, last_logged_at
-            )
-            continue
+            if segment.status == "needs_manual_review" and _can_retry_korean_script_segment(segment):
+                segment.errors = [
+                    error
+                    for error in segment.errors
+                    if not _is_recoverable_korean_preflight_error(error)
+                ]
+            else:
+                needs_manual_review += 1
+                segment.script = None
+                message = f"korean-script skipped segment status {segment.status}."
+                if message not in segment.errors:
+                    segment.errors.append(message)
+                last_logged_at = _log_segment_progress(
+                    "korean-script", index, total, segment, manifest, started_at, last_logged_at
+                )
+                continue
         translation = segment.translation_ko
         text = translation.ko_natural.strip() if translation else ""
         source_text = segment.source_script.text.strip() if segment.source_script else ""
@@ -77,6 +84,17 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
             source_text=source_text,
             min_hangul_ratio=cfg.gsv_ko_text_min_hangul_ratio,
         )
+        if preflight.issues == [
+            "korean_tts_suspicious_truncated_sentence"
+        ] and _can_soften_truncated_korean_tts(segment.script.tts_text):
+            segment.script.tts_text = segment.script.tts_text.rstrip(" ,") + "..."
+            preflight = preflight_tts_text(
+                segment.script,
+                target_language=cfg.target_language,
+                source_text=source_text,
+                min_hangul_ratio=cfg.gsv_ko_text_min_hangul_ratio,
+            )
+            segment.analysis["pre_synth_text_qc_recovery"] = "softened_truncated_sentence"
         segment.analysis["pre_synth_text_qc"] = preflight.as_payload()
         if preflight.blocked:
             needs_manual_review += 1
@@ -108,3 +126,26 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
     save_manifest(project_dir, manifest)
     _log_stage_complete("korean-script", manifest, "tts_language=ko")
     return ctx.update_manifest(manifest)
+
+
+def _can_soften_truncated_korean_tts(text: str) -> bool:
+    normalized = text.strip()
+    if normalized.endswith(","):
+        return True
+    return bool(re.search(r"(?:그리고|그러니까|하지만|말고|자|뭐)$", normalized))
+
+
+def _can_retry_korean_script_segment(segment: Segment) -> bool:
+    translation = segment.translation_ko
+    if translation is None or not translation.ko_natural.strip():
+        return False
+    if not segment.errors:
+        return False
+    return all(_is_recoverable_korean_preflight_error(error) for error in segment.errors)
+
+
+def _is_recoverable_korean_preflight_error(error: str) -> bool:
+    return error in {
+        "Korean TTS preflight blocked synthesis: korean_tts_suspicious_truncated_sentence",
+        "korean-script skipped segment status needs_manual_review.",
+    }
