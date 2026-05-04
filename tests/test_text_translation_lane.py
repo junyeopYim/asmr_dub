@@ -4250,6 +4250,75 @@ def test_korean_script_blocks_japanese_fallback_text(tmp_project_dir: Path) -> N
     assert "korean_tts_contains_kana" in manifest.segments[0].errors[-1]
 
 
+def test_korean_script_fails_stage_for_minor_sexualized_tts_text(tmp_project_dir: Path) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="裸の少女が映し出されます",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="나체의 소녀가 비춰집니다.",
+            ko_natural="나체의 소녀가 비춰집니다.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    with pytest.raises(ValueError, match="minor sexualized"):
+        korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["korean-script"]["status"] == "failed"
+    assert manifest.stage_state["korean-script"]["safety_blocked"] == 1
+    assert manifest.segments[0].status == "needs_manual_review"
+    assert "tts_safety_minor_sexualized_content" in manifest.segments[0].errors[-1]
+
+
+def test_korean_script_allows_adult_content_warning_without_minor_subject(tmp_project_dir: Path) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        source_script=SourceScript(
+            text="性的な表現があります。18歳未満の方は利用をおやめください。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="성적인 표현이 있습니다. 열여덟 살 미만은 이용하지 말아 주세요.",
+            ko_natural="성적인 표현이 있습니다. 열여덟 살 미만은 이용하지 말아 주세요.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["korean-script"]["status"] == "completed"
+    assert manifest.segments[0].status == "scripted"
+
+
 def test_transcribe_and_translate_mock_cli(
     cli_runner,
     tiny_wav_path: Path,

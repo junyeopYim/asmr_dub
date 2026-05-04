@@ -17,6 +17,14 @@ BRACKETED_RE = re.compile(
     r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|（[^）]*）|【[^】]*】|｛[^｝]*｝|〈[^〉]*〉|《[^》]*》)"
 )
 KOREAN_LONG_CLAUSE_MAX_CHARS = 44
+MINOR_SUBJECT_RE = re.compile(
+    r"(?:少女|幼女|小さな女の子|女の子|女子校生|女子高生|学校|"
+    r"소녀|여자아이|여아|미성년자?|로리|학교|교복)"
+)
+SEXUALIZED_CONTENT_RE = re.compile(
+    r"(?:裸|全裸|下着|股間|胸|乳首|性的|性器|性交|媚薬|"
+    r"나체|벌거벗|속옷|가랑이|가슴|유두|성적|성적인|성기|음부|최음)"
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +99,13 @@ def hangul_ratio(text: str) -> float:
     return hangul / len(speech_chars)
 
 
+def has_minor_sexualized_content(text: str, source_text: str = "") -> bool:
+    combined = "\n".join(part for part in (source_text.strip(), text.strip()) if part)
+    if not combined:
+        return False
+    return bool(MINOR_SUBJECT_RE.search(combined) and SEXUALIZED_CONTENT_RE.search(combined))
+
+
 def preflight_tts_text(
     script: JapaneseScript,
     *,
@@ -120,6 +135,8 @@ def preflight_tts_text(
             issues.append("korean_tts_long_clause_without_pause")
         if has_suspicious_truncated_sentence(text):
             issues.append("korean_tts_suspicious_truncated_sentence")
+        if has_minor_sexualized_content(text, source_text):
+            issues.append("tts_safety_minor_sexualized_content")
         ratio = hangul_ratio(text)
         if source_text.strip() and text == source_text.strip():
             issues.append("korean_tts_matches_source_japanese")

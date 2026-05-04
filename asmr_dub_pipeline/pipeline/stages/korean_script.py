@@ -22,6 +22,7 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
     scripted = 0
     needs_manual_review = 0
     no_speech_detected = 0
+    safety_blocked = 0
     started_at = monotonic()
     last_logged_at = started_at
     for index, segment in enumerate(manifest.segments, start=1):
@@ -98,6 +99,8 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
         segment.analysis["pre_synth_text_qc"] = preflight.as_payload()
         if preflight.blocked:
             needs_manual_review += 1
+            if "tts_safety_minor_sexualized_content" in preflight.issues:
+                safety_blocked += 1
             segment.status = "needs_manual_review"
             segment.errors.append(
                 "Korean TTS preflight blocked synthesis: " + ", ".join(preflight.issues)
@@ -115,15 +118,27 @@ def run_korean_script_stage(ctx: PipelineContext, confirm_rights: bool = False) 
     out_path = project_dir / "work" / "segments" / "manifests" / "segments_ko_script.json"
     write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
     manifest.artifacts["segments_ko_script"] = str(out_path)
+    stage_status = "failed" if safety_blocked else "completed"
     mark_stage(
         manifest,
         "korean-script",
-        "completed",
+        stage_status,
         scripted=scripted,
         needs_manual_review=needs_manual_review,
         no_speech_detected=no_speech_detected,
+        safety_blocked=safety_blocked,
     )
     save_manifest(project_dir, manifest)
+    if safety_blocked:
+        _log_stage_complete(
+            "korean-script",
+            manifest,
+            f"safety_blocked={safety_blocked}",
+        )
+        raise ValueError(
+            "korean-script blocked minor sexualized content before TTS synthesis "
+            f"({safety_blocked} segment(s))."
+        )
     _log_stage_complete("korean-script", manifest, "tts_language=ko")
     return ctx.update_manifest(manifest)
 
