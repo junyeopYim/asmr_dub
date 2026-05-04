@@ -363,8 +363,8 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gsv_few_shot_min_clip_sec == 2.0
     assert cfg.gsv_few_shot_max_clip_sec == 8.0
     assert cfg.gsv_concurrency == 3
-    assert cfg.gsv_tts_min_speed_factor == 0.92
-    assert cfg.gsv_tts_max_speed_factor == 1.0
+    assert cfg.gsv_tts_min_speed_factor == 0.75
+    assert cfg.gsv_tts_max_speed_factor == 1.20
     assert cfg.gsv_top_k == 8
     assert cfg.gsv_top_p == 0.9
     assert cfg.gsv_temperature == 0.7

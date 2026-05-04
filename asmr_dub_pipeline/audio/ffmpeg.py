@@ -155,6 +155,47 @@ def slice_audio(
     return output_path
 
 
+def _atempo_chain(tempo: float) -> str:
+    if tempo <= 0:
+        raise FFmpegError("atempo tempo must be greater than zero.")
+    factors: list[float] = []
+    remaining = tempo
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:.6f}" for factor in factors)
+
+
+def fit_audio_duration(
+    input_path: Path,
+    output_path: Path,
+    *,
+    target_duration_sec: float,
+    sample_rate: int | None = None,
+    channels: int | None = None,
+) -> Path:
+    ensure_not_same_path(input_path, output_path)
+    if target_duration_sec <= 0:
+        raise FFmpegError("target_duration_sec must be greater than zero.")
+    source_duration_sec = probe_media(input_path).duration_sec
+    if source_duration_sec <= 0:
+        raise FFmpegError(f"Cannot time-fit audio with unknown duration: {input_path}")
+    tempo = source_duration_sec / target_duration_sec
+    args = ["-y", "-i", str(input_path), "-filter:a", _atempo_chain(tempo), "-vn"]
+    if channels:
+        args += ["-ac", str(channels)]
+    if sample_rate:
+        args += ["-ar", str(sample_rate)]
+    args += [str(output_path)]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(args)
+    return output_path
+
+
 def mux_audio(input_media: Path, final_audio: Path, output_path: Path) -> Path:
     ensure_not_same_path(input_media, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

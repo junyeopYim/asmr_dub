@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # ruff: noqa: F403,F405,I001
 
+import copy
+
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
 
@@ -144,6 +146,88 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 keep_sec=cfg.gsv_trim_silence_keep_sec,
             )
             payload.setdefault("postprocess", {})["edge_silence_trim"] = trim
+
+        def candidate_language_contract_ok(candidate: TTSCandidate) -> bool:
+            if _canonical_language(cfg.target_language) != "ko":
+                return True
+            return (
+                candidate.payload.get("text_lang") == "all_ko"
+                and candidate.payload.get("prompt_lang") == "all_ja"
+                and bool(candidate.payload.get("text"))
+            )
+
+        def time_fit_candidate_if_needed(
+            segment: Segment,
+            selected: TTSCandidate,
+        ) -> TTSCandidate | None:
+            if selected.acceptable_for_mix:
+                return None
+            if selected.payload.get("audio_qc", {}).get("gate") != "pass":
+                return None
+            if not candidate_language_contract_ok(selected):
+                return None
+            if selected.duration_sec is None or selected.duration_sec <= 0 or segment.duration <= 0:
+                return None
+            source_path = Path(selected.output_path)
+            fitted_path = project_dir / "work" / "tts" / "candidates" / f"{segment.id}_timefit.wav"
+            payload = copy.deepcopy(selected.payload)
+            try:
+                ffmpeg.fit_audio_duration(
+                    source_path,
+                    fitted_path,
+                    target_duration_sec=segment.duration,
+                    sample_rate=cfg.mix_sample_rate,
+                    channels=2,
+                )
+                postprocess_tts_candidate(fitted_path, payload)
+                fitted_duration = duration_sec(fitted_path)
+                fitted_peak = peak_dbfs(fitted_path)
+                fitted_rms = rms_dbfs(fitted_path)
+            except Exception as exc:
+                selected.payload.setdefault("time_fit", {})["error"] = str(exc)
+                return None
+            too_long = duration_too_long(fitted_duration, segment.duration, cfg.duration_tolerance)
+            too_short = duration_too_short(fitted_duration, segment.duration, cfg.duration_tolerance)
+            fitted_ratio = duration_ratio(fitted_duration, segment.duration)
+            duration_gate = "too_long" if too_long else "too_short" if too_short else "pass"
+            audio_gate = "silent" if fitted_peak <= -90.0 or fitted_rms <= -90.0 else "pass"
+            payload["duration_ratio"] = fitted_ratio
+            payload["duration_gate"] = duration_gate
+            payload["audio_qc"] = {
+                "gate": audio_gate,
+                "peak_dbfs": round(fitted_peak, 3),
+                "rms_dbfs": round(fitted_rms, 3),
+            }
+            payload["time_fit"] = {
+                "source_path": selected.output_path,
+                "source_duration_sec": selected.duration_sec,
+                "target_duration_sec": segment.duration,
+                "tempo": selected.duration_sec / segment.duration,
+                "duration_ratio_before": selected.duration_ratio,
+                "duration_ratio_after": fitted_ratio,
+            }
+            acceptable_for_mix = (
+                duration_gate == "pass" and audio_gate == "pass" and candidate_language_contract_ok(selected)
+            )
+            selection_score = max(0.0, 1.0 - min(abs(fitted_ratio - 1.0), 1.0))
+            return TTSCandidate(
+                candidate_index=selected.candidate_index,
+                seed=selected.seed,
+                payload=payload,
+                output_path=str(fitted_path),
+                duration_sec=fitted_duration,
+                backend=selected.backend,
+                duration_ratio=fitted_ratio,
+                duration_gate=duration_gate,
+                acceptable_for_mix=acceptable_for_mix,
+                selection_score=selection_score,
+                selection_reason=(
+                    "duration_time_fit_fallback"
+                    if acceptable_for_mix
+                    else "duration_time_fit_failed"
+                ),
+                retry_summary=selected.retry_summary,
+            )
 
         def synthesize_segment_locked(
             index: int,
@@ -475,6 +559,11 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 return index, segment
             selected_pool = acceptable or audible
             selected = min(selected_pool, key=lambda c: abs((c.duration_sec or 0.0) - segment.duration))
+            fitted = time_fit_candidate_if_needed(segment, selected)
+            if fitted is not None:
+                candidates.append(fitted)
+                if fitted.acceptable_for_mix:
+                    selected = fitted
             selected.selected = True
             final_path = project_dir / "work" / "tts" / f"{segment.id}_final.wav"
             ensure_not_same_path(Path(selected.output_path), final_path)

@@ -999,6 +999,96 @@ def test_synth_uses_three_gsv_lanes_by_segment_id(
     assert manifest.stage_state["synth"]["concurrency"] == 3
 
 
+def test_synth_time_fits_audible_candidate_when_duration_gate_fails(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(project_name="test", gsv_concurrency=1, duration_tolerance=0.2)
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio, duration=3.0)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=3.0,
+        duration=3.0,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+        source_script=SourceScript(
+            text="テストです",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=3.0,
+        ),
+        script=JapaneseScript(
+            literal_ja="テストです",
+            ja_text="テストです",
+            tts_text="테스트입니다.",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+        ),
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+
+    class ShortClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            write_tiny_wav(output_path, duration=1.0)
+            return output_path
+
+    def fake_fit_audio_duration(
+        input_path: Path,
+        output_path: Path,
+        *,
+        target_duration_sec: float,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, sample_rate, channels
+        sr = sample_rate or 48_000
+        t = np.arange(int(sr * target_duration_sec), dtype=np.float32) / sr
+        tone = 0.05 * np.sin(2 * np.pi * 220.0 * t)
+        write_audio(output_path, np.stack([tone, tone], axis=1), sr)
+        return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", ShortClient)
+    monkeypatch.setattr(steps.ffmpeg, "fit_audio_duration", fake_fit_audio_duration)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://127.0.0.1:9880",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    manifest = load_manifest(tmp_project_dir)
+    tts = manifest.segments[0].tts
+    assert tts is not None
+    selected = next(candidate for candidate in tts.candidates if candidate.selected)
+    assert selected.duration_gate == "pass"
+    assert selected.acceptable_for_mix is True
+    assert selected.payload["time_fit"]["source_duration_sec"] == pytest.approx(1.15, abs=0.01)
+    assert selected.payload["time_fit"]["target_duration_sec"] == 3.0
+    assert Path(tts.selected_candidate_path).exists()
+
+
 def test_synth_fails_segment_when_all_gsv_candidates_are_silent(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
