@@ -211,6 +211,22 @@ def test_rvc_train_dataset_skips_identical_existing_copy(tmp_project_dir: Path, 
     assert len(calls) == 1
 
 
+def test_rvc_train_dataset_keeps_metadata_out_of_audio_directory(tmp_project_dir: Path) -> None:
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock")
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[_segment_with_tts(tmp_project_dir)],
+    )
+
+    dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert rows
+    assert {path.suffix for path in dataset_dir.iterdir()} == {".wav"}
+    assert not (dataset_dir / "dataset_manifest.json").exists()
+    assert (tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").exists()
+
+
 def test_duration_mismatch_triggers_next_retry_profile(tmp_project_dir: Path, monkeypatch) -> None:
     model_path = tmp_project_dir / "models" / "voice.pth"
     model_path.parent.mkdir(parents=True)

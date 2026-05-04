@@ -4311,6 +4311,9 @@ def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: boo
     if force and dataset_dir.exists():
         shutil.rmtree(dataset_dir)
     dataset_dir.mkdir(parents=True, exist_ok=True)
+    stale_manifest = dataset_dir / "dataset_manifest.json"
+    if stale_manifest.exists():
+        stale_manifest.unlink()
     rows: list[dict[str, str]] = []
     for segment in manifest.segments:
         if segment.status in SKIP_STATUSES:
@@ -4330,7 +4333,7 @@ def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: boo
         rows.append({"segment_id": segment.id, "source_path": str(source_path), "dataset_path": str(output_path)})
     if not rows:
         raise RVCCommandError("train-rvc requires at least one source segment audio file.")
-    write_json_atomic(dataset_dir / "dataset_manifest.json", {"segments": rows})
+    write_json_atomic(project_dir / "work" / "rvc_train" / "dataset_manifest.json", {"segments": rows})
     return dataset_dir, rows
 
 
