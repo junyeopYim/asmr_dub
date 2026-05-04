@@ -273,6 +273,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                         _mock_synthesize(candidate_path, mock_duration, options.seed, cfg.mix_sample_rate)
                         postprocess_tts_candidate(candidate_path, payload)
                         duration = duration_sec(candidate_path)
+                        peak = peak_dbfs(candidate_path)
+                        rms = rms_dbfs(candidate_path)
                         payload.update(
                             {
                                 "mock": True,
@@ -313,6 +315,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             client.synthesize_to_file(request, candidate_path)
                             postprocess_tts_candidate(candidate_path, payload)
                             duration = duration_sec(candidate_path)
+                            peak = peak_dbfs(candidate_path)
+                            rms = rms_dbfs(candidate_path)
                         except GPTSoVITSError as exc:
                             candidates.append(
                                 TTSCandidate(
@@ -330,8 +334,14 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                     too_short = duration_too_short(duration, segment.duration, cfg.duration_tolerance)
                     candidate_ratio = duration_ratio(duration, segment.duration)
                     duration_gate = "too_long" if too_long else "too_short" if too_short else "pass"
+                    audio_gate = "silent" if peak <= -90.0 or rms <= -90.0 else "pass"
                     payload["duration_ratio"] = candidate_ratio
                     payload["duration_gate"] = duration_gate
+                    payload["audio_qc"] = {
+                        "gate": audio_gate,
+                        "peak_dbfs": round(peak, 3),
+                        "rms_dbfs": round(rms, 3),
+                    }
                     language_contract_ok = True
                     if target_language == "ko":
                         language_contract_ok = (
@@ -339,7 +349,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             and payload.get("text_lang") == "all_ko"
                             and payload.get("prompt_lang") == "all_ja"
                         )
-                    acceptable_for_mix = duration_gate == "pass" and language_contract_ok
+                    acceptable_for_mix = (
+                        duration_gate == "pass" and audio_gate == "pass" and language_contract_ok
+                    )
                     selection_score = max(0.0, 1.0 - min(abs(candidate_ratio - 1.0), 1.0))
                     if too_long and attempt < 2:
                         if attempt == 0:
@@ -365,6 +377,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             selection_reason=(
                                 "duration_and_language_contract_pass"
                                 if acceptable_for_mix
+                                else "audio_qc_failed"
+                                if audio_gate != "pass"
                                 else "duration_or_language_contract_failed"
                             ),
                             retry_summary=payload["retry"],
@@ -439,7 +453,27 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 segment.errors.append("All TTS candidates failed.")
                 return index, segment
             acceptable = [candidate for candidate in successful if candidate.acceptable_for_mix]
-            selected_pool = acceptable or successful
+            audible = [
+                candidate
+                for candidate in successful
+                if candidate.payload.get("audio_qc", {}).get("gate") == "pass"
+            ]
+            if not audible:
+                segment.tts = TTSMetadata(
+                    backend="mock" if mock else "gpt-sovits",
+                    ref_style=resolved_ref_style,
+                    speed_factor=speed,
+                    candidate_count=cfg.candidate_count,
+                    candidates=candidates,
+                    source_language=source_language,
+                    target_language=target_language,
+                    cross_lingual_voice_transfer=source_language != target_language,
+                    retry_summary={"acceptable_candidates": 0},
+                )
+                segment.status = "failed"
+                segment.errors.append("No acceptable TTS candidates for mix.")
+                return index, segment
+            selected_pool = acceptable or audible
             selected = min(selected_pool, key=lambda c: abs((c.duration_sec or 0.0) - segment.duration))
             selected.selected = True
             final_path = project_dir / "work" / "tts" / f"{segment.id}_final.wav"

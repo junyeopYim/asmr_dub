@@ -6,10 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
 from conftest import write_tiny_wav
 
+from asmr_dub_pipeline.audio.features import write_audio
 from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.gpt_sovits import few_shot
 from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSError, build_tts_request
@@ -995,6 +997,79 @@ def test_synth_uses_three_gsv_lanes_by_segment_id(
     assert by_text["테스트 육"] == "http://127.0.0.1:9882"
     manifest = load_manifest(tmp_project_dir)
     assert manifest.stage_state["synth"]["concurrency"] == 3
+
+
+def test_synth_fails_segment_when_all_gsv_candidates_are_silent(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(project_name="test", gsv_concurrency=1)
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio, duration=3.0)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=3.0,
+        duration=3.0,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+        source_script=SourceScript(
+            text="テストです",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=3.0,
+        ),
+        script=JapaneseScript(
+            literal_ja="テストです",
+            ja_text="テストです",
+            tts_text="테스트입니다.",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+        ),
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+
+    class SilentClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            write_audio(output_path, np.zeros((16000, 1), dtype=np.float32), 16000)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", SilentClient)
+
+    with pytest.raises(GPTSoVITSError, match="seg_0001"):
+        synth_step(
+            tmp_project_dir,
+            gsv_url="http://127.0.0.1:9880",
+            refs_path=tmp_project_dir / "refs" / "refs.json",
+            mock=False,
+            confirm_rights=True,
+        )
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["synth"]["status"] == "failed"
+    assert manifest.segments[0].status == "failed"
+    assert "No acceptable TTS candidates for mix." in manifest.segments[0].errors
+    assert manifest.segments[0].tts is not None
+    assert manifest.segments[0].tts.selected_candidate_path is None
+    assert all(not candidate.selected for candidate in manifest.segments[0].tts.candidates)
 
 
 def test_semantic_parts_merge_with_upstream_header(tmp_project_dir: Path) -> None:

@@ -309,3 +309,23 @@ def test_gsv_subprocess_env_adds_mecab_shim_when_missing(monkeypatch, tmp_path: 
     env = _gsv_subprocess_env()
 
     assert env["PYTHONPATH"].split(":")[:2] == [str(shim_dir), "existing"]
+
+
+def test_gsv_subprocess_env_includes_python_nvrtc_lib_dir(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv = tmp_path / "venv"
+    nvrtc_dir = venv / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13" / "lib"
+    nvrtc_dir.mkdir(parents=True)
+    (nvrtc_dir / "libnvrtc-builtins.so.13.0").write_bytes(b"")
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing")
+    monkeypatch.setattr(gsv_server.sys, "prefix", str(venv))
+    monkeypatch.setattr(gsv_server.sys, "base_prefix", str(tmp_path / "base"))
+
+    env = _gsv_subprocess_env()
+
+    ld_paths = env["LD_LIBRARY_PATH"].split(":")
+    assert ld_paths[0] == str(nvrtc_dir)
+    assert "/existing" in ld_paths

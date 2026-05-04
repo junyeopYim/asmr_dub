@@ -242,7 +242,55 @@ def _gsv_subprocess_env() -> dict[str, str]:
         env["PYTHONPATH"] = (
             str(SHIM_DIR) if not existing else os.pathsep.join((str(SHIM_DIR), existing))
         )
+    cuda_library_dirs = _candidate_cuda_library_dirs()
+    library_paths = [str(path) for path in cuda_library_dirs]
+    if env.get("LD_LIBRARY_PATH"):
+        library_paths.append(env["LD_LIBRARY_PATH"])
+    if library_paths:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(_dedupe_text(library_paths))
     return env
+
+
+def _candidate_cuda_library_dirs() -> list[Path]:
+    roots: list[Path] = []
+    for raw in (os.environ.get("VIRTUAL_ENV"), sys.prefix, sys.base_prefix):
+        if raw:
+            roots.append(Path(raw).expanduser())
+    executable = Path(sys.executable).expanduser()
+    if executable.name:
+        roots.append(executable.parent.parent)
+    dirs: list[Path] = []
+    for root in roots:
+        for pattern in (
+            "lib/python*/site-packages/nvidia/cu*/lib",
+            "lib/python*/site-packages/nvidia/cuda_nvrtc/lib",
+        ):
+            dirs.extend(path for path in root.glob(pattern) if _has_nvrtc_runtime(path))
+    for path in (
+        Path("/usr/local/cuda-13.2/targets/x86_64-linux/lib"),
+        Path("/usr/local/lib/ollama/mlx_cuda_v13"),
+    ):
+        if _has_nvrtc_runtime(path):
+            dirs.append(path)
+    return _dedupe_paths(dirs)
+
+
+def _has_nvrtc_runtime(path: Path) -> bool:
+    return path.exists() and (
+        any(path.glob("libnvrtc-builtins.so.13*")) or any(path.glob("libnvrtc.so.13*"))
+    )
+
+
+def _dedupe_paths(paths: Sequence[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(path.resolve())
+    return result
 
 
 def _tail(path: Path, max_chars: int = 2000) -> str:
