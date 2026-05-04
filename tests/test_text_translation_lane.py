@@ -36,6 +36,7 @@ from asmr_dub_pipeline.schemas import (
     PipelineManifest,
     ProjectConfig,
     QCMetadata,
+    RVCMetadata,
     Segment,
     SourceScript,
     TTSCandidate,
@@ -2964,6 +2965,36 @@ def test_mix_blocks_selected_candidate_with_failed_duration_gate() -> None:
     segment.qc = QCMetadata(recommendation="pass", status="ok")
 
     assert not pipeline_steps._include_segment_in_mix(segment, allow_korean_timing_draft=False)
+
+
+def test_mix_includes_qc_passed_rvc_output_even_if_tts_candidate_gate_failed() -> None:
+    segment = sample_segment()
+    segment.status = "ok"
+    segment.script = JapaneseScript(ja_text="こんにちは", tts_text="안녕하세요.", tts_language="ko")
+    segment.tts = TTSMetadata(
+        selected_candidate_path="work/tts/seg_0001_final.wav",
+        candidates=[
+            TTSCandidate(
+                candidate_index=0,
+                seed=1,
+                output_path="work/tts/seg_0001_final.wav",
+                duration_sec=1.3,
+                selected=True,
+                duration_ratio=1.3,
+                duration_gate="too_long",
+                acceptable_for_mix=False,
+            )
+        ],
+    )
+    segment.rvc = RVCMetadata(
+        backend="command",
+        input_path="work/tts/seg_0001_final.wav",
+        output_path="work/rvc/seg_0001_final.wav",
+        accepted=True,
+    )
+    segment.qc = QCMetadata(recommendation="pass", status="ok")
+
+    assert pipeline_steps._include_segment_in_mix(segment, allow_korean_timing_draft=False)
 
 
 def test_llama_server_translation_client_repairs_invalid_json() -> None:

@@ -4370,11 +4370,12 @@ def _include_segment_in_mix(segment: Segment, *, allow_korean_timing_draft: bool
     if segment.tts:
         selected_candidate = next((candidate for candidate in segment.tts.candidates if candidate.selected), None)
     selected_candidate_ok = selected_candidate.acceptable_for_mix if selected_candidate else True
+    rvc_output_ok = bool(segment.rvc and segment.rvc.accepted and segment.rvc.output_path)
     if (
         segment.status == "ok"
         and segment.qc is not None
         and segment.qc.recommendation == "pass"
-        and selected_candidate_ok
+        and (selected_candidate_ok or rvc_output_ok)
     ):
         return True
     if not allow_korean_timing_draft:
