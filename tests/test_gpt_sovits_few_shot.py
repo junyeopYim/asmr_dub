@@ -1093,6 +1093,88 @@ def test_synth_time_fits_audible_candidate_when_duration_gate_fails(
     assert Path(tts.selected_candidate_path).exists()
 
 
+def test_synth_retries_silent_candidate_even_when_duration_matches(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    cfg = ProjectConfig(project_name="test", candidate_count=1, gsv_concurrency=1)
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
+    write_tiny_wav(ref_audio)
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio, duration=1.0)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+        source_script=SourceScript(
+            text="テストです",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        script=JapaneseScript(
+            literal_ja="テストです",
+            ja_text="テストです",
+            tts_text="테스트입니다.",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+        ),
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+
+    class SilentThenToneClient:
+        calls = 0
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def set_gpt_weights(self, path: str) -> str:
+            return "success"
+
+        def set_sovits_weights(self, path: str) -> str:
+            return "success"
+
+        def build_payload(self, text, ref, options=None):
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            type(self).calls += 1
+            if type(self).calls == 1:
+                write_audio(output_path, np.zeros((16000, 1), dtype=np.float32), 16000)
+            else:
+                write_tiny_wav(output_path, duration=1.0)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", SilentThenToneClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://127.0.0.1:9880",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    manifest = load_manifest(tmp_project_dir)
+    tts = manifest.segments[0].tts
+    assert tts is not None
+    assert SilentThenToneClient.calls == 2
+    assert tts.selected_candidate_path is not None
+    selected = next(candidate for candidate in tts.candidates if candidate.selected)
+    assert selected.payload["audio_qc"]["gate"] == "pass"
+    assert selected.acceptable_for_mix is True
+    silent = tts.candidates[0]
+    assert silent.payload["audio_qc"]["gate"] == "silent"
+    assert silent.payload["retry"]["next_action"] == "seed_changed"
+
+
 def test_synth_fails_segment_when_all_gsv_candidates_are_silent(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

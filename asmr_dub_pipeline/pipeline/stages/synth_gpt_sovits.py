@@ -436,7 +436,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                         duration_gate == "pass" and audio_gate == "pass" and language_contract_ok
                     )
                     selection_score = max(0.0, 1.0 - min(abs(candidate_ratio - 1.0), 1.0))
-                    if too_long and attempt < 2:
+                    if audio_gate != "pass" and attempt < 2:
+                        payload["retry"]["next_action"] = GPTSoVITSRetrySignal.SEED_CHANGED.value
+                    elif too_long and attempt < 2:
                         if attempt == 0:
                             payload["retry"]["next_action"] = GPTSoVITSRetrySignal.SPEED_FACTOR_ADJUSTED.value
                         elif can_rewrite_for_duration:
@@ -467,6 +469,18 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             retry_summary=payload["retry"],
                         )
                     )
+                    if audio_gate != "pass":
+                        if attempt >= 2:
+                            break
+                        options = options.model_copy(
+                            update={
+                                "seed": options.seed + 30_000 + index + attempt
+                                if options.seed >= 0
+                                else 30_000 + index + attempt
+                            }
+                        )
+                        attempt_signals = [GPTSoVITSRetrySignal.SEED_CHANGED]
+                        continue
                     if not (too_long or too_short):
                         break
                     if attempt >= 2:
