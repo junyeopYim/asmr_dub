@@ -14,6 +14,8 @@ _TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
 CACHE_MANIFEST_NAME = "rvc_train_cache_manifest.json"
 CACHE_VERSION = 1
 WRAPPER_VERSION = "webui-train-cache-v1"
+INDEX_MAX_TRAIN_FRAMES = 200_000
+INDEX_MAX_IVF = 4096
 
 
 def _repo_root() -> Path:
@@ -312,11 +314,14 @@ def _train_index(exp_dir: Path, experiment_name: str, version: str, output_index
     order = np.arange(big_npy.shape[0])
     np.random.shuffle(order)
     big_npy = big_npy[order]
-    n_ivf = max(1, min(int(16 * np.sqrt(big_npy.shape[0])), max(1, big_npy.shape[0] // 39)))
+    train_npy = big_npy
+    if big_npy.shape[0] > INDEX_MAX_TRAIN_FRAMES:
+        train_npy = big_npy[:INDEX_MAX_TRAIN_FRAMES]
+    n_ivf = max(1, min(int(16 * np.sqrt(train_npy.shape[0])), max(1, train_npy.shape[0] // 39), INDEX_MAX_IVF))
     index = faiss.index_factory(256 if version == "v1" else 768, f"IVF{n_ivf},Flat")
     index_ivf = faiss.extract_index_ivf(index)
     index_ivf.nprobe = 1
-    index.train(big_npy)
+    index.train(train_npy)
     trained = exp_dir / f"trained_IVF{n_ivf}_Flat_nprobe_1_{experiment_name}_{version}.index"
     added = exp_dir / f"added_IVF{n_ivf}_Flat_nprobe_1_{experiment_name}_{version}.index"
     faiss.write_index(index, str(trained))

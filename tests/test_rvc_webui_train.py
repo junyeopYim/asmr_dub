@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from asmr_dub_pipeline.rvc import webui_train
@@ -134,6 +135,44 @@ def test_cache_manifest_match_and_complete_outputs(tmp_path: Path) -> None:
     assert webui_train._preprocess_outputs_complete(exp_dir) is True
     assert webui_train._f0_outputs_complete(exp_dir) is True
     assert webui_train._feature_outputs_complete(exp_dir, "v2") is True
+
+
+def test_train_index_caps_large_feature_sets(monkeypatch, tmp_path: Path) -> None:
+    exp_dir = tmp_path / "logs" / "speaker"
+    feature_dir = exp_dir / "3_feature768"
+    feature_dir.mkdir(parents=True)
+    np.save(feature_dir / "a.npy", np.ones((5, 768), dtype=np.float32))
+    np.save(feature_dir / "b.npy", np.ones((5, 768), dtype=np.float32))
+    output_index = tmp_path / "out" / "added.index"
+    trained_shapes: list[tuple[int, ...]] = []
+    index_specs: list[str] = []
+
+    class FakeIndex:
+        def train(self, values: np.ndarray) -> None:
+            trained_shapes.append(values.shape)
+
+        def add(self, values: np.ndarray) -> None:
+            _ = values
+
+    def fake_index_factory(dimension: int, spec: str) -> FakeIndex:
+        assert dimension == 768
+        index_specs.append(spec)
+        return FakeIndex()
+
+    fake_faiss = SimpleNamespace(
+        index_factory=fake_index_factory,
+        extract_index_ivf=lambda index: SimpleNamespace(nprobe=0),
+        write_index=lambda index, path: Path(path).write_bytes(b"index"),
+    )
+    monkeypatch.setitem(sys.modules, "faiss", fake_faiss)
+    monkeypatch.setattr(webui_train, "INDEX_MAX_TRAIN_FRAMES", 3, raising=False)
+    monkeypatch.setattr(webui_train, "INDEX_MAX_IVF", 1, raising=False)
+
+    webui_train._train_index(exp_dir, "speaker", "v2", output_index)
+
+    assert trained_shapes == [(3, 768)]
+    assert index_specs == ["IVF1,Flat"]
+    assert output_index.read_bytes() == b"index"
 
 
 def test_main_partitions_f0_and_feature_workers(monkeypatch, tmp_path: Path) -> None:
