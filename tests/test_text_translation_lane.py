@@ -1855,6 +1855,8 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert "ご処生" in ProjectConfig().asr_repair_suspicious_text_patterns
     assert ProjectConfig(asr_review_backend="llama_server_audio").asr_review_backend == "llama_server_audio"
     assert ProjectConfig().asr_review_audio_padding_sec == pytest.approx(0.4)
+    assert "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf" in ProjectConfig().gemma_llama_cpp_audio_model_path
+    assert "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf" in ProjectConfig().gemma_llama_cpp_audio_mmproj_path
     assert "女体化" in ProjectConfig().asr_hotwords
     assert "性感帯" in ProjectConfig().asr_hotwords
     assert "採集マシーン" in ProjectConfig().asr_hotwords
@@ -1892,6 +1894,35 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().gsv_overlap_length == 2
     assert ProjectConfig().gsv_min_chunk_length == 16
     assert ProjectConfig().gsv_fragment_interval == pytest.approx(0.3)
+
+
+def test_asr_audio_review_server_uses_audio_llama_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = ProjectConfig(
+        gemma_llama_cpp_model_path="text-model.gguf",
+        gemma_llama_cpp_mmproj_path="text-mmproj.gguf",
+        gemma_llama_cpp_audio_model_path="audio-model.gguf",
+        gemma_llama_cpp_audio_mmproj_path="audio-mmproj.gguf",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_default_llama_server_command(**kwargs: object) -> list[str]:
+        captured.clear()
+        captured.update(kwargs)
+        return ["llama-server"]
+
+    monkeypatch.setattr(
+        pipeline_steps._common_stage,
+        "default_llama_server_command",
+        fake_default_llama_server_command,
+    )
+
+    assert pipeline_steps._gemma_text_server_command(cfg, include_mmproj=True) == ["llama-server"]
+    assert captured["model_path"] == "audio-model.gguf"
+    assert captured["mmproj_path"] == "audio-mmproj.gguf"
+
+    assert pipeline_steps._gemma_text_server_command(cfg, include_mmproj=False) == ["llama-server"]
+    assert captured["model_path"] == "text-model.gguf"
+    assert captured["mmproj_path"] is None
 
 
 def test_source_voice_ref_selection_extends_short_candidate_to_duration_window(

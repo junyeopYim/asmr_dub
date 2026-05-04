@@ -377,6 +377,16 @@ class GemmaConfig(StrictBaseModel):
         "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
         "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"
     )
+    llama_cpp_audio_model_path: str = (
+        "~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/"
+        "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
+        "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf"
+    )
+    llama_cpp_audio_mmproj_path: str = (
+        "~/.cache/huggingface/hub/models--OBLITERATUS--gemma-4-E4B-it-OBLITERATED/"
+        "snapshots/d8678bbb9e0d4f5729c115087485a4e25ba89d65/"
+        "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"
+    )
     llama_cpp_timeout_sec: float = Field(default=600.0, gt=0)
     llama_cpp_ctx_size: int = Field(default=4096, ge=512)
     llama_cpp_n_predict: int = Field(default=1024, ge=64)
@@ -732,6 +742,8 @@ _GEMMA_LLAMA_CPP_FLAT_FIELDS = [
     "cli_path",
     "model_path",
     "mmproj_path",
+    "audio_model_path",
+    "audio_mmproj_path",
     "timeout_sec",
     "ctx_size",
     "n_predict",

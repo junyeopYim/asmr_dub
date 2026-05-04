@@ -1788,7 +1788,11 @@ def _review_asr_chunks_with_model(
     review_by_chunk_id = {str(item["chunk_id"]): item for item in review_items}
     selected_text_by_chunk_id: dict[str, str] = {}
     review_results: dict[str, dict[str, Any]] = {}
-    model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server_audio" else "mock"
+    model_name = (
+        cfg.gemma_llama_cpp_audio_model_path
+        if backend_kind == "llama_server_audio"
+        else "mock"
+    )
     base_url = cfg.gemma_text_server_url.rstrip("/")
 
     def create_review_client() -> Any:
@@ -3938,8 +3942,12 @@ def _gemma_text_server_command(
         )
     return default_llama_server_command(
         base_url=effective_base_url,
-        model_path=cfg.gemma_llama_cpp_model_path,
-        mmproj_path=cfg.gemma_llama_cpp_mmproj_path if include_mmproj else None,
+        model_path=(
+            cfg.gemma_llama_cpp_audio_model_path
+            if include_mmproj
+            else cfg.gemma_llama_cpp_model_path
+        ),
+        mmproj_path=cfg.gemma_llama_cpp_audio_mmproj_path if include_mmproj else None,
         ctx_size=cfg.gemma_llama_cpp_ctx_size,
         gpu_layers=cfg.gemma_llama_cpp_gpu_layers,
         n_predict=cfg.gemma_text_n_predict,
