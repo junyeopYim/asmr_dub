@@ -97,6 +97,14 @@ def _tail(text: str | bytes | None, limit: int = 1200) -> str:
     return tail_text(text, limit=limit)
 
 
+def _output_fresh_for_input(output_path: Path, input_path: Path) -> bool:
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        return False
+    if not input_path.exists():
+        return False
+    return output_path.stat().st_mtime_ns >= input_path.stat().st_mtime_ns
+
+
 def _popen_process_group_kwargs() -> dict[str, bool]:
     return popen_process_group_kwargs()
 
@@ -754,7 +762,7 @@ class RVCCommandClient:
             segment_id=segment_id,
             sid=sid,
         )
-        if output_path.exists() and output_path.stat().st_size > 0 and not force:
+        if _output_fresh_for_input(output_path, input_path) and not force:
             return RVCCommandResult(
                 output_path=output_path,
                 command=command,
@@ -886,7 +894,7 @@ class RVCBatchCommandClient:
         results: dict[str, RVCCommandResult] = {}
         pending: list[RVCBatchJob] = []
         for job in jobs:
-            if job.output_path.exists() and job.output_path.stat().st_size > 0 and not force:
+            if _output_fresh_for_input(job.output_path, job.input_path) and not force:
                 results[job.segment_id] = RVCCommandResult(
                     output_path=job.output_path,
                     command=command,
@@ -1024,7 +1032,7 @@ class RVCMockClient:
         force: bool = False,
     ) -> RVCCommandResult:
         _ = model_path, index_path, cfg, profile, segment_id, sid
-        if output_path.exists() and output_path.stat().st_size > 0 and not force:
+        if _output_fresh_for_input(output_path, input_path) and not force:
             return RVCCommandResult(
                 output_path=output_path,
                 command=[],

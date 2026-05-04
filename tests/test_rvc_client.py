@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -287,6 +288,8 @@ def test_stream_timeout_kills_child_process_group(tmp_path: Path) -> None:
 def test_existing_output_reuse_when_force_false(tmp_path: Path) -> None:
     input_path = write_tiny_wav(tmp_path / "input.wav")
     output_path = write_tiny_wav(tmp_path / "out.wav")
+    future = time.time() + 10
+    os.utime(output_path, (future, future))
     cfg = ProjectConfig(rvc_backend="command", rvc_command=[sys.executable, "-c", "raise SystemExit(99)"])
     client = RVCCommandClient(cfg.rvc_command, timeout_sec=5)
 
@@ -301,6 +304,39 @@ def test_existing_output_reuse_when_force_false(tmp_path: Path) -> None:
     )
 
     assert result.reused_existing is True
+
+
+def test_existing_output_is_not_reused_when_input_is_newer(tmp_path: Path) -> None:
+    input_path = write_tiny_wav(tmp_path / "input.wav")
+    output_path = write_tiny_wav(tmp_path / "out.wav")
+    past = time.time() - 20
+    future = time.time() + 20
+    os.utime(output_path, (past, past))
+    os.utime(input_path, (future, future))
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        _ = kwargs
+        calls.append(command)
+        output_path.write_bytes(input_path.read_bytes())
+        return subprocess.CompletedProcess(command, 0, stdout="fresh", stderr="")
+
+    cfg = ProjectConfig(rvc_backend="command", rvc_command=["mock", "{input}", "{output}"])
+    client = RVCCommandClient(cfg.rvc_command, runner=runner, timeout_sec=5)
+
+    result = client.convert(
+        input_path,
+        output_path,
+        model_path=tmp_path / "model.pth",
+        index_path=None,
+        cfg=cfg,
+        profile=cfg.rvc_auto_profiles[0],
+        segment_id="seg_0001",
+    )
+
+    assert result.reused_existing is False
+    assert result.stdout == "fresh"
+    assert len(calls) == 1
 
 
 def test_batch_command_client_writes_jobs_and_reads_results(tmp_path: Path) -> None:
@@ -371,3 +407,75 @@ def test_batch_command_client_writes_jobs_and_reads_results(tmp_path: Path) -> N
     assert results["seg_0001"].returncode == 0
     assert results["seg_0001"].elapsed_sec == 1.25
     assert output_path.exists()
+
+
+def test_batch_command_client_only_reuses_outputs_fresh_for_inputs(tmp_path: Path) -> None:
+    fresh_input = write_tiny_wav(tmp_path / "fresh_input.wav")
+    fresh_output = write_tiny_wav(tmp_path / "fresh_output.wav")
+    stale_input = write_tiny_wav(tmp_path / "stale_input.wav")
+    stale_output = write_tiny_wav(tmp_path / "stale_output.wav")
+    now = time.time()
+    os.utime(fresh_input, (now - 20, now - 20))
+    os.utime(fresh_output, (now + 20, now + 20))
+    os.utime(stale_input, (now + 30, now + 30))
+    os.utime(stale_output, (now - 30, now - 30))
+
+    model_path = tmp_path / "model.pth"
+    index_path = tmp_path / "added.index"
+    model_path.write_bytes(b"model")
+    index_path.write_bytes(b"index")
+    cfg = ProjectConfig(rvc_backend="command", rvc_batch_command=["batch", "{jobs}", "{results}"])
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        _ = kwargs
+        jobs_path = Path(command[1])
+        results_path = Path(command[2])
+        rows = [json.loads(line) for line in jobs_path.read_text("utf-8").splitlines()]
+        assert [row["segment_id"] for row in rows] == ["seg_stale"]
+        with results_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                Path(row["output_path"]).write_bytes(Path(row["input_path"]).read_bytes())
+                handle.write(
+                    json.dumps(
+                        {
+                            "segment_id": row["segment_id"],
+                            "output_path": row["output_path"],
+                            "returncode": 0,
+                            "elapsed_sec": 2.5,
+                        }
+                    )
+                    + "\n"
+                )
+        return subprocess.CompletedProcess(command, 0, stdout="batch ok", stderr="")
+
+    client = RVCBatchCommandClient(cfg.rvc_batch_command, runner=runner)
+    results = client.convert_many(
+        [
+            RVCBatchJob(
+                segment_id="seg_fresh",
+                input_path=fresh_input,
+                output_path=fresh_output,
+                model_path=model_path,
+                index_path=index_path,
+                profile=cfg.rvc_auto_profiles[0],
+            ),
+            RVCBatchJob(
+                segment_id="seg_stale",
+                input_path=stale_input,
+                output_path=stale_output,
+                model_path=model_path,
+                index_path=index_path,
+                profile=cfg.rvc_auto_profiles[0],
+            ),
+        ],
+        jobs_path=tmp_path / "jobs.jsonl",
+        results_path=tmp_path / "results.jsonl",
+        model_path=model_path,
+        index_path=index_path,
+        cfg=cfg,
+        profile=cfg.rvc_auto_profiles[0],
+    )
+
+    assert results["seg_fresh"].reused_existing is True
+    assert results["seg_stale"].reused_existing is False
+    assert results["seg_stale"].elapsed_sec == 2.5
