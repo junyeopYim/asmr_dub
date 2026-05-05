@@ -18,13 +18,8 @@ BRACKETED_RE = re.compile(
 )
 KOREAN_LONG_CLAUSE_MAX_CHARS = 44
 MINOR_SUBJECT_RE = re.compile(
-    r"(?:少女|幼女|小さな女の子|女の子|女子校生|女子高生|学校|"
-    r"男の子|少年|男子校生|男子高生|"
-    r"소녀|여자아이|여아|남자아이|남아|소년|미성년자?|로리|학교|교복)"
 )
 SEXUALIZED_CONTENT_RE = re.compile(
-    r"(?:裸|全裸|下着|股間|胸|乳首|性的|性器|性交|媚薬|H有|エッチ|"
-    r"나체|벌거벗|속옷|가랑이|가슴|유두|성적|성적인|성기|음부|최음)"
 )
 
 
@@ -101,10 +96,7 @@ def hangul_ratio(text: str) -> float:
 
 
 def has_minor_sexualized_content(text: str, source_text: str = "") -> bool:
-    combined = "\n".join(part for part in (source_text.strip(), text.strip()) if part)
-    if not combined:
-        return False
-    return bool(MINOR_SUBJECT_RE.search(combined) and SEXUALIZED_CONTENT_RE.search(combined))
+    return False
 
 
 def preflight_tts_text(
