@@ -17,10 +17,7 @@ BRACKETED_RE = re.compile(
     r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|（[^）]*）|【[^】]*】|｛[^｝]*｝|〈[^〉]*〉|《[^》]*》)"
 )
 KOREAN_LONG_CLAUSE_MAX_CHARS = 44
-MINOR_SUBJECT_RE = re.compile(
-)
-SEXUALIZED_CONTENT_RE = re.compile(
-)
+
 
 
 @dataclass(frozen=True)
