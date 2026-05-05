@@ -72,6 +72,7 @@ from asmr_dub_pipeline.audio.separation import (
     SourceSeparationUnavailable,
     separate_source_audio,
 )
+from asmr_dub_pipeline.audio.training_filter import evaluate_voice_training_candidate
 from asmr_dub_pipeline.config import (
     create_project_structure,
     load_project_config,
@@ -168,6 +169,7 @@ from asmr_dub_pipeline.script.normalizer import normalize_korean_tts_text, norma
 from asmr_dub_pipeline.script.text_qc import preflight_tts_text
 from asmr_dub_pipeline.voice_bank import (
     apply_voice_bank_to_config,
+    assign_source_speakers_to_manifest,
     assign_speakers_to_manifest,
     load_voice_bank,
     resolve_voice_bank_path,
@@ -4323,10 +4325,46 @@ def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: boo
     if stale_manifest.exists():
         stale_manifest.unlink()
     rows: list[dict[str, str]] = []
+    rejected_rows: list[dict[str, Any]] = []
+    cfg = manifest.project_config
+    strict_training_filter = cfg.rvc_train_backend == "command"
     for segment in manifest.segments:
         if segment.status in SKIP_STATUSES:
+            rejected_rows.append(
+                {
+                    "segment_id": segment.id,
+                    "source_path": None,
+                    "reject_reasons": [f"skip_status:{segment.status}"],
+                }
+            )
             continue
-        source_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+        if strict_training_filter:
+            check = evaluate_voice_training_candidate(
+                project_dir,
+                segment,
+                cfg,
+                min_quality_score=cfg.rvc_train_min_quality_score,
+                require_source_script=False,
+                require_speaker_id=True,
+            )
+            if not check.accepted:
+                rejected_rows.append(
+                    {
+                        "segment_id": segment.id,
+                        "source_path": str(check.source_audio_path) if check.source_audio_path else None,
+                        "reject_reasons": list(check.reject_reasons),
+                        "quality_score": round(check.metrics.score, 6) if check.metrics else None,
+                        "quality_issues": list(check.metrics.issues) if check.metrics else [],
+                        "speaker_id": segment.speaker_id,
+                        "analysis_speaker_count": segment.analysis.get("speaker_count"),
+                    }
+                )
+                continue
+            if not check.source_audio_path:
+                raise RVCCommandError(f"train-rvc source segment audio is missing for {segment.id}")
+            source_path = check.source_audio_path
+        else:
+            source_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
         if not source_path.exists():
             raise RVCCommandError(f"train-rvc source segment audio is missing: {source_path}")
         output_path = dataset_dir / f"{segment.id}.wav"
@@ -4339,9 +4377,16 @@ def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: boo
         ):
             shutil.copy2(source_path, output_path)
         rows.append({"segment_id": segment.id, "source_path": str(source_path), "dataset_path": str(output_path)})
+    accepted_names = {f"{row['segment_id']}.wav" for row in rows}
+    for stale_wav in dataset_dir.glob("*.wav"):
+        if stale_wav.name not in accepted_names:
+            stale_wav.unlink()
     if not rows:
-        raise RVCCommandError("train-rvc requires at least one source segment audio file.")
-    write_json_atomic(project_dir / "work" / "rvc_train" / "dataset_manifest.json", {"segments": rows})
+        raise RVCCommandError("train-rvc requires at least one clean source voice segment audio file.")
+    write_json_atomic(
+        project_dir / "work" / "rvc_train" / "dataset_manifest.json",
+        {"segments": rows, "rejected_segments": rejected_rows},
+    )
     return dataset_dir, rows
 
 

@@ -502,6 +502,7 @@ class RVCConfig(StrictBaseModel):
     train_sample_rate: int = Field(default=48_000, ge=0)
     train_epochs: int = Field(default=20, ge=1)
     train_batch_size: int = Field(default=0, ge=0, le=64)
+    train_min_quality_score: float = Field(default=0.20, ge=0.0, le=1.0)
     train_preprocess_processes: int = Field(default=0, ge=0)
     train_f0_workers: int = Field(default=0, ge=0)
     train_feature_workers: int = Field(default=0, ge=0)
@@ -824,6 +825,7 @@ _RVC_FLAT_FIELDS = [
     "train_sample_rate",
     "train_epochs",
     "train_batch_size",
+    "train_min_quality_score",
     "train_preprocess_processes",
     "train_f0_workers",
     "train_feature_workers",

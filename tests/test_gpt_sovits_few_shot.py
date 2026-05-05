@@ -38,11 +38,13 @@ def _segment(project_dir: Path, segment_id: str, start: float, duration: float, 
     write_tiny_wav(audio, duration=duration)
     return Segment(
         id=segment_id,
+        speaker_id="speaker_0001",
         start=start,
         end=start + duration,
         duration=duration,
         audio_for_gemma=str(audio),
         audio_for_mix=str(audio.relative_to(project_dir)),
+        analysis={"speaker_count": 1},
         source_script=SourceScript(
             text=text,
             language="ja",
@@ -253,6 +255,9 @@ def test_python_missing_imports_rejects_wrong_ffmpeg_package(
 def test_few_shot_dataset_selects_source_segments(tmp_project_dir: Path) -> None:
     init_project(tmp_project_dir)
     manifest = _manifest_with_segments(tmp_project_dir, [1.0, 0.5, 1.4])
+    for segment in manifest.segments:
+        segment.speaker_id = "speaker_0001"
+        segment.analysis = {"speaker_count": 1}
     cfg = ProjectConfig(
         project_name="test",
         gsv_few_shot_target_sec=2.0,
@@ -274,6 +279,31 @@ def test_few_shot_dataset_selects_source_segments(tmp_project_dir: Path) -> None
     assert qc["clips"][0]["source_language"] == "ja"
     assert qc["clips"][0]["target_language"] == "ko"
     assert qc["clips"][0]["quality_score"] > 0
+
+
+def test_few_shot_dataset_filters_effected_and_multi_speaker_segments(tmp_project_dir: Path) -> None:
+    init_project(tmp_project_dir)
+    manifest = _manifest_with_segments(tmp_project_dir, [1.0, 1.0, 1.2, 1.2])
+    clean_one, effected, clean_two, multi_speaker = manifest.segments
+    for segment in manifest.segments:
+        segment.speaker_id = "speaker_0001"
+        segment.analysis = {"speaker_count": 1}
+    effected.analysis = {"speaker_count": 1, "style_tags": ["whisper", "reverb"]}
+    multi_speaker.analysis = {"speaker_count": 2}
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_few_shot_target_sec=2.0,
+        gsv_few_shot_min_clip_sec=1.0,
+        gsv_few_shot_max_clip_sec=10.0,
+    )
+
+    dataset = build_training_dataset(tmp_project_dir, manifest, cfg)
+
+    assert [item.segment_id for item in dataset.items] == [clean_one.id, clean_two.id]
+    qc = json.loads((tmp_project_dir / "work/gpt_sovits/few_shot/source_clip_qc.json").read_text("utf-8"))
+    rejected = {clip["segment_id"]: clip["reject_reasons"] for clip in qc["clips"] if not clip["selected_for_training"]}
+    assert rejected[effected.id] == ["disallowed_training_tag:reverb"]
+    assert rejected[multi_speaker.id] == ["speaker_count_not_one:2"]
 
 
 def test_few_shot_dataset_rejects_too_little_source_voice(tmp_project_dir: Path) -> None:

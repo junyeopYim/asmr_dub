@@ -18,6 +18,7 @@ from asmr_dub_pipeline.pipeline.stages.analyze import run_analyze_stage
 from asmr_dub_pipeline.pipeline.stages.script import run_script_stage
 from asmr_dub_pipeline.pipeline.stages.translate_ko import run_translate_ko_stage
 from asmr_dub_pipeline.pipeline.stages.korean_script import run_korean_script_stage
+from asmr_dub_pipeline.pipeline.stages.source_speakers import run_source_speakers_stage
 from asmr_dub_pipeline.pipeline.stages.speaker_assignment import run_assign_speakers_stage
 from asmr_dub_pipeline.pipeline.stages.voice_refs import run_prepare_source_voice_refs_stage
 from asmr_dub_pipeline.pipeline.stages.gsv_few_shot import run_gsv_few_shot_stage
@@ -47,6 +48,7 @@ from asmr_dub_pipeline.pipeline.stages import rvc_train as _rvc_train_stage
 from asmr_dub_pipeline.pipeline.stages import script as _script_stage
 from asmr_dub_pipeline.pipeline.stages import segment as _segment_stage
 from asmr_dub_pipeline.pipeline.stages import source_separation as _source_separation_stage
+from asmr_dub_pipeline.pipeline.stages import source_speakers as _source_speakers_stage
 from asmr_dub_pipeline.pipeline.stages import speaker_assignment as _speaker_assignment_stage
 from asmr_dub_pipeline.pipeline.stages import synth_gpt_sovits as _synth_gpt_sovits_stage
 from asmr_dub_pipeline.pipeline.stages import synth_qwen as _synth_qwen_stage
@@ -91,6 +93,10 @@ def translate_ko_step(project_dir: Path, gemma_text_backend: str | None = None, 
 def korean_script_step(project_dir: Path, confirm_rights: bool = False) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
     return run_korean_script_stage(ctx, confirm_rights)
+
+def source_speakers_step(project_dir: Path, backend_kind: str | None = None, confirm_rights: bool = False) -> PipelineManifest:
+    ctx = PipelineContext.load(project_dir)
+    return run_source_speakers_stage(ctx, backend_kind, confirm_rights)
 
 def assign_speakers_step(project_dir: Path, voice_bank_path: Path | None = None, backend_kind: str | None = None, require_all: bool = True) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -145,7 +151,7 @@ def export_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> Pi
     return run_export_stage(ctx, input_path, confirm_rights)
 
 
-_COMPAT_MODULES = (_common_stage, _analyze_stage, _experimental_tts_stage, _export_stage, _extract_stage, _gsv_few_shot_stage, _korean_script_stage, _mix_stage, _project_stage, _qc_stage, _regenerate_stage, _rvc_stage, _rvc_train_stage, _script_stage, _segment_stage, _source_separation_stage, _speaker_assignment_stage, _synth_gpt_sovits_stage, _synth_qwen_stage, _transcribe_stage, _translate_ko_stage, _voice_bank_cache_stage, _voice_refs_stage,)
+_COMPAT_MODULES = (_common_stage, _analyze_stage, _experimental_tts_stage, _export_stage, _extract_stage, _gsv_few_shot_stage, _korean_script_stage, _mix_stage, _project_stage, _qc_stage, _regenerate_stage, _rvc_stage, _rvc_train_stage, _script_stage, _segment_stage, _source_separation_stage, _source_speakers_stage, _speaker_assignment_stage, _synth_gpt_sovits_stage, _synth_qwen_stage, _transcribe_stage, _translate_ko_stage, _voice_bank_cache_stage, _voice_refs_stage,)
 
 class _StepsCompatModule(types.ModuleType):
     def __setattr__(self, name: str, value: object) -> None:

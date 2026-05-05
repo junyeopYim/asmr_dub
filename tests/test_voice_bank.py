@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from asmr_dub_pipeline.schemas import (
 from asmr_dub_pipeline.voice_bank import (
     DiarizationTurn,
     VoiceBankError,
+    assign_source_speakers_to_manifest,
     assign_speakers_to_manifest,
     build_voice_bank,
     cluster_turns,
@@ -242,6 +244,63 @@ def test_pyannote_tf32_flags_are_disabled_before_cuda_inference() -> None:
     assert FakeTorch.backends.cudnn.allow_tf32 is False
 
 
+def test_pyannote_from_pretrained_falls_back_for_legacy_token_keyword() -> None:
+    class LegacyLoader:
+        calls: list[dict[str, object]] = []
+
+        @classmethod
+        def from_pretrained(cls, model_id: str, **kwargs: object) -> str:
+            _ = model_id
+            cls.calls.append(kwargs)
+            if "token" in kwargs:
+                raise TypeError("from_pretrained() got an unexpected keyword argument 'token'")
+            return "loaded"
+
+    result = voice_bank_manager._pyannote_from_pretrained(
+        LegacyLoader,
+        "pyannote/legacy",
+        token="hf-token",
+    )
+
+    assert result == "loaded"
+    assert LegacyLoader.calls == [
+        {"token": "hf-token", "cache_dir": str(voice_bank_manager._hf_hub_cache())},
+        {"use_auth_token": "hf-token"},
+    ]
+
+
+def test_pyannote_from_pretrained_does_not_hide_internal_typeerror() -> None:
+    class BrokenLoader:
+        calls = 0
+
+        @classmethod
+        def from_pretrained(cls, model_id: str, **kwargs: object) -> str:
+            _ = model_id, kwargs
+            cls.calls += 1
+            raise TypeError("weights_only must be a supertype of typing.Optional[bool]")
+
+    with pytest.raises(TypeError, match="weights_only"):
+        voice_bank_manager._pyannote_from_pretrained(BrokenLoader, "pyannote/broken", token=None)
+
+    assert BrokenLoader.calls == 1
+
+
+def test_pyannote_optional_nemo_block_restores_existing_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_nemo = object()
+    fake_collection = object()
+    monkeypatch.setitem(sys.modules, "nemo", fake_nemo)
+    monkeypatch.setitem(sys.modules, "nemo.collections", fake_collection)
+
+    with voice_bank_manager._block_broken_pyannote_optional_nemo():
+        assert sys.modules["nemo"] is None
+        assert "nemo.collections" not in sys.modules
+
+    assert sys.modules["nemo"] is fake_nemo
+    assert sys.modules["nemo.collections"] is fake_collection
+
+
 def test_embedding_crop_bounds_expands_short_turn_to_stable_window(tiny_wav_path: Path) -> None:
     start, end = voice_bank_manager._embedding_crop_bounds(tiny_wav_path, 0.02, 0.05)
 
@@ -445,6 +504,125 @@ def test_pyannote_embedding_assignment_requires_configured_threshold(
     assigned = assign_speakers_to_manifest(tmp_project_dir, manifest, bank, backend_kind="pyannote")
 
     assert assigned.segments[0].speaker_id == "speaker_0001"
+
+
+def test_source_speaker_assignment_marks_clean_and_overlapped_segments(
+    tmp_project_dir: Path,
+    tiny_wav_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_project_dir / "work" / "audio" / "source_vocals_48k.wav"
+    write_tiny_wav(audio_path, duration=2.0)
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(diarization_embedding_match_threshold=0.78),
+        source_info=SourceInfo(
+            path=str(tiny_wav_path.resolve()),
+            duration_sec=2.0,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+        ),
+        artifacts={"source_vocals_48k": str(audio_path)},
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0.0,
+                end=0.7,
+                duration=0.7,
+                audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+            ),
+            Segment(
+                id="seg_0002",
+                start=1.3,
+                end=2.0,
+                duration=0.7,
+                audio_for_gemma="work/segments/audio/seg_0002_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0002_mix.wav",
+            ),
+            Segment(
+                id="seg_0003",
+                start=0.8,
+                end=1.2,
+                duration=0.4,
+                audio_for_gemma="work/segments/audio/seg_0003_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0003_mix.wav",
+            ),
+        ],
+    )
+
+    class TwoSpeakerBackend:
+        def diarize(self, audio_path: Path, source_id: str, cfg: ProjectConfig) -> list[DiarizationTurn]:
+            _ = cfg
+            return [
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="A",
+                    start=0.0,
+                    end=1.0,
+                    embedding=np.array([1.0, 0.0], dtype=np.float32),
+                ),
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="B",
+                    start=1.0,
+                    end=2.0,
+                    embedding=np.array([0.0, 1.0], dtype=np.float32),
+                ),
+            ]
+
+    monkeypatch.setattr(voice_bank_manager, "create_diarization_backend", lambda kind, cfg: TwoSpeakerBackend())
+
+    assigned = assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote")
+
+    assert assigned.segments[0].speaker_id == "speaker_0001"
+    assert assigned.segments[1].speaker_id == "speaker_0002"
+    overlapped = assigned.segments[2]
+    assert overlapped.speaker_id is None
+    assert overlapped.analysis["speaker_count"] == 2
+    assert overlapped.analysis["voice_training"] == {
+        "exclude": True,
+        "reason": "multi_speaker_overlap",
+    }
+
+
+def test_source_speakers_cli_invokes_stage(
+    cli_runner,
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_source_speakers_step(project_dir: Path, backend_kind: str | None = None, confirm_rights: bool = False):
+        seen["project_dir"] = project_dir
+        seen["backend_kind"] = backend_kind
+        seen["confirm_rights"] = confirm_rights
+        return PipelineManifest(stage_state={"source-speakers": {"assigned_segments": 1}})
+
+    monkeypatch.setattr(cli_module, "source_speakers_step", fake_source_speakers_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "source-speakers",
+            "--project",
+            str(tmp_project_dir),
+            "--backend",
+            "mock",
+            "--confirm-rights",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen == {
+        "project_dir": tmp_project_dir.resolve(),
+        "backend_kind": "mock",
+        "confirm_rights": True,
+    }
+    assert "Source speaker assignment complete" in result.output
 
 
 def test_pyannote_model_resolution_uses_local_cache_then_download(

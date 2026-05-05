@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ from asmr_dub_pipeline.schemas import (
     RVCMetadata,
     RVCSpeakerConfig,
     Segment,
+    SourceScript,
     TTSMetadata,
 )
 
@@ -48,6 +50,15 @@ def _segment_with_tts(project_dir: Path, duration: float = 1.0, segment_id: str 
         duration=duration,
         audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
         audio_for_mix=str(source_path.relative_to(project_dir)),
+        speaker_id="speaker_0001",
+        analysis={"speaker_count": 1},
+        source_script=SourceScript(
+            text="こんにちは。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=duration,
+        ),
         status="synthesized",
         script=JapaneseScript(ja_text="안녕하세요.", tts_text="안녕하세요.", tts_language="ko"),
         tts=TTSMetadata(selected_candidate_path=str(tts_path)),
@@ -226,6 +237,32 @@ def test_rvc_train_dataset_keeps_metadata_out_of_audio_directory(tmp_project_dir
     assert {path.suffix for path in dataset_dir.iterdir()} == {".wav"}
     assert not (dataset_dir / "dataset_manifest.json").exists()
     assert (tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").exists()
+
+
+def test_real_rvc_train_dataset_filters_effected_and_multi_speaker_segments(tmp_project_dir: Path) -> None:
+    clean = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    effected = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    effected.analysis = {"speaker_count": 1, "risk_flags": ["voice_effect"]}
+    multi_speaker = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0003")
+    multi_speaker.analysis = {"speaker_count": 2}
+    cfg = ProjectConfig()
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[clean, effected, multi_speaker],
+    )
+
+    dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert [row["segment_id"] for row in rows] == [clean.id]
+    assert {path.name for path in dataset_dir.iterdir()} == {f"{clean.id}.wav"}
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    rejected = {
+        item["segment_id"]: item["reject_reasons"]
+        for item in dataset_manifest["rejected_segments"]
+    }
+    assert rejected[effected.id] == ["disallowed_training_tag:voice_effect"]
+    assert rejected[multi_speaker.id] == ["speaker_count_not_one:2"]
 
 
 def test_duration_mismatch_triggers_next_retry_profile(tmp_project_dir: Path, monkeypatch) -> None:

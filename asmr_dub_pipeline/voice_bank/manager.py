@@ -5,9 +5,11 @@ import json
 import os
 import re
 import shutil
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 import yaml
@@ -60,6 +62,10 @@ class VoiceBankError(RuntimeError):
 
 _MIN_EMBEDDING_AUDIO_SEC = 0.05
 _MIN_EMBEDDING_CROP_SEC = 0.50
+_SOURCE_SPEAKER_MIN_OVERLAP_RATIO = 0.50
+_SOURCE_SPEAKER_MULTI_OVERLAP_RATIO = 0.20
+_MISSING = object()
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -137,22 +143,24 @@ class PyannoteDiarizationBackend:
             ) from exc
         _disable_pyannote_tf32(torch)
         try:
-            self.pipeline = Pipeline.from_pretrained(
-                diarization_model,
-                token=token,
-                cache_dir=str(_hf_hub_cache()),
-            )
-        except TypeError:  # pyannote 3.x compatibility
-            self.pipeline = Pipeline.from_pretrained(diarization_model, use_auth_token=token)
+            with _block_broken_pyannote_optional_nemo():
+                self.pipeline = _pyannote_from_pretrained(
+                    Pipeline,
+                    diarization_model,
+                    token=token,
+                )
         except Exception as exc:  # pragma: no cover - depends on local model access
             raise VoiceBankError(
                 "Unable to load pyannote diarization model. Accept model terms and set HF_TOKEN, "
                 f"or configure a local model path. model={diarization_model}"
             ) from exc
         try:
-            model = Model.from_pretrained(embedding_model, token=token, cache_dir=str(_hf_hub_cache()))
-        except TypeError:
-            model = Model.from_pretrained(embedding_model, use_auth_token=token)
+            with _block_broken_pyannote_optional_nemo():
+                model = _pyannote_from_pretrained(
+                    Model,
+                    embedding_model,
+                    token=token,
+                )
         except Exception as exc:  # pragma: no cover - depends on local model access
             raise VoiceBankError(
                 "Unable to load pyannote speaker embedding model. Accept model terms and set HF_TOKEN, "
@@ -256,6 +264,48 @@ def _disable_pyannote_tf32(torch_module: Any) -> None:
         return
 
 
+@contextmanager
+def _block_broken_pyannote_optional_nemo():
+    """Make pyannote treat NeMo as unavailable for non-NeMo speaker embeddings."""
+
+    saved_modules = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name == "nemo" or name.startswith("nemo.")
+    }
+    had_nemo = "nemo" in sys.modules
+    previous_nemo = sys.modules.get("nemo", _MISSING)
+    for name in saved_modules:
+        sys.modules.pop(name, None)
+    sys.modules["nemo"] = None
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name == "nemo" or name.startswith("nemo."):
+                sys.modules.pop(name, None)
+        if had_nemo:
+            sys.modules["nemo"] = previous_nemo
+        for name, module in saved_modules.items():
+            if name != "nemo":
+                sys.modules[name] = module
+
+
+def _pyannote_from_pretrained(cls: type[_T], model_id_or_path: str, *, token: str | None) -> _T:
+    loader = cls.from_pretrained
+    try:
+        return loader(model_id_or_path, token=token, cache_dir=str(_hf_hub_cache()))
+    except TypeError as exc:
+        if not _is_unexpected_keyword_error(exc, "token", "cache_dir"):
+            raise
+        return loader(model_id_or_path, use_auth_token=token)
+
+
+def _is_unexpected_keyword_error(exc: TypeError, *keywords: str) -> bool:
+    message = str(exc)
+    return any(f"unexpected keyword argument '{keyword}'" in message for keyword in keywords)
+
+
 def _embedding_crop_bounds(audio_path: Path, start: float, end: float) -> tuple[float, float]:
     source_duration = max(0.0, _audio_duration(audio_path))
     if source_duration <= 0.0:
@@ -289,7 +339,6 @@ def _ensure_hf_cache_env() -> None:
     hf_home.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(hf_home))
     os.environ.setdefault("HF_HUB_CACHE", str(hf_home / "hub"))
-    os.environ.setdefault("TRANSFORMERS_CACHE", str(hf_home / "transformers"))
 
 
 def _force_hf_offline_for_local_cache() -> None:
@@ -561,6 +610,102 @@ def assign_speakers_to_manifest(
         "speaker_count": len(bank.speakers),
     }
     return manifest
+
+
+def assign_source_speakers_to_manifest(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    backend_kind: str = "mock",
+) -> PipelineManifest:
+    cfg = manifest.project_config
+    audio_path = _source_speaker_audio_path(project_dir, manifest)
+    backend = create_diarization_backend(backend_kind, cfg) if backend_kind == "pyannote" else MockDiarizationBackend()
+    turns = backend.diarize(audio_path, "source", cfg)
+    cluster_turns(turns, threshold=cfg.diarization_embedding_match_threshold)
+    assigned = 0
+    excluded = 0
+    for segment in manifest.segments:
+        if segment.status in {"failed", "needs_manual_review"}:
+            continue
+        assignment = _source_speaker_assignment(segment, turns)
+        segment.analysis["speaker_count"] = assignment["speaker_count"]
+        segment.analysis["source_speaker_assignment"] = assignment
+        if assignment["speaker_count"] == 1 and assignment["speaker_id"]:
+            segment.speaker_id = str(assignment["speaker_id"])
+            assigned += 1
+            voice_training = dict(segment.analysis.get("voice_training") or {})
+            if voice_training.get("reason") in {"multi_speaker_overlap", "no_source_speaker_match"}:
+                voice_training.pop("exclude", None)
+                voice_training.pop("reason", None)
+            if voice_training:
+                segment.analysis["voice_training"] = voice_training
+            else:
+                segment.analysis.pop("voice_training", None)
+            continue
+        segment.speaker_id = None
+        excluded += 1
+        reason = "multi_speaker_overlap" if assignment["speaker_count"] > 1 else "no_source_speaker_match"
+        segment.analysis["voice_training"] = {"exclude": True, "reason": reason}
+    manifest.artifacts["source_speaker_audio"] = str(audio_path)
+    manifest.stage_state["source-speakers"] = {
+        "status": "completed",
+        "backend": backend_kind,
+        "turn_count": len(turns),
+        "assigned_segments": assigned,
+        "excluded_segments": excluded,
+    }
+    return manifest
+
+
+def _source_speaker_audio_path(project_dir: Path, manifest: PipelineManifest) -> Path:
+    for key in ("source_vocals_48k", "original_stereo_48k"):
+        raw_path = manifest.artifacts.get(key)
+        if raw_path:
+            path = _resolve_project_or_absolute(project_dir, raw_path)
+            if path.exists():
+                return path
+    if manifest.source_info:
+        path = Path(manifest.source_info.path).expanduser().resolve()
+        if path.exists():
+            return path
+    raise VoiceBankError("source-speakers requires source_vocals_48k, original_stereo_48k, or source_info.path.")
+
+
+def _source_speaker_assignment(segment: Segment, turns: list[DiarizationTurn]) -> dict[str, Any]:
+    overlaps: dict[str, float] = {}
+    for turn in turns:
+        if not turn.speaker_id:
+            continue
+        overlap = max(0.0, min(segment.end, turn.end) - max(segment.start, turn.start))
+        if overlap <= 0:
+            continue
+        overlaps[turn.speaker_id] = overlaps.get(turn.speaker_id, 0.0) + overlap
+    duration = max(segment.duration, 0.001)
+    active = {
+        speaker_id: overlap
+        for speaker_id, overlap in overlaps.items()
+        if overlap / duration >= _SOURCE_SPEAKER_MULTI_OVERLAP_RATIO
+    }
+    if not active:
+        return {
+            "speaker_id": None,
+            "speaker_count": 0,
+            "overlaps": {},
+            "dominant_overlap_ratio": 0.0,
+        }
+    speaker_id, overlap = max(active.items(), key=lambda item: (item[1], item[0]))
+    ratio = overlap / duration
+    speaker_count = len(active)
+    selected_speaker_id = (
+        speaker_id if speaker_count == 1 and ratio >= _SOURCE_SPEAKER_MIN_OVERLAP_RATIO else None
+    )
+    return {
+        "speaker_id": selected_speaker_id,
+        "speaker_count": speaker_count,
+        "overlaps": {key: round(value, 6) for key, value in sorted(active.items())},
+        "dominant_overlap_ratio": round(ratio, 6),
+    }
 
 
 def build_voice_bank(

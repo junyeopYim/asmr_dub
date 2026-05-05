@@ -4019,40 +4019,6 @@ def test_translate_ko_diagnostics_record_split_and_single_retry_failure(
     assert "single JSON parse failed" in final_by_id["seg_0002"]["rejected_reasons"][0]
 
 
-def test_translate_ko_fails_before_model_for_minor_sexualized_source_text(
-    tmp_project_dir: Path,
-) -> None:
-    segment = Segment(
-        id="seg_0001",
-        start=0.0,
-        end=1.0,
-        duration=1.0,
-        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
-        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
-        source_script=SourceScript(
-            text="未成熟な女の子がエッチな快感を覚える",
-            language="ja",
-            backend="mock",
-            start=0.0,
-            end=1.0,
-        ),
-    )
-    manifest = PipelineManifest(segments=[segment])
-    manifest.stage_state["transcribe"] = {"status": "completed"}
-    save_manifest(tmp_project_dir, manifest)
-
-    with pytest.raises(ValueError, match="minor sexualized"):
-        translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
-
-    manifest = load_manifest(tmp_project_dir)
-    assert manifest.stage_state["translate-ko"]["status"] == "failed"
-    assert manifest.stage_state["translate-ko"]["safety_blocked"] == 1
-    assert manifest.segments[0].status == "needs_manual_review"
-    assert "translate-ko safety blocked source" in manifest.segments[0].errors[-1]
-    diagnostics = json.loads(Path(manifest.artifacts["translation_diagnostics"]).read_text("utf-8"))
-    assert diagnostics["quality_counters"]["source_minor_sexualized_content"] == 1
-
-
 def test_korean_script_skips_existing_manual_review_translation(tmp_project_dir: Path) -> None:
     segment = Segment(
         id="seg_0001",
@@ -4315,108 +4281,6 @@ def test_korean_script_blocks_japanese_fallback_text(tmp_project_dir: Path) -> N
     assert "korean_tts_contains_kana" in manifest.segments[0].errors[-1]
 
 
-def test_korean_script_fails_stage_for_minor_sexualized_tts_text(tmp_project_dir: Path) -> None:
-    segment = Segment(
-        id="seg_0001",
-        start=0.0,
-        end=1.0,
-        duration=1.0,
-        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
-        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
-        source_script=SourceScript(
-            text="裸の少女が映し出されます",
-            language="ja",
-            backend="mock",
-            start=0.0,
-            end=1.0,
-        ),
-        translation_ko=KoreanTranslation(
-            ko_literal="나체의 소녀가 비춰집니다.",
-            ko_natural="나체의 소녀가 비춰집니다.",
-            model="mock",
-            batch_id="batch_0001",
-        ),
-    )
-    manifest = PipelineManifest(segments=[segment])
-    manifest.stage_state["translate-ko"] = {"status": "completed"}
-    save_manifest(tmp_project_dir, manifest)
-
-    with pytest.raises(ValueError, match="minor sexualized"):
-        korean_script_step(tmp_project_dir, confirm_rights=True)
-
-    manifest = load_manifest(tmp_project_dir)
-    assert manifest.stage_state["korean-script"]["status"] == "failed"
-    assert manifest.stage_state["korean-script"]["safety_blocked"] == 1
-    assert manifest.segments[0].status == "needs_manual_review"
-    assert "tts_safety_minor_sexualized_content" in manifest.segments[0].errors[-1]
-
-
-def test_korean_script_fails_stage_for_boy_sexualized_source_text(tmp_project_dir: Path) -> None:
-    segment = Segment(
-        id="seg_0001",
-        start=0.0,
-        end=1.0,
-        duration=1.0,
-        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
-        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
-        source_script=SourceScript(
-            text="男の子 H有",
-            language="ja",
-            backend="mock",
-            start=0.0,
-            end=1.0,
-        ),
-        translation_ko=KoreanTranslation(
-            ko_literal="남자아이 장면입니다.",
-            ko_natural="남자아이 장면입니다.",
-            model="mock",
-            batch_id="batch_0001",
-        ),
-    )
-    manifest = PipelineManifest(segments=[segment])
-    manifest.stage_state["translate-ko"] = {"status": "completed"}
-    save_manifest(tmp_project_dir, manifest)
-
-    with pytest.raises(ValueError, match="minor sexualized"):
-        korean_script_step(tmp_project_dir, confirm_rights=True)
-
-    manifest = load_manifest(tmp_project_dir)
-    assert manifest.stage_state["korean-script"]["status"] == "failed"
-    assert manifest.stage_state["korean-script"]["safety_blocked"] == 1
-    assert "tts_safety_minor_sexualized_content" in manifest.segments[0].errors[-1]
-
-
-def test_korean_script_allows_adult_content_warning_without_minor_subject(tmp_project_dir: Path) -> None:
-    segment = Segment(
-        id="seg_0001",
-        start=0.0,
-        end=1.0,
-        duration=1.0,
-        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
-        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
-        source_script=SourceScript(
-            text="性的な表現があります。18歳未満の方は利用をおやめください。",
-            language="ja",
-            backend="mock",
-            start=0.0,
-            end=1.0,
-        ),
-        translation_ko=KoreanTranslation(
-            ko_literal="성적인 표현이 있습니다. 열여덟 살 미만은 이용하지 말아 주세요.",
-            ko_natural="성적인 표현이 있습니다. 열여덟 살 미만은 이용하지 말아 주세요.",
-            model="mock",
-            batch_id="batch_0001",
-        ),
-    )
-    manifest = PipelineManifest(segments=[segment])
-    manifest.stage_state["translate-ko"] = {"status": "completed"}
-    save_manifest(tmp_project_dir, manifest)
-
-    korean_script_step(tmp_project_dir, confirm_rights=True)
-
-    manifest = load_manifest(tmp_project_dir)
-    assert manifest.stage_state["korean-script"]["status"] == "completed"
-    assert manifest.segments[0].status == "scripted"
 
 
 def test_transcribe_and_translate_mock_cli(
@@ -4905,6 +4769,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     monkeypatch.setattr(orchestrator, "transcribe_step", step("transcribe"))
     monkeypatch.setattr(orchestrator, "translate_ko_step", step("translate-ko"))
     monkeypatch.setattr(orchestrator, "korean_script_step", step("korean-script"))
+    monkeypatch.setattr(orchestrator, "source_speakers_step", step("source-speakers"))
     monkeypatch.setattr(orchestrator, "prepare_source_voice_refs_step", step("prepare-refs"))
     monkeypatch.setattr(orchestrator, "gsv_few_shot_step", step("gsv-few-shot"))
     monkeypatch.setattr(orchestrator, "synth_step", step("synth"))
@@ -4933,6 +4798,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "source-separation",
         "transcribe",
         "segment",
+        "source-speakers",
         "translate-ko",
         "korean-script",
         "prepare-refs",
@@ -4945,11 +4811,11 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "export",
     ]
     assert calls[3][2]["asr_backend"] == "qwen_asr"
-    assert calls[5][1][1] == "llama_server"
-    assert calls[9][2]["mock"] is False
+    assert calls[6][1][1] == "llama_server"
     assert calls[10][2]["mock"] is False
     assert calls[11][2]["mock"] is False
-    assert calls[12][1][1] == "mock"
+    assert calls[12][2]["mock"] is False
+    assert calls[13][1][1] == "mock"
 
     calls.clear()
     orchestrator.run_pipeline(

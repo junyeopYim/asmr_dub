@@ -15,12 +15,14 @@ from typing import Any
 
 import yaml
 
-from asmr_dub_pipeline.audio.quality import measure_source_voice_quality
+from asmr_dub_pipeline.audio.training_filter import (
+    VoiceTrainingCandidateCheck,
+    evaluate_voice_training_candidate,
+)
 from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSError
 from asmr_dub_pipeline.gpt_sovits.server import SHIM_DIR, _default_gsv_command
 from asmr_dub_pipeline.pipeline.manifest_io import write_json_atomic
 from asmr_dub_pipeline.rights import (
-    RightsError,
     ensure_inside_project,
     ensure_not_same_path,
     sha256_file,
@@ -81,6 +83,12 @@ class FewShotDataset:
 
 
 @dataclass(frozen=True)
+class FewShotTrainingSelection:
+    items: list[FewShotTrainingItem]
+    diagnostics: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class GPTSoVITSInstall:
     root: Path
     api_path: Path
@@ -128,16 +136,6 @@ FewShotProgressCallback = Callable[[FewShotTrainingProgress], None]
 
 def _project_path(project_dir: Path, *parts: str) -> Path:
     return ensure_inside_project(project_dir, project_dir.joinpath(*parts))
-
-
-def _resolve_project_read_path(project_dir: Path, raw_path: str, field_name: str) -> Path:
-    path = Path(raw_path).expanduser()
-    resolved = (project_dir / path).resolve() if not path.is_absolute() else path.resolve()
-    try:
-        resolved.relative_to(project_dir.resolve())
-    except ValueError as exc:
-        raise RightsError(f"{field_name} must stay inside the project directory: {resolved}") from exc
-    return resolved
 
 
 def _command_parts(command: Sequence[str] | str | None) -> list[str]:
@@ -417,21 +415,45 @@ def select_training_items(
     manifest: PipelineManifest,
     cfg: ProjectConfig,
 ) -> list[FewShotTrainingItem]:
+    return _select_training_items_with_diagnostics(project_dir, manifest, cfg).items
+
+
+def _select_training_items_with_diagnostics(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+) -> FewShotTrainingSelection:
     candidates: list[FewShotTrainingItem] = []
+    diagnostics: list[dict[str, Any]] = []
     source_language = _canonical_language(cfg.source_language)
     for segment in sorted(manifest.segments, key=lambda item: (item.start, item.id)):
-        if not _segment_is_training_candidate(segment, cfg):
+        check = evaluate_voice_training_candidate(
+            project_dir,
+            segment,
+            cfg,
+            min_quality_score=cfg.gsv_few_shot_min_quality_score,
+            require_source_script=True,
+            require_speaker_id=True,
+            source_language=source_language,
+        )
+        reject_reasons = [
+            *check.reject_reasons,
+            *_few_shot_duration_reject_reasons(segment, cfg),
+        ]
+        if reject_reasons or not check.source_audio_path or not check.metrics:
+            diagnostics.append(
+                _few_shot_diagnostic_row(
+                    segment,
+                    check,
+                    cfg,
+                    selected=False,
+                    reject_reasons=reject_reasons or ("missing_source_audio",),
+                )
+            )
             continue
-        source_audio_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
-        if not source_audio_path.exists():
-            continue
+        source_audio_path = check.source_audio_path
         text = segment.source_script.text.strip() if segment.source_script else ""
         language = segment.source_script.language if segment.source_script else cfg.asr_language
-        if _canonical_language(language) != source_language:
-            continue
-        metrics = measure_source_voice_quality(source_audio_path)
-        if metrics.score < cfg.gsv_few_shot_min_quality_score:
-            continue
         training_filename = f"{segment.id}.wav"
         candidates.append(
             FewShotTrainingItem(
@@ -441,8 +463,17 @@ def select_training_items(
                 text=text,
                 language=_canonical_language(language or cfg.asr_language),
                 duration_sec=segment.duration,
-                quality_score=metrics.score,
-                quality_issues=tuple(metrics.issues),
+                quality_score=check.metrics.score,
+                quality_issues=tuple(check.metrics.issues),
+            )
+        )
+        diagnostics.append(
+            _few_shot_diagnostic_row(
+                segment,
+                check,
+                cfg,
+                selected=False,
+                reject_reasons=("not_selected_target_reached",),
             )
         )
     items: list[FewShotTrainingItem] = []
@@ -454,19 +485,52 @@ def select_training_items(
             break
     if total < cfg.gsv_few_shot_target_sec:
         raise GPTSoVITSError(
-            "Not enough source voice data for GPT-SoVITS few-shot training: "
+            "Not enough source voice data for GPT-SoVITS few-shot training after clean-source filtering: "
             f"selected {total:.2f}s, need {cfg.gsv_few_shot_target_sec:.2f}s."
         )
-    return items
+    selected_ids = {item.segment_id for item in items}
+    normalized_diagnostics: list[dict[str, Any]] = []
+    for row in diagnostics:
+        if row["segment_id"] in selected_ids:
+            row = {**row, "selected_for_training": True, "reject_reasons": []}
+        normalized_diagnostics.append(row)
+    return FewShotTrainingSelection(items=items, diagnostics=normalized_diagnostics)
 
 
-def _segment_is_training_candidate(segment: Segment, cfg: ProjectConfig) -> bool:
-    return bool(
-        segment.source_script
-        and segment.source_script.text.strip()
-        and segment.audio_for_mix
-        and cfg.gsv_few_shot_min_clip_sec <= segment.duration <= cfg.gsv_few_shot_max_clip_sec
-    )
+def _few_shot_duration_reject_reasons(segment: Segment, cfg: ProjectConfig) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if segment.duration < cfg.gsv_few_shot_min_clip_sec:
+        reasons.append(f"duration_below_min:{segment.duration:.3f}<{cfg.gsv_few_shot_min_clip_sec:.3f}")
+    if segment.duration > cfg.gsv_few_shot_max_clip_sec:
+        reasons.append(f"duration_above_max:{segment.duration:.3f}>{cfg.gsv_few_shot_max_clip_sec:.3f}")
+    return tuple(reasons)
+
+
+def _few_shot_diagnostic_row(
+    segment: Segment,
+    check: VoiceTrainingCandidateCheck,
+    cfg: ProjectConfig,
+    *,
+    selected: bool,
+    reject_reasons: Sequence[str],
+) -> dict[str, Any]:
+    metrics = check.metrics
+    return {
+        "segment_id": segment.id,
+        "source_audio_path": str(check.source_audio_path) if check.source_audio_path else None,
+        "training_filename": f"{segment.id}.wav",
+        "language": _canonical_language(segment.source_script.language if segment.source_script else cfg.asr_language),
+        "duration_sec": round(segment.duration, 6),
+        "quality_score": round(metrics.score, 6) if metrics else None,
+        "quality_issues": list(metrics.issues) if metrics else [],
+        "source_language": cfg.source_language,
+        "target_language": cfg.target_language,
+        "cross_lingual_role": "ja_source_voice_for_ko_sovits_transfer",
+        "speaker_id": segment.speaker_id,
+        "analysis_speaker_count": segment.analysis.get("speaker_count"),
+        "selected_for_training": selected,
+        "reject_reasons": list(dict.fromkeys(reject_reasons)),
+    }
 
 
 def _canonical_language(value: str | None) -> str:
@@ -486,37 +550,26 @@ def build_training_dataset(
     wav_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "wavs")
     list_path = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "dataset.list")
     wav_dir.mkdir(parents=True, exist_ok=True)
-    items = select_training_items(project_dir, manifest, cfg)
+    selection = _select_training_items_with_diagnostics(project_dir, manifest, cfg)
+    items = selection.items
     lines: list[str] = []
     total = 0.0
-    qc_rows: list[dict[str, Any]] = []
     for item in items:
         target = wav_dir / item.training_filename
         ensure_not_same_path(item.source_audio_path, target)
         shutil.copy2(item.source_audio_path, target)
         lines.append(f"{item.training_filename}|source_voice|{item.language}|{item.text}")
         total += item.duration_sec
-        qc_rows.append(
-            {
-                "segment_id": item.segment_id,
-                "source_audio_path": str(item.source_audio_path),
-                "training_filename": item.training_filename,
-                "language": item.language,
-                "duration_sec": round(item.duration_sec, 6),
-                "quality_score": round(item.quality_score, 6),
-                "quality_issues": list(item.quality_issues),
-                "source_language": cfg.source_language,
-                "target_language": cfg.target_language,
-                "cross_lingual_role": "ja_source_voice_for_ko_sovits_transfer",
-                "selected_for_training": True,
-            }
-        )
+    selected_filenames = {item.training_filename for item in items}
+    for stale_wav in wav_dir.glob("*.wav"):
+        if stale_wav.name not in selected_filenames:
+            stale_wav.unlink()
     tmp = list_path.with_suffix(list_path.suffix + ".tmp")
     tmp.write_text("\n".join(lines) + "\n", "utf-8")
     os.replace(tmp, list_path)
     write_json_atomic(
         _project_path(project_dir, "work", "gpt_sovits", "few_shot", "source_clip_qc.json"),
-        {"clips": qc_rows},
+        {"clips": selection.diagnostics},
     )
     return FewShotDataset(items=items, wav_dir=wav_dir, list_path=list_path, total_duration_sec=total)
 

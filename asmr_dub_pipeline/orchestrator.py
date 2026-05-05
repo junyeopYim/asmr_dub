@@ -22,6 +22,7 @@ from .pipeline.steps import (
     segment_step,
     skip_rvc_train_for_voice_bank_step,
     source_separation_step,
+    source_speakers_step,
     synth_step,
     transcribe_step,
     translate_ko_step,
@@ -126,6 +127,8 @@ def run_pipeline(
                 backend_kind=None,
                 require_all=True,
             )
+        elif not mock:
+            source_speakers_step(project_dir, backend_kind="pyannote", confirm_rights=confirm_rights)
         translate_ko_step(project_dir, "mock" if mock else "llama_server")
         korean_script_step(project_dir)
         if not mock and not use_voice_bank:
@@ -151,6 +154,8 @@ def run_pipeline(
                 asr_batched_inference=asr_batched_inference,
                 asr_batch_size=asr_batch_size,
             )
+        if not use_voice_bank and not mock:
+            source_speakers_step(project_dir, backend_kind="pyannote", confirm_rights=confirm_rights)
         analyze_step(project_dir, gemma_backend)
         script_step(project_dir, gemma_backend)
         if use_few_shot:

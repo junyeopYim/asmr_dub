@@ -35,6 +35,7 @@ from .pipeline.steps import (
     script_step,
     segment_step,
     source_separation_step,
+    source_speakers_step,
     synth_experimental_tts_step,
     synth_qwen_step,
     synth_step,
@@ -159,7 +160,6 @@ def _configure_local_model_cache() -> list[str]:
     hf_cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(hf_cache))
     os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
-    os.environ.setdefault("TRANSFORMERS_CACHE", str(hf_cache / "transformers"))
     lines.append(f"HF cache: {hf_cache}")
     gemma_cache = hf_cache / "hub" / "models--google--gemma-4-E4B-it"
     lines.append(f"Gemma cache: {'found' if gemma_cache.exists() else 'missing'}")
@@ -1020,6 +1020,26 @@ def train_gsv(
     except Exception as exc:
         _handle_error(exc)
     console.print(f"GPT-SoVITS few-shot complete: {manifest.artifacts.get('gsv_few_shot_gpt_weights')}")
+
+
+@app.command(name="source-speakers")
+def source_speakers(
+    project: Path = typer.Option(..., "--project", "-p"),
+    backend: str = typer.Option("pyannote", "--backend", help="pyannote|mock"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+) -> None:
+    """Assign project-local speaker IDs from source diarization."""
+    try:
+        manifest = source_speakers_step(
+            project.expanduser().resolve(),
+            backend_kind=backend,
+            confirm_rights=confirm_rights,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Source speaker assignment complete: {manifest.stage_state.get('source-speakers')}")
 
 
 @app.command()
