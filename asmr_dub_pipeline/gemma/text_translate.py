@@ -352,8 +352,7 @@ def build_translate_ko_prompt(
         "삼 or 공; quantities, years, ordinals, time, and measurements should use the idiomatic "
         "Korean form for that context. Never leave raw digits. Translate the full source text "
         "without summarizing or dropping clauses. Preserve ASMR domain terms: translate 媚薬 as "
-        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 "
-        "hypnosis audio without reversing it into content for minors.\n"
+        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -374,8 +373,7 @@ def build_literal_translate_prompt(
         "first for adjacent-segment context, but keep exactly one output item per input "
         "segment_id; do not merge, split, omit, duplicate, or move content between segment_ids. "
         "Preserve all clauses without summary. Preserve ASMR domain terms: translate 媚薬 as "
-        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 "
-        "hypnosis audio without reversing it into content for minors.\n"
+        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -412,8 +410,7 @@ def build_naturalize_ko_prompt(
         "only for continuity of names, pronouns, register, and tone. Keep exactly one output item "
         "per input segment_id; do not merge, split, omit, duplicate, or move content between "
         "segment_ids. Preserve ASMR domain terms: translate 媚薬 as 미약, 최음제, or 흥분제, "
-        "never 변비약; translate 18禁催眠音声 as adult/십팔금 hypnosis audio without reversing "
-        "it into content for minors.\n"
+        "never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 

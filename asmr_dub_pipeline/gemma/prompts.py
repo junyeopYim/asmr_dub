@@ -49,7 +49,6 @@ RETRY_POLICY_CONTRACT = (
 def analysis_prompt(segment: Segment, context: Mapping[str, Any] | None = None) -> str:
     return f"""{STRICT_JSON_LINE}
 Analyze this ASMR audio segment for speech, translation, timing, style, spatial position, and risks.
-{SAFETY_LINE}
 {STYLE_ENUMS}
 {NONVERBAL_CUE_CONTRACT}
 Required keys: source_language, transcript_original, literal_ja, speech_style, speaker_count, emotion, pace, volume, nonverbal_cues, spatial_style, style_tags, estimated_pan, keep_original_texture, risk_flags, confidence.
@@ -61,7 +60,6 @@ Context: {dict(context or {})}
 def script_prompt(segment: Segment, analysis: Mapping[str, Any], context: Mapping[str, Any] | None = None) -> str:
     return f"""{STRICT_JSON_LINE}
 Generate gentle Japanese ASMR dubbing text for GPT-SoVITS.
-{SAFETY_LINE}
 {STYLE_ENUMS}
 {NONVERBAL_CUE_CONTRACT}
 {RETRY_POLICY_CONTRACT}
@@ -76,7 +74,6 @@ Context: {dict(context or {})}
 def qc_prompt(segment: Segment, target_text: str, context: Mapping[str, Any] | None = None) -> str:
     return f"""{STRICT_JSON_LINE}
 Quality-check the synthesized Japanese ASMR audio against the target text and style.
-{SAFETY_LINE}
 Required keys: text_match_score, pronunciation_score, asmr_style_score, timing_score, repetition_detected, omission_detected, unsafe_or_rights_issue, recommendation, issues.
 recommendation must be one of: pass, regenerate, manual_review. If timing fails because the synthesized audio is too long, add issue "duration_too_long" so the script retry_policy can request a shorter script. If repetition_detected or omission_detected is true, prefer recommendation="regenerate" unless there is a rights or safety issue.
 Segment: id={segment.id}, duration={segment.duration}.
