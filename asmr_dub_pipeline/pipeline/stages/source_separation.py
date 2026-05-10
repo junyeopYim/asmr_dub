@@ -6,6 +6,42 @@ from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
 
 
+def _folder_mix_part_paths(manifest: PipelineManifest) -> list[Path]:
+    folder_input = manifest.source_info.raw.get("folder_input") if manifest.source_info else None
+    if not isinstance(folder_input, dict):
+        return []
+    raw_parts = folder_input.get("mix_parts")
+    if not isinstance(raw_parts, list):
+        return []
+    paths: list[Path] = []
+    for raw_part in raw_parts:
+        if isinstance(raw_part, dict) and raw_part.get("path"):
+            paths.append(Path(str(raw_part["path"])).expanduser().resolve())
+    return paths
+
+
+def _source_separation_part_clip_inputs(metadata_path: Path) -> list[dict[str, Any]]:
+    if not metadata_path.exists():
+        return []
+    try:
+        metadata = json.loads(metadata_path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(metadata, dict) or not metadata.get("partwise"):
+        return []
+    raw_parts = metadata.get("parts")
+    if not isinstance(raw_parts, list):
+        return []
+    parts: list[dict[str, Any]] = []
+    for raw_part in raw_parts:
+        if not isinstance(raw_part, dict):
+            continue
+        if not raw_part.get("vocals_mono_path") or not raw_part.get("vocals_path"):
+            continue
+        parts.append(dict(raw_part))
+    return parts
+
+
 def run_source_separation_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
@@ -22,6 +58,7 @@ def run_source_separation_stage(ctx: PipelineContext, confirm_rights: bool = Fal
     original_audio = Path(
         manifest.artifacts.get("original_stereo_48k", project_dir / "work/audio/original_stereo_48k.wav")
     )
+    input_part_paths = _folder_mix_part_paths(manifest)
     if backend == "none":
         mark_stage(manifest, "source-separation", "skipped", backend=backend, reason="disabled")
         save_manifest(project_dir, manifest)
@@ -31,6 +68,7 @@ def run_source_separation_stage(ctx: PipelineContext, confirm_rights: bool = Fal
         result = separate_source_audio(
             original_audio,
             project_dir,
+            input_part_paths=input_part_paths,
             backend=backend,
             model=cfg.source_separation_model,
             device=cfg.source_separation_device,
@@ -64,6 +102,7 @@ def run_source_separation_stage(ctx: PipelineContext, confirm_rights: bool = Fal
 
     resliced_segments = 0
     if manifest.segments:
+        part_clip_inputs = _source_separation_part_clip_inputs(result.metadata_path)
         started_at = monotonic()
         last_logged_at = started_at
 
@@ -79,13 +118,21 @@ def run_source_separation_stage(ctx: PipelineContext, confirm_rights: bool = Fal
                 last_logged_at,
             )
 
-        write_segment_audio_clips(
-            manifest.segments,
-            result.vocals_mono_path,
-            result.vocals_path,
-            project_dir,
-            progress_callback=log_reslice_progress,
-        )
+        if part_clip_inputs:
+            write_segment_audio_clips_from_parts(
+                manifest.segments,
+                part_clip_inputs,
+                project_dir,
+                progress_callback=log_reslice_progress,
+            )
+        else:
+            write_segment_audio_clips(
+                manifest.segments,
+                result.vocals_mono_path,
+                result.vocals_path,
+                project_dir,
+                progress_callback=log_reslice_progress,
+            )
         resliced_segments = len(manifest.segments)
         out_path = project_dir / "work" / "segments" / "manifests" / "segments_source_separated.json"
         write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})

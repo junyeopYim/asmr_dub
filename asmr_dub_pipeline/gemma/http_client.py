@@ -13,7 +13,7 @@ from asmr_dub_pipeline.schemas import Segment
 from .base import GemmaBackend, GemmaHTTPError, GemmaResponseParseError
 from .json_repair import JSONRepairError
 from .parser import parse_gemma_task_response
-from .prompts import analysis_prompt, qc_prompt, repair_prompt, script_prompt
+from .prompts import analysis_prompt, audio_style_prompt, qc_prompt, repair_prompt, script_prompt
 from .schemas import TaskName
 
 
@@ -108,6 +108,9 @@ class HTTPGemmaBackend(GemmaBackend):
 
     def analyze_segment(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
         return self._post("analyze", analysis_prompt(segment, context), audio_path, segment, context)
+
+    def analyze_audio_style(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
+        return self._post("audio_style", audio_style_prompt(segment), audio_path, segment, context)
 
     def generate_script(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
         return self._post(

@@ -40,6 +40,19 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
             else Path(segment.tts.selected_candidate_path)
         )
         audio_metrics = measure_audio_qc(audio_path, segment.duration)
+        selected_candidate = next(
+            (candidate for candidate in segment.tts.candidates if candidate.selected),
+            None,
+        )
+        pause_padding = (
+            selected_candidate.payload.get("pause_padding")
+            if selected_candidate is not None
+            else None
+        )
+        if isinstance(pause_padding, dict) and pause_padding.get("tier") == "source_pause_padding":
+            padding_sec = float(pause_padding.get("padding_sec") or 0.0)
+            if padding_sec > 0.0:
+                audio_metrics["intentional_trailing_silence_sec"] = padding_sec
         try:
             gemma_result = validate_gemma_task_response(
                 "qc",

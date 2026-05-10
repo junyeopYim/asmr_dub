@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import asmr_dub_pipeline.audio.features as features
 from asmr_dub_pipeline.audio.features import (
     duration_sec,
     leading_trailing_silence,
@@ -22,6 +23,28 @@ def test_audio_features_and_qc(tiny_wav_path) -> None:
     metrics = measure_audio_qc(tiny_wav_path, target_duration_sec=1.0)
     qc = score_qc(metrics, {"recommendation": "pass"})
     assert qc.status in {"ok", "needs_regeneration"}
+
+
+def test_audio_qc_metrics_stream_without_full_audio_load(monkeypatch, tmp_path) -> None:
+    sr = 16_000
+    tone = np.sin(2 * np.pi * 220.0 * np.arange(int(sr * 0.4), dtype=np.float32) / sr) * 0.05
+    path = tmp_path / "qc.wav"
+    write_audio(path, tone[:, None], sr)
+
+    def forbidden_load_audio(path):
+        raise AssertionError(f"QC metrics should not load full audio arrays: {path}")
+
+    monkeypatch.setattr(features, "load_audio", forbidden_load_audio)
+
+    assert features.peak_dbfs(path) < 0
+    assert features.rms_dbfs(path) < 0
+    assert features.clipping_ratio(path) == 0.0
+    leading, trailing = features.leading_trailing_silence(path)
+    assert leading == 0.0
+    assert trailing == 0.0
+    metrics = measure_audio_qc(path, target_duration_sec=0.4)
+    assert metrics["duration_sec"] == duration_sec(path)
+    assert metrics["clipping_ratio"] == 0.0
 
 
 def test_qc_manual_review_not_downgraded(tiny_wav_path) -> None:

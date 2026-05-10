@@ -34,6 +34,10 @@ _FOLDER_ASR_CLEAN_TOKENS = (
     "se無し",
     "seなし",
     "se無",
+    "off_se",
+    "offse",
+    "se_off",
+    "seoff",
     "音無し",
     "音なし",
     "音無",
@@ -41,6 +45,27 @@ _FOLDER_ASR_CLEAN_TOKENS = (
     "nose",
     "without_se",
     "without se",
+)
+_FOLDER_EFFECT_VARIANT_PATH_TOKENS = (
+    "effect_on",
+    "effect on",
+    "effects_on",
+    "effects on",
+    "ef_on",
+    "on_ef",
+    "se_on",
+    "seあり",
+    "se有",
+    "効果音あり",
+    "効果音有",
+)
+_FOLDER_EFFECT_VARIANT_SUFFIX_RE = re.compile(
+    r"(?:[_\-\s]*(?:"
+    r"off[_\-\s]*se|se[_\-\s]*off|no[_\-\s]*se|without[_\-\s]*se|"
+    r"on[_\-\s]*(?:ef|effect)|(?:ef|effect)[_\-\s]*on|"
+    r"se[_\-\s]*on|seあり|se有|効果音なし|効果音無し|効果音あり|効果音有"
+    r"))+$",
+    re.IGNORECASE,
 )
 _FOLDER_EXCLUDE_TOKENS = (
     "readme",
@@ -147,6 +172,7 @@ class FolderInputPlan:
     status: str
     reason: str
     asr_source_status: str
+    asr_silent_parts: tuple[Path, ...] = ()
 
     @property
     def should_prepare(self) -> bool:
@@ -258,6 +284,112 @@ def _group_media_by_parent(input_path: Path, files: tuple[Path, ...]) -> dict[Pa
     }
 
 
+def _is_clean_asr_group(group_key: Path) -> bool:
+    return _contains_any(_path_text(group_key), _FOLDER_ASR_CLEAN_TOKENS)
+
+
+def _folder_group_label(group_key: Path) -> str:
+    text = str(group_key)
+    return "." if text == "." else text
+
+
+def _folder_mix_groups(groups: dict[Path, tuple[Path, ...]]) -> tuple[tuple[Path, tuple[Path, ...]], ...]:
+    non_clean = [
+        (key, parts)
+        for key, parts in groups.items()
+        if not _is_clean_asr_group(key)
+    ]
+    selected = non_clean or list(groups.items())
+    return tuple(sorted(selected, key=lambda item: _natural_path_key(item[0])))
+
+
+def _folder_asr_duplicate_key(input_path: Path, media_path: Path) -> str:
+    try:
+        relative = media_path.resolve().relative_to(input_path.resolve())
+    except ValueError:
+        relative = media_path
+    parent_parts = [
+        unicodedata.normalize("NFKC", part.lower())
+        for part in relative.parent.parts
+        if not _contains_any(part, _FOLDER_EFFECT_VARIANT_PATH_TOKENS)
+    ]
+    stem = unicodedata.normalize("NFKC", media_path.stem.lower())
+    previous = None
+    while previous != stem:
+        previous = stem
+        stem = _FOLDER_EFFECT_VARIANT_SUFFIX_RE.sub("", stem).strip(" _-.")
+    return "/".join([*parent_parts, stem])
+
+
+def _folder_asr_duplicate_score(input_path: Path, media_path: Path) -> tuple[float, tuple[object, ...]]:
+    try:
+        relative = media_path.resolve().relative_to(input_path.resolve())
+    except ValueError:
+        relative = media_path
+    text = _path_text(relative)
+    score = 0.0
+    if _contains_any(text, _FOLDER_ASR_CLEAN_TOKENS):
+        score += 80.0
+    if _contains_any(text, _FOLDER_EFFECT_VARIANT_PATH_TOKENS):
+        score -= 60.0
+    stripped_stem = _FOLDER_EFFECT_VARIANT_SUFFIX_RE.sub("", media_path.stem.lower()).strip(" _-.")
+    if stripped_stem == media_path.stem.lower():
+        score += 20.0
+    return score, _natural_path_key(media_path)
+
+
+def _folder_variant_duration_matches(reference: Path, candidate: Path) -> bool:
+    reference_duration = _probe_duration_or_zero(reference)
+    candidate_duration = _probe_duration_or_zero(candidate)
+    if reference_duration <= 0 or candidate_duration <= 0:
+        return False
+    delta = abs(reference_duration - candidate_duration)
+    return delta <= 2.0 or delta / max(reference_duration, candidate_duration) <= 0.03
+
+
+def _folder_asr_silent_duplicate_parts(input_path: Path, parts: tuple[Path, ...]) -> tuple[Path, ...]:
+    grouped: dict[str, list[Path]] = {}
+    for path in parts:
+        grouped.setdefault(_folder_asr_duplicate_key(input_path, path), []).append(path)
+    silent: list[Path] = []
+    for group in grouped.values():
+        if len(group) < 2:
+            continue
+        representative = max(group, key=lambda path: _folder_asr_duplicate_score(input_path, path))
+        for candidate in group:
+            if candidate != representative and _folder_variant_duration_matches(representative, candidate):
+                silent.append(candidate)
+    return tuple(sorted(silent, key=_natural_path_key))
+
+
+def _clean_asr_group_for_single_mix(
+    groups: dict[Path, tuple[Path, ...]],
+    mix_group_key: Path,
+    mix_parts: tuple[Path, ...],
+) -> tuple[Path, tuple[Path, ...]] | None:
+    clean_groups = {
+        key: parts
+        for key, parts in groups.items()
+        if key != mix_group_key and _is_clean_asr_group(key)
+    }
+    if not clean_groups:
+        return None
+    mix_duration = sum(_probe_duration_or_zero(path) for path in mix_parts)
+    asr_group_key, asr_parts = max(
+        clean_groups.items(),
+        key=lambda item: _score_asr_group(
+            item[0],
+            item[1],
+            mix_count=len(mix_parts),
+            mix_duration=mix_duration,
+        ),
+    )
+    asr_duration = sum(_probe_duration_or_zero(path) for path in asr_parts)
+    if len(asr_parts) == len(mix_parts) or not mix_duration or 0.75 <= asr_duration / mix_duration <= 1.25:
+        return asr_group_key, asr_parts
+    return None
+
+
 def plan_folder_input(input_path: Path) -> FolderInputPlan:
     input_path = input_path.expanduser().resolve()
     if not input_path.is_dir():
@@ -280,42 +412,46 @@ def plan_folder_input(input_path: Path) -> FolderInputPlan:
             asr_source_status="not_applicable",
         )
     groups = _group_media_by_parent(input_path, files)
-    mix_group_key, mix_parts = max(
-        groups.items(),
-        key=lambda item: _score_mix_group(item[0], item[1]),
-    )
-    mix_duration = sum(_probe_duration_or_zero(path) for path in mix_parts)
-    clean_groups = {
-        key: parts
-        for key, parts in groups.items()
-        if key != mix_group_key and _contains_any(_path_text(key), _FOLDER_ASR_CLEAN_TOKENS)
-    }
-    if clean_groups:
-        asr_group_key, asr_parts = max(
-            clean_groups.items(),
-            key=lambda item: _score_asr_group(
-                item[0],
-                item[1],
-                mix_count=len(mix_parts),
-                mix_duration=mix_duration,
-            ),
-        )
-        asr_duration = sum(_probe_duration_or_zero(path) for path in asr_parts)
-        if len(asr_parts) == len(mix_parts) or not mix_duration or 0.75 <= asr_duration / mix_duration <= 1.25:
+    mix_groups = _folder_mix_groups(groups)
+    mix_parts = tuple(path for _, parts in mix_groups for path in parts)
+    if len(mix_groups) == 1:
+        mix_group_key, group_mix_parts = mix_groups[0]
+        clean_asr_group = _clean_asr_group_for_single_mix(groups, mix_group_key, group_mix_parts)
+        if clean_asr_group is not None:
+            asr_group_key, asr_parts = clean_asr_group
             return FolderInputPlan(
                 requested_path=input_path,
-                mix_parts=tuple(mix_parts),
+                mix_parts=tuple(group_mix_parts),
                 asr_parts=tuple(asr_parts),
                 status="planned",
-                reason=f"Selected mix group '{mix_group_key}' and clean ASR group '{asr_group_key}'.",
+                reason=(
+                    f"Selected mix group '{_folder_group_label(mix_group_key)}' "
+                    f"and clean ASR group '{_folder_group_label(asr_group_key)}'."
+                ),
                 asr_source_status="separate_asr_parts",
             )
+    asr_silent_parts = _folder_asr_silent_duplicate_parts(input_path, mix_parts)
+    if asr_silent_parts:
+        labels = ", ".join(f"'{_folder_group_label(key)}'" for key, _ in mix_groups)
+        return FolderInputPlan(
+            requested_path=input_path,
+            mix_parts=mix_parts,
+            asr_parts=tuple(mix_parts),
+            status="planned",
+            reason=(
+                f"Selected {len(mix_groups)} mix group(s) and silenced "
+                f"{len(asr_silent_parts)} duplicate/effect variant(s) for ASR: {labels}."
+            ),
+            asr_source_status="mix_parts_silenced_duplicates",
+            asr_silent_parts=asr_silent_parts,
+        )
+    labels = ", ".join(f"'{_folder_group_label(key)}'" for key, _ in mix_groups)
     return FolderInputPlan(
         requested_path=input_path,
-        mix_parts=tuple(mix_parts),
+        mix_parts=mix_parts,
         asr_parts=tuple(mix_parts),
         status="planned",
-        reason=f"Selected mix group '{mix_group_key}' for both mix and ASR.",
+        reason=f"Selected {len(mix_groups)} mix group(s) for both mix and ASR: {labels}.",
         asr_source_status="mix_parts",
     )
 
@@ -331,9 +467,10 @@ def translate_media_stem_to_korean(stem: str) -> str:
     return translated or "part"
 
 
-def _part_metadata(parts: tuple[Path, ...]) -> list[dict[str, Any]]:
+def _part_metadata(parts: tuple[Path, ...], *, silent_parts: tuple[Path, ...] = ()) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     cursor = 0.0
+    silent_set = {path.resolve() for path in silent_parts}
     for index, path in enumerate(parts, start=1):
         info = probe_with_fallback(path)
         duration = float(info.duration_sec)
@@ -351,6 +488,7 @@ def _part_metadata(parts: tuple[Path, ...]) -> list[dict[str, Any]]:
                 "sample_rate": info.sample_rate,
                 "channels": info.channels,
                 "codec": info.codec,
+                "asr_silenced": path.resolve() in silent_set,
             }
         )
         cursor = end
@@ -364,7 +502,7 @@ def folder_input_metadata(
     asr_audio_path: Path,
 ) -> dict[str, Any]:
     mix_parts = _part_metadata(plan.mix_parts)
-    asr_parts = _part_metadata(plan.asr_parts)
+    asr_parts = _part_metadata(plan.asr_parts, silent_parts=plan.asr_silent_parts)
     total_duration = mix_parts[-1]["end_sec"] if mix_parts else 0.0
     return {
         "requested": True,
@@ -378,6 +516,8 @@ def folder_input_metadata(
         "part_count": len(mix_parts),
         "mix_parts": mix_parts,
         "asr_parts": asr_parts,
+        "asr_silent_part_count": len(plan.asr_silent_parts),
+        "asr_silent_parts": [str(path) for path in plan.asr_silent_parts],
         "total_part_duration_sec": total_duration,
     }
 
@@ -439,7 +579,50 @@ def _concat_or_convert_parts(
         import numpy as np
 
         write_audio(output_path, np.concatenate(clips, axis=0), sample_rate)
-        return output_path
+    return output_path
+
+
+def _concat_or_convert_parts_with_silence(
+    parts: tuple[Path, ...],
+    output_path: Path,
+    *,
+    sample_rate: int,
+    channels: int,
+    silent_parts: tuple[Path, ...] = (),
+) -> Path:
+    if not silent_parts:
+        return _concat_or_convert_parts(parts, output_path, sample_rate=sample_rate, channels=channels)
+    if not parts:
+        raise ValueError("At least one media file is required.")
+    try:
+        return ffmpeg.concat_audio_to_wav_with_silence(
+            list(parts),
+            output_path,
+            silent_paths=list(silent_parts),
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+    except ffmpeg.FFmpegError:
+        pass
+    import numpy as np
+
+    silent_set = {path.resolve() for path in silent_parts}
+    clips = []
+    for part in parts:
+        if part.resolve() in silent_set:
+            frames = max(1, int(round(_probe_duration_or_zero(part) * sample_rate)))
+            clips.append(np.zeros((frames, channels), dtype=np.float32))
+            continue
+        data, sr = load_audio(part)
+        if channels == 1:
+            converted = resample_linear(to_mono(data), sr, sample_rate)
+            if converted.ndim == 1:
+                converted = converted[:, None]
+        else:
+            converted = ensure_stereo(resample_linear(data, sr, sample_rate))
+        clips.append(converted.astype(np.float32, copy=False))
+    write_audio(output_path, np.concatenate(clips, axis=0), sample_rate)
+    return output_path
 
 
 def prepare_folder_input_audio(plan: FolderInputPlan, project_dir: Path) -> tuple[Path, Path]:
@@ -448,7 +631,13 @@ def prepare_folder_input_audio(plan: FolderInputPlan, project_dir: Path) -> tupl
     stereo = project_dir / "work" / "audio" / "original_stereo_48k.wav"
     mono = project_dir / "work" / "audio" / "gemma_mono_16k.wav"
     _concat_or_convert_parts(plan.mix_parts, stereo, sample_rate=48_000, channels=2)
-    _concat_or_convert_parts(plan.asr_parts, mono, sample_rate=16_000, channels=1)
+    _concat_or_convert_parts_with_silence(
+        plan.asr_parts,
+        mono,
+        sample_rate=16_000,
+        channels=1,
+        silent_parts=plan.asr_silent_parts,
+    )
     return stereo, mono
 
 

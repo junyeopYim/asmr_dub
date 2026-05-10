@@ -12,7 +12,7 @@ from asmr_dub_pipeline.schemas import Segment
 from .base import GemmaBackend, GemmaResponseParseError, GemmaUnavailableError
 from .json_repair import JSONRepairError
 from .parser import parse_gemma_task_response
-from .prompts import analysis_prompt, json_repair_prompt, qc_prompt, script_prompt
+from .prompts import analysis_prompt, audio_style_prompt, json_repair_prompt, qc_prompt, script_prompt
 from .schemas import TASK_REQUIRED_KEYS, TaskName
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -161,6 +161,9 @@ class LlamaCppGemmaBackend(GemmaBackend):
 
     def analyze_segment(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
         return self._generate(audio_path, analysis_prompt(segment, context), "analyze")
+
+    def analyze_audio_style(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
+        return self._generate(audio_path, audio_style_prompt(segment), "audio_style")
 
     def generate_script(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
         return self._generate(audio_path, script_prompt(segment, segment.analysis, context), "script")

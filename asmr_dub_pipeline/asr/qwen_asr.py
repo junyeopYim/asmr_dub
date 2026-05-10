@@ -8,7 +8,7 @@ import soundfile as sf
 
 from asmr_dub_pipeline.schemas import Segment
 
-from .base import ASRBackend, ASRChunk, ASRUnavailableError
+from .base import ASRBackend, ASRChunk, ASRUnavailableError, ASRWord
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -148,11 +148,27 @@ def _coalesce_qwen_timestamp_chunks(
     coalesced: list[ASRChunk] = []
     current: list[ASRChunk] = []
 
+    def chunk_words(chunk: ASRChunk) -> list[ASRWord]:
+        if chunk.words:
+            return chunk.words
+        text = chunk.text.strip()
+        if not text or chunk.end <= chunk.start:
+            return []
+        return [
+            ASRWord(
+                start=chunk.start,
+                end=chunk.end,
+                text=text,
+                confidence=chunk.confidence,
+            )
+        ]
+
     def flush() -> None:
         nonlocal current
         if not current:
             return
         text = _join_qwen_timestamp_text([chunk.text for chunk in current], language=language)
+        words = [word for chunk in current for word in chunk_words(chunk)]
         if text:
             coalesced.append(
                 ASRChunk(
@@ -161,6 +177,7 @@ def _coalesce_qwen_timestamp_chunks(
                     text=text,
                     language=current[0].language,
                     confidence=None,
+                    words=words,
                 )
             )
         current = []
@@ -205,9 +222,11 @@ class QwenASRBackend(ASRBackend):
         self.context = context
         self.max_inference_batch_size = max_inference_batch_size
         self.max_new_tokens = max_new_tokens
+        self._model: Any | None = None
 
-    def transcribe(self, audio_path: Path, segments: Sequence[Segment]) -> list[ASRChunk]:
-        _ = segments
+    def _load_model(self) -> Any:
+        if self._model is not None:
+            return self._model
         try:
             import torch
             from qwen_asr import Qwen3ASRModel
@@ -240,14 +259,21 @@ class QwenASRBackend(ASRBackend):
             local_files_only=self.local_files_only,
             label="model",
         )
+        self._model = Qwen3ASRModel.from_pretrained(model_path, **kwargs)
+        return self._model
+
+    def transcribe(self, audio_path: Path, segments: Sequence[Segment]) -> list[ASRChunk]:
+        _ = segments
         try:
-            model = Qwen3ASRModel.from_pretrained(model_path, **kwargs)
+            model = self._load_model()
             raw_results = model.transcribe(
                 audio=str(audio_path),
                 context=self.context,
                 language=_qwen_language(self.language),
                 return_time_stamps=self.return_timestamps,
             )
+        except ASRUnavailableError:
+            raise
         except Exception as exc:
             raise ASRUnavailableError(f"Qwen ASR transcription failed: {exc}") from exc
 
@@ -275,6 +301,14 @@ class QwenASRBackend(ASRBackend):
                             text=chunk_text,
                             language=language,
                             confidence=None,
+                            words=[
+                                ASRWord(
+                                    start=start_sec,
+                                    end=end_sec,
+                                    text=chunk_text,
+                                    confidence=None,
+                                )
+                            ],
                         )
                     )
             if result_chunks:

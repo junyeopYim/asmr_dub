@@ -6,7 +6,7 @@ from typing import Any
 
 from asmr_dub_pipeline.schemas import Segment
 
-from .base import ASRBackend, ASRChunk, ASRUnavailableError
+from .base import ASRBackend, ASRChunk, ASRUnavailableError, ASRWord
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,6 +49,45 @@ def _ctranslate2_snapshot_for_model(model_id: str) -> Path | None:
         if candidate is not None:
             return candidate
     return None
+
+
+def _attr_or_item(value: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value[name]
+        if hasattr(value, name):
+            return getattr(value, name)
+    return None
+
+
+def _word_confidence(value: Any) -> float | None:
+    raw = _attr_or_item(value, "probability", "confidence")
+    if raw is None:
+        return None
+    return max(0.0, min(1.0, float(raw)))
+
+
+def _segment_words(item: Any) -> list[ASRWord]:
+    words: list[ASRWord] = []
+    for raw_word in _attr_or_item(item, "words") or []:
+        text = str(_attr_or_item(raw_word, "word", "text") or "").strip()
+        start = _attr_or_item(raw_word, "start")
+        end = _attr_or_item(raw_word, "end")
+        if not text or start is None or end is None:
+            continue
+        start_sec = float(start)
+        end_sec = float(end)
+        if end_sec <= start_sec:
+            continue
+        words.append(
+            ASRWord(
+                start=start_sec,
+                end=end_sec,
+                text=text,
+                confidence=_word_confidence(raw_word),
+            )
+        )
+    return words
 
 
 class FasterWhisperASRBackend(ASRBackend):
@@ -179,6 +218,7 @@ class FasterWhisperASRBackend(ASRBackend):
                     text=str(item.text).strip(),
                     language=language,
                     confidence=confidence,
+                    words=_segment_words(item),
                 )
             )
         return chunks

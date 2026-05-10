@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
 import shutil
 import sys
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,12 +29,13 @@ from asmr_dub_pipeline.audio.features import (
 )
 from asmr_dub_pipeline.audio.quality import measure_source_voice_quality
 from asmr_dub_pipeline.audio.separation import SourceSeparationUnavailable, separate_source_audio
+from asmr_dub_pipeline.audio.training_filter import evaluate_voice_training_candidate
 from asmr_dub_pipeline.config import (
     create_project_structure,
     load_project_config,
     save_project_config,
 )
-from asmr_dub_pipeline.gpt_sovits.few_shot import train_few_shot
+from asmr_dub_pipeline.gpt_sovits.few_shot import few_shot_min_total_sec, train_few_shot
 from asmr_dub_pipeline.pipeline.manifest_io import write_json_atomic
 from asmr_dub_pipeline.rights import (
     ensure_inside_project,
@@ -64,6 +69,11 @@ _MIN_EMBEDDING_AUDIO_SEC = 0.05
 _MIN_EMBEDDING_CROP_SEC = 0.50
 _SOURCE_SPEAKER_MIN_OVERLAP_RATIO = 0.50
 _SOURCE_SPEAKER_MULTI_OVERLAP_RATIO = 0.20
+_SOURCE_DIARIZATION_CACHE_VERSION = 2
+_SOURCE_EFFECT_AUGMENTED_MAX_SEGMENTS_PER_SPEAKER = 2
+_SOURCE_EFFECT_AUGMENTED_MIN_MATCH_THRESHOLD = 0.60
+_SOURCE_EFFECT_AUGMENTED_PROFILES = ("sfx_center", "sfx_left", "sfx_right", "echo")
+_SOURCE_DISTINCT_MINOR_MAX_CENTROID_SIMILARITY = 0.35
 _MISSING = object()
 _T = TypeVar("_T")
 
@@ -89,10 +99,34 @@ class DiarizationTurn:
         return max(0.0, self.end - self.start)
 
 
+@dataclass(frozen=True)
+class SourceDiarizationPart:
+    part_index: int
+    source_id: str
+    start: float
+    end: float
+    clip_path: Path
+    cache_path: Path
+
+
+@dataclass(frozen=True)
+class SourceDiarizationPartResult:
+    part: SourceDiarizationPart
+    turns: list[DiarizationTurn]
+    cache_status: str
+
+
 class MockDiarizationBackend:
     name = "mock"
 
-    def diarize(self, audio_path: Path, source_id: str, cfg: ProjectConfig) -> list[DiarizationTurn]:
+    def diarize(
+        self,
+        audio_path: Path,
+        source_id: str,
+        cfg: ProjectConfig,
+        *,
+        include_embeddings: bool = True,
+    ) -> list[DiarizationTurn]:
         _ = cfg
         duration = _audio_duration(audio_path)
         return [
@@ -102,7 +136,9 @@ class MockDiarizationBackend:
                 local_speaker_label="SPEAKER_00",
                 start=0.0,
                 end=duration,
-                embedding=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                embedding=np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                if include_embeddings
+                else None,
             )
         ]
 
@@ -114,7 +150,7 @@ class MockDiarizationBackend:
 class PyannoteDiarizationBackend:
     name = "pyannote"
 
-    def __init__(self, cfg: ProjectConfig) -> None:
+    def __init__(self, cfg: ProjectConfig, *, load_embedding_model: bool = True) -> None:
         os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
         _ensure_hf_cache_env()
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
@@ -125,13 +161,20 @@ class PyannoteDiarizationBackend:
             token=token,
         )
         dependency_models = _ensure_pyannote_pipeline_dependencies(diarization_model, cfg, token)
-        embedding_model = _resolve_pyannote_model(
-            cfg.diarization_embedding_model_id,
-            cfg,
-            label="speaker embedding",
-            token=token,
+        embedding_model = (
+            _resolve_pyannote_model(
+                cfg.diarization_embedding_model_id,
+                cfg,
+                label="speaker embedding",
+                token=token,
+            )
+            if load_embedding_model
+            else None
         )
-        if _all_local_paths([diarization_model, embedding_model, *dependency_models]):
+        local_paths = [diarization_model, *dependency_models]
+        if embedding_model is not None:
+            local_paths.append(embedding_model)
+        if _all_local_paths(local_paths):
             _force_hf_offline_for_local_cache()
         try:
             import torch  # type: ignore[import-not-found]
@@ -154,25 +197,35 @@ class PyannoteDiarizationBackend:
                 "Unable to load pyannote diarization model. Accept model terms and set HF_TOKEN, "
                 f"or configure a local model path. model={diarization_model}"
             ) from exc
-        try:
-            with _block_broken_pyannote_optional_nemo():
-                model = _pyannote_from_pretrained(
-                    Model,
-                    embedding_model,
-                    token=token,
-                )
-        except Exception as exc:  # pragma: no cover - depends on local model access
-            raise VoiceBankError(
-                "Unable to load pyannote speaker embedding model. Accept model terms and set HF_TOKEN, "
-                f"or configure a local model path. model={embedding_model}"
-            ) from exc
-        self.inference = Inference(model, window="whole")
+        self.inference = None
+        if embedding_model is not None:
+            try:
+                with _block_broken_pyannote_optional_nemo():
+                    model = _pyannote_from_pretrained(
+                        Model,
+                        embedding_model,
+                        token=token,
+                    )
+            except Exception as exc:  # pragma: no cover - depends on local model access
+                raise VoiceBankError(
+                    "Unable to load pyannote speaker embedding model. Accept model terms and set HF_TOKEN, "
+                    f"or configure a local model path. model={embedding_model}"
+                ) from exc
+            self.inference = Inference(model, window="whole")
         if "cuda" in cfg.rvc_device.lower() and torch.cuda.is_available():
             device = torch.device("cuda")
             self.pipeline.to(device)
-            self.inference.to(device)
+            if self.inference is not None:
+                self.inference.to(device)
 
-    def diarize(self, audio_path: Path, source_id: str, cfg: ProjectConfig) -> list[DiarizationTurn]:
+    def diarize(
+        self,
+        audio_path: Path,
+        source_id: str,
+        cfg: ProjectConfig,
+        *,
+        include_embeddings: bool = True,
+    ) -> list[DiarizationTurn]:
         kwargs: dict[str, Any] = {}
         if cfg.diarization_min_speakers is not None:
             kwargs["min_speakers"] = cfg.diarization_min_speakers
@@ -198,7 +251,9 @@ class PyannoteDiarizationBackend:
                     local_speaker_label=str(speaker) or f"SPEAKER_{index:02d}",
                     start=start,
                     end=end,
-                    embedding=self.embed_excerpt(audio_path, start, end),
+                    embedding=self.embed_excerpt(audio_path, start, end)
+                    if include_embeddings
+                    else None,
                 )
             )
         if not turns:
@@ -212,6 +267,8 @@ class PyannoteDiarizationBackend:
         return turns
 
     def embed_excerpt(self, audio_path: Path, start: float, end: float) -> np.ndarray:
+        if self.inference is None:
+            raise VoiceBankError("pyannote speaker embedding inference was not loaded.")
         from pyannote.core import Segment as PyannoteSegment  # type: ignore[import-not-found]
 
         crop_start, crop_end = _embedding_crop_bounds(audio_path, start, end)
@@ -219,6 +276,8 @@ class PyannoteDiarizationBackend:
         return _normalize_embedding(np.asarray(embedding, dtype=np.float32).reshape(-1))
 
     def embed_clip(self, audio_path: Path) -> np.ndarray:
+        if self.inference is None:
+            raise VoiceBankError("pyannote speaker embedding inference was not loaded.")
         embedding = self.inference(str(audio_path))
         return _normalize_embedding(np.asarray(embedding, dtype=np.float32).reshape(-1))
 
@@ -243,12 +302,12 @@ def save_voice_bank(path: Path, manifest: VoiceBankManifest) -> Path:
     return write_json_atomic(path, manifest.model_dump(mode="json"))
 
 
-def create_diarization_backend(kind: str, cfg: ProjectConfig):
+def create_diarization_backend(kind: str, cfg: ProjectConfig, *, load_embedding_model: bool = True):
     normalized = kind.replace("-", "_")
     if normalized == "mock":
         return MockDiarizationBackend()
     if normalized == "pyannote":
-        return PyannoteDiarizationBackend(cfg)
+        return PyannoteDiarizationBackend(cfg, load_embedding_model=load_embedding_model)
     raise VoiceBankError(f"Unsupported speaker assignment backend: {kind}")
 
 
@@ -454,7 +513,7 @@ def _is_hf_model_id(value: str) -> bool:
     return "/" in value and not value.startswith("$model/") and not Path(value).expanduser().exists()
 
 
-def cluster_turns(turns: list[DiarizationTurn], threshold: float = 0.78) -> list[DiarizationTurn]:
+def cluster_turns(turns: list[DiarizationTurn], threshold: float = 0.75) -> list[DiarizationTurn]:
     centroids: list[np.ndarray] = []
     labels: list[str] = []
     for turn in turns:
@@ -481,6 +540,62 @@ def cluster_turns(turns: list[DiarizationTurn], threshold: float = 0.78) -> list
         else:
             centroids.append(embedding)
             turn.speaker_id = f"speaker_{len(centroids):04d}"
+    return turns
+
+
+def _cluster_source_turns(turns: list[DiarizationTurn], threshold: float = 0.75) -> list[DiarizationTurn]:
+    groups: dict[tuple[str, str], list[DiarizationTurn]] = {}
+    for turn in turns:
+        groups.setdefault((turn.source_id, turn.local_speaker_label), []).append(turn)
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda item: (
+            min(turn.start for turn in item[1]),
+            item[0][0],
+            item[0][1],
+        ),
+    )
+    clusters: list[dict[str, Any]] = []
+    fallback_labels: dict[str, str] = {}
+    speaker_index = 0
+
+    def next_speaker_id() -> str:
+        nonlocal speaker_index
+        speaker_index += 1
+        return f"speaker_{speaker_index:04d}"
+
+    for (_source_id, local_speaker_label), group_turns in ordered_groups:
+        embeddings = [
+            _normalize_embedding(turn.embedding)
+            for turn in group_turns
+            if turn.embedding is not None
+        ]
+        if not embeddings:
+            speaker_id = fallback_labels.get(local_speaker_label)
+            if speaker_id is None:
+                speaker_id = next_speaker_id()
+                fallback_labels[local_speaker_label] = speaker_id
+            for turn in group_turns:
+                turn.speaker_id = speaker_id
+            continue
+
+        centroid = _normalize_embedding(np.mean(np.stack(embeddings), axis=0))
+        best_index = -1
+        best_score = -1.0
+        for index, cluster in enumerate(clusters):
+            score = float(np.dot(cluster["centroid"], centroid))
+            if score > best_score:
+                best_index = index
+                best_score = score
+        if best_index >= 0 and best_score >= threshold:
+            cluster = clusters[best_index]
+            speaker_id = str(cluster["speaker_id"])
+            cluster["centroid"] = _normalize_embedding((cluster["centroid"] + centroid) / 2.0)
+        else:
+            speaker_id = next_speaker_id()
+            clusters.append({"speaker_id": speaker_id, "centroid": centroid})
+        for turn in group_turns:
+            turn.speaker_id = speaker_id
     return turns
 
 
@@ -617,12 +732,43 @@ def assign_source_speakers_to_manifest(
     manifest: PipelineManifest,
     *,
     backend_kind: str = "mock",
+    jobs: int = 4,
 ) -> PipelineManifest:
     cfg = manifest.project_config
     audio_path = _source_speaker_audio_path(project_dir, manifest)
-    backend = create_diarization_backend(backend_kind, cfg) if backend_kind == "pyannote" else MockDiarizationBackend()
-    turns = backend.diarize(audio_path, "source", cfg)
-    cluster_turns(turns, threshold=cfg.diarization_embedding_match_threshold)
+    normalized_jobs = max(1, int(jobs))
+    part_specs = (
+        _source_diarization_part_specs(project_dir, manifest, audio_path)
+        if normalized_jobs > 1
+        else []
+    )
+    if part_specs:
+        part_results = _diarize_source_parts(
+            audio_path,
+            cfg,
+            backend_kind,
+            part_specs,
+            jobs=normalized_jobs,
+            include_embeddings=backend_kind == "pyannote",
+        )
+        turns = [turn for result in part_results for turn in result.turns]
+        cache_status = _combined_cache_status([result.cache_status for result in part_results])
+        cache_path = project_dir / "work" / "diarization" / "source_parts"
+    else:
+        cache_path = _source_diarization_cache_path(project_dir)
+        cache_signature = _source_diarization_cache_signature(
+            audio_path,
+            cfg,
+            backend_kind,
+            include_embeddings=False,
+        )
+        turns = _load_source_diarization_cache(cache_path, cache_signature, audio_path)
+        cache_status = "hit" if turns is not None else "miss"
+        if turns is None:
+            backend = _create_source_diarization_backend(backend_kind, cfg)
+            turns = _diarize_source_audio(backend, audio_path, cfg)
+            _write_source_diarization_cache(cache_path, cache_signature, turns)
+    _cluster_source_turns(turns, threshold=cfg.diarization_embedding_match_threshold)
     assigned = 0
     excluded = 0
     for segment in manifest.segments:
@@ -635,7 +781,11 @@ def assign_source_speakers_to_manifest(
             segment.speaker_id = str(assignment["speaker_id"])
             assigned += 1
             voice_training = dict(segment.analysis.get("voice_training") or {})
-            if voice_training.get("reason") in {"multi_speaker_overlap", "no_source_speaker_match"}:
+            if voice_training.get("reason") in {
+                "multi_speaker_overlap",
+                "no_source_speaker_match",
+                "minor_bucket_auto_merged",
+            }:
                 voice_training.pop("exclude", None)
                 voice_training.pop("reason", None)
             if voice_training:
@@ -647,19 +797,43 @@ def assign_source_speakers_to_manifest(
         excluded += 1
         reason = "multi_speaker_overlap" if assignment["speaker_count"] > 1 else "no_source_speaker_match"
         segment.analysis["voice_training"] = {"exclude": True, "reason": reason}
+    embedding_backend_factory = None
+    if backend_kind == "pyannote":
+        def embedding_backend_factory() -> Any:
+            return _create_source_diarization_backend(
+                backend_kind,
+                cfg,
+                load_embedding_model=True,
+            )
+
+    bucket_normalization = _normalize_source_speaker_buckets(
+        project_dir,
+        manifest,
+        cfg,
+        turns,
+        embedding_backend_factory=embedding_backend_factory,
+    )
     manifest.artifacts["source_speaker_audio"] = str(audio_path)
+    bucket_qc_path = project_dir / "work" / "diarization" / "source_speaker_bucket_qc.json"
+    write_json_atomic(bucket_qc_path, bucket_normalization)
+    manifest.artifacts["source_speaker_bucket_qc"] = str(bucket_qc_path)
     manifest.stage_state["source-speakers"] = {
         "status": "completed",
         "backend": backend_kind,
+        "diarization_cache": cache_status,
+        "diarization_cache_path": str(cache_path),
+        "parallel_jobs": normalized_jobs,
+        "parallel_tracks": len(part_specs),
         "turn_count": len(turns),
         "assigned_segments": assigned,
         "excluded_segments": excluded,
+        "bucket_normalization": bucket_normalization["summary"],
     }
     return manifest
 
 
 def _source_speaker_audio_path(project_dir: Path, manifest: PipelineManifest) -> Path:
-    for key in ("source_vocals_48k", "original_stereo_48k"):
+    for key in ("source_vocals_mono_16k", "source_vocals_48k", "gemma_mono_16k", "original_stereo_48k"):
         raw_path = manifest.artifacts.get(key)
         if raw_path:
             path = _resolve_project_or_absolute(project_dir, raw_path)
@@ -669,7 +843,322 @@ def _source_speaker_audio_path(project_dir: Path, manifest: PipelineManifest) ->
         path = Path(manifest.source_info.path).expanduser().resolve()
         if path.exists():
             return path
-    raise VoiceBankError("source-speakers requires source_vocals_48k, original_stereo_48k, or source_info.path.")
+    raise VoiceBankError(
+        "source-speakers requires source_vocals_mono_16k, source_vocals_48k, "
+        "gemma_mono_16k, original_stereo_48k, or source_info.path."
+    )
+
+
+def _create_source_diarization_backend(
+    backend_kind: str,
+    cfg: ProjectConfig,
+    *,
+    load_embedding_model: bool = False,
+):
+    if backend_kind != "pyannote":
+        return MockDiarizationBackend()
+    try:
+        parameters = inspect.signature(create_diarization_backend).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "load_embedding_model" in parameters:
+        return create_diarization_backend(
+            backend_kind,
+            cfg,
+            load_embedding_model=load_embedding_model,
+        )
+    return create_diarization_backend(backend_kind, cfg)
+
+
+def _diarize_source_audio(
+    backend: Any,
+    audio_path: Path,
+    cfg: ProjectConfig,
+    *,
+    source_id: str = "source",
+    include_embeddings: bool = False,
+) -> list[DiarizationTurn]:
+    resolved_audio_path = audio_path.resolve()
+    try:
+        parameters = inspect.signature(backend.diarize).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "include_embeddings" in parameters:
+        return backend.diarize(
+            resolved_audio_path,
+            source_id,
+            cfg,
+            include_embeddings=include_embeddings,
+        )
+    return backend.diarize(resolved_audio_path, source_id, cfg)
+
+
+def _source_diarization_part_specs(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    audio_path: Path,
+) -> list[SourceDiarizationPart]:
+    if not manifest.source_info:
+        return []
+    folder_input = manifest.source_info.raw.get("folder_input")
+    if not isinstance(folder_input, dict):
+        return []
+    raw_parts = folder_input.get("asr_parts")
+    if not isinstance(raw_parts, list) or len(raw_parts) < 2:
+        return []
+    audio_duration = _audio_duration(audio_path)
+    specs: list[SourceDiarizationPart] = []
+    seen_indices: set[int] = set()
+    for fallback_index, raw_part in enumerate(raw_parts, start=1):
+        if not isinstance(raw_part, dict):
+            return []
+        try:
+            start = float(raw_part["start_sec"])
+            end = float(raw_part["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        if end <= start:
+            return []
+        start = max(0.0, min(start, audio_duration))
+        end = max(start, min(end, audio_duration))
+        if end - start < _MIN_EMBEDDING_AUDIO_SEC:
+            continue
+        try:
+            part_index = int(raw_part.get("part_index") or fallback_index)
+        except (TypeError, ValueError):
+            part_index = fallback_index
+        if part_index in seen_indices:
+            part_index = fallback_index
+        seen_indices.add(part_index)
+        part_dir = ensure_inside_project(project_dir, project_dir / "work" / "diarization" / "source_parts")
+        specs.append(
+            SourceDiarizationPart(
+                part_index=part_index,
+                source_id=f"source_part_{part_index:04d}",
+                start=start,
+                end=end,
+                clip_path=part_dir / f"part_{part_index:04d}.wav",
+                cache_path=part_dir / f"part_{part_index:04d}_turns.json",
+            )
+        )
+    return sorted(specs, key=lambda part: (part.start, part.part_index)) if len(specs) >= 2 else []
+
+
+def _diarize_source_parts(
+    audio_path: Path,
+    cfg: ProjectConfig,
+    backend_kind: str,
+    parts: list[SourceDiarizationPart],
+    *,
+    jobs: int,
+    include_embeddings: bool = False,
+) -> list[SourceDiarizationPartResult]:
+    audio_sha256 = sha256_file(audio_path)
+    max_workers = min(max(1, jobs), len(parts))
+    local_state = threading.local()
+
+    def backend_for_thread():
+        backend = getattr(local_state, "backend", None)
+        if backend is None:
+            backend = _create_source_diarization_backend(
+                backend_kind,
+                cfg,
+                load_embedding_model=include_embeddings,
+            )
+            local_state.backend = backend
+        return backend
+
+    def run_part(part: SourceDiarizationPart) -> SourceDiarizationPartResult:
+        signature = _source_diarization_cache_signature(
+            audio_path,
+            cfg,
+            backend_kind,
+            audio_sha256=audio_sha256,
+            part=part,
+            include_embeddings=include_embeddings,
+        )
+        cached = _load_source_diarization_cache(part.cache_path, signature, part.clip_path)
+        if cached is not None:
+            return SourceDiarizationPartResult(
+                part=part,
+                turns=_offset_source_part_turns(cached, part, audio_path),
+                cache_status="hit",
+            )
+        _write_source_part_audio(audio_path, part)
+        turns = _diarize_source_audio(
+            backend_for_thread(),
+            part.clip_path,
+            cfg,
+            source_id=part.source_id,
+            include_embeddings=include_embeddings,
+        )
+        _write_source_diarization_cache(part.cache_path, signature, turns)
+        return SourceDiarizationPartResult(
+            part=part,
+            turns=_offset_source_part_turns(turns, part, audio_path),
+            cache_status="miss",
+        )
+
+    if max_workers == 1:
+        return [run_part(part) for part in parts]
+    results: list[SourceDiarizationPartResult] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(run_part, part) for part in parts]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return sorted(results, key=lambda result: (result.part.start, result.part.part_index))
+
+
+def _write_source_part_audio(audio_path: Path, part: SourceDiarizationPart) -> None:
+    try:
+        ffmpeg.slice_audio(
+            audio_path,
+            part.start,
+            part.end,
+            part.clip_path,
+            sample_rate=16_000,
+            channels=1,
+        )
+    except ffmpeg.FFmpegError:
+        _write_audio_slice(audio_path, part.start, part.end, part.clip_path)
+
+
+def _offset_source_part_turns(
+    turns: list[DiarizationTurn],
+    part: SourceDiarizationPart,
+    audio_path: Path,
+) -> list[DiarizationTurn]:
+    offset_turns: list[DiarizationTurn] = []
+    for turn in turns:
+        offset_turns.append(
+            DiarizationTurn(
+                source_id=turn.source_id,
+                source_path=audio_path.resolve(),
+                local_speaker_label=turn.local_speaker_label,
+                start=round(part.start + turn.start, 3),
+                end=round(part.start + turn.end, 3),
+                embedding=turn.embedding,
+                text=turn.text,
+                language=turn.language,
+                quality_score=turn.quality_score,
+                audio_path=turn.audio_path,
+                analysis_audio_path=turn.analysis_audio_path,
+                segment_id=turn.segment_id,
+            )
+        )
+    return offset_turns
+
+
+def _combined_cache_status(statuses: list[str]) -> str:
+    unique = set(statuses)
+    if unique == {"hit"}:
+        return "hit"
+    if unique == {"miss"}:
+        return "miss"
+    return "partial"
+
+
+def _source_diarization_cache_path(project_dir: Path) -> Path:
+    return ensure_inside_project(project_dir, project_dir / "work" / "diarization" / "source_turns.json")
+
+
+def _source_diarization_cache_signature(
+    audio_path: Path,
+    cfg: ProjectConfig,
+    backend_kind: str,
+    *,
+    audio_sha256: str | None = None,
+    part: SourceDiarizationPart | None = None,
+    include_embeddings: bool = False,
+) -> dict[str, Any]:
+    resolved_audio_path = audio_path.resolve()
+    signature: dict[str, Any] = {
+        "version": _SOURCE_DIARIZATION_CACHE_VERSION,
+        "backend": backend_kind,
+        "audio_path": str(resolved_audio_path),
+        "audio_sha256": audio_sha256 or sha256_file(resolved_audio_path),
+        "diarization_model_id": cfg.diarization_model_id,
+        "diarization_embedding_model_id": cfg.diarization_embedding_model_id,
+        "include_embeddings": include_embeddings,
+        "diarization_min_speakers": cfg.diarization_min_speakers,
+        "diarization_max_speakers": cfg.diarization_max_speakers,
+        "minimum_turn_sec": round(_minimum_diarization_turn_sec(cfg), 6),
+    }
+    if part is not None:
+        signature["part_index"] = part.part_index
+        signature["part_start_sec"] = round(part.start, 6)
+        signature["part_end_sec"] = round(part.end, 6)
+    return signature
+
+
+def _load_source_diarization_cache(
+    cache_path: Path,
+    signature: dict[str, Any],
+    audio_path: Path,
+) -> list[DiarizationTurn] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text("utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if data.get("signature") != signature:
+        return None
+    raw_turns = data.get("turns")
+    if not isinstance(raw_turns, list):
+        return None
+    try:
+        turns = [_source_turn_from_cache(item, audio_path) for item in raw_turns]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return turns or None
+
+
+def _write_source_diarization_cache(
+    cache_path: Path,
+    signature: dict[str, Any],
+    turns: list[DiarizationTurn],
+) -> None:
+    write_json_atomic(
+        cache_path,
+        {
+            "signature": signature,
+            "turns": [_source_turn_to_cache(turn) for turn in turns],
+        },
+    )
+
+
+def _source_turn_to_cache(turn: DiarizationTurn) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "source_id": turn.source_id,
+        "local_speaker_label": turn.local_speaker_label,
+        "start": round(float(turn.start), 6),
+        "end": round(float(turn.end), 6),
+    }
+    if turn.embedding is not None:
+        item["embedding"] = [float(value) for value in np.asarray(turn.embedding, dtype=np.float32).reshape(-1)]
+    return item
+
+
+def _source_turn_from_cache(item: dict[str, Any], audio_path: Path) -> DiarizationTurn:
+    start = float(item["start"])
+    end = float(item["end"])
+    if end <= start:
+        raise ValueError("cached diarization turn has non-positive duration")
+    raw_embedding = item.get("embedding")
+    embedding = (
+        np.asarray(raw_embedding, dtype=np.float32).reshape(-1)
+        if isinstance(raw_embedding, list)
+        else None
+    )
+    return DiarizationTurn(
+        source_id=str(item["source_id"]),
+        source_path=audio_path.resolve(),
+        local_speaker_label=str(item["local_speaker_label"]),
+        start=start,
+        end=end,
+        embedding=embedding,
+    )
 
 
 def _source_speaker_assignment(segment: Segment, turns: list[DiarizationTurn]) -> dict[str, Any]:
@@ -705,6 +1194,429 @@ def _source_speaker_assignment(segment: Segment, turns: list[DiarizationTurn]) -
         "speaker_count": speaker_count,
         "overlaps": {key: round(value, 6) for key, value in sorted(active.items())},
         "dominant_overlap_ratio": round(ratio, 6),
+    }
+
+
+def _normalize_source_speaker_buckets(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+    turns: list[DiarizationTurn],
+    *,
+    embedding_backend_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    stats = _source_speaker_bucket_stats(project_dir, manifest, cfg)
+    if len(stats) <= 1:
+        return _source_speaker_bucket_qc_payload(stats, [])
+    target_sec = few_shot_min_total_sec(cfg)
+    major_ids = [
+        speaker_id
+        for speaker_id, row in stats.items()
+        if float(row["clean_training_duration_sec"]) >= target_sec
+    ]
+    if not major_ids:
+        return _source_speaker_bucket_qc_payload(stats, [])
+    centroids = _speaker_centroids_from_turns(turns)
+    direct_matches: dict[str, tuple[str | None, float | None]] = {}
+    low_similarity_minor_ids: list[str] = []
+    for speaker_id in sorted(stats):
+        if speaker_id in major_ids:
+            continue
+        target_id, similarity = _best_source_bucket_merge_target(
+            speaker_id,
+            major_ids,
+            stats,
+            centroids,
+        )
+        direct_matches[speaker_id] = (target_id, similarity)
+        if similarity is None or similarity < cfg.diarization_embedding_match_threshold:
+            low_similarity_minor_ids.append(speaker_id)
+    effect_matches = _source_effect_augmented_bucket_matches(
+        project_dir,
+        manifest,
+        cfg,
+        stats,
+        major_ids,
+        low_similarity_minor_ids,
+        centroids,
+        embedding_backend_factory,
+    )
+    merges: list[dict[str, Any]] = []
+    preserves: list[dict[str, Any]] = []
+    for speaker_id, row in sorted(stats.items()):
+        if speaker_id in major_ids:
+            continue
+        target_id, similarity = direct_matches.get(speaker_id, (None, None))
+        if target_id is None:
+            continue
+        effect_match = effect_matches.get(speaker_id)
+        match_basis = "clean_centroid"
+        merge_confidence = "high"
+        selected_similarity = similarity
+        if similarity is None or similarity < cfg.diarization_embedding_match_threshold:
+            match_basis = "major_bucket_fallback"
+            merge_confidence = "low"
+        if effect_match is not None and effect_match.get("accepted") is True:
+            target_id = str(effect_match["speaker_id"])
+            selected_similarity = float(effect_match["similarity"])
+            match_basis = "effect_augmented"
+            merge_confidence = "medium"
+        if _source_minor_bucket_should_remain_distinct(row, similarity, cfg) and match_basis == "major_bucket_fallback":
+            preserve = {
+                "speaker_id": speaker_id,
+                "model_fallback_speaker_id": target_id,
+                "reason": "distinct_minor_bucket_insufficient_training_data",
+                "clean_training_duration_sec": row["clean_training_duration_sec"],
+                "target_clean_training_duration_sec": stats[target_id]["clean_training_duration_sec"],
+                "centroid_similarity": round(selected_similarity, 6) if selected_similarity is not None else None,
+                "clean_centroid_similarity": round(similarity, 6) if similarity is not None else None,
+                "effect_augmented_similarity": round(float(effect_match["similarity"]), 6)
+                if effect_match is not None
+                else None,
+                "effect_profile": effect_match.get("profile") if effect_match is not None else None,
+                "effect_augmented_match_threshold": effect_match.get("threshold") if effect_match is not None else None,
+                "effect_augmented_accepted": effect_match.get("accepted") if effect_match is not None else None,
+                "match_basis": "distinct_low_similarity",
+                "merge_confidence": "distinct",
+            }
+            preserves.append(preserve)
+            _apply_source_bucket_model_fallback(manifest, preserve)
+            continue
+        merge = {
+            "original_speaker_id": speaker_id,
+            "merged_into_speaker_id": target_id,
+            "reason": "minor_bucket_auto_merged",
+            "clean_training_duration_sec": row["clean_training_duration_sec"],
+            "target_clean_training_duration_sec": stats[target_id]["clean_training_duration_sec"],
+            "centroid_similarity": round(selected_similarity, 6) if selected_similarity is not None else None,
+            "clean_centroid_similarity": round(similarity, 6) if similarity is not None else None,
+            "effect_augmented_similarity": round(float(effect_match["similarity"]), 6)
+            if effect_match is not None
+            else None,
+            "effect_profile": effect_match.get("profile") if effect_match is not None else None,
+            "effect_augmented_match_threshold": effect_match.get("threshold") if effect_match is not None else None,
+            "effect_augmented_accepted": effect_match.get("accepted") if effect_match is not None else None,
+            "match_basis": match_basis,
+            "merge_confidence": merge_confidence,
+        }
+        merges.append(merge)
+        _apply_source_bucket_merge(manifest, merge)
+    return _source_speaker_bucket_qc_payload(stats, merges, preserves)
+
+
+def _source_speaker_bucket_stats(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+) -> dict[str, dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {}
+    for segment in manifest.segments:
+        speaker_id = segment.speaker_id
+        if not speaker_id or segment.status in {"failed", "needs_manual_review"}:
+            continue
+        row = stats.setdefault(
+            speaker_id,
+            {
+                "speaker_id": speaker_id,
+                "segment_count": 0,
+                "duration_sec": 0.0,
+                "clean_training_segment_count": 0,
+                "clean_training_duration_sec": 0.0,
+                "clean_training_segment_ids": [],
+            },
+        )
+        row["segment_count"] += 1
+        row["duration_sec"] += segment.duration
+        if _source_segment_is_clean_training_candidate(project_dir, segment, cfg):
+            row["clean_training_segment_count"] += 1
+            row["clean_training_duration_sec"] += segment.duration
+            row["clean_training_segment_ids"].append(segment.id)
+    for row in stats.values():
+        row["duration_sec"] = round(float(row["duration_sec"]), 6)
+        row["clean_training_duration_sec"] = round(float(row["clean_training_duration_sec"]), 6)
+    return dict(sorted(stats.items()))
+
+
+def _source_segment_is_clean_training_candidate(
+    project_dir: Path,
+    segment: Segment,
+    cfg: ProjectConfig,
+) -> bool:
+    if segment.duration < cfg.gsv_few_shot_min_clip_sec:
+        return False
+    if segment.duration > cfg.gsv_few_shot_max_clip_sec:
+        return False
+    check = evaluate_voice_training_candidate(
+        project_dir,
+        segment,
+        cfg,
+        min_quality_score=cfg.gsv_few_shot_min_quality_score,
+        require_source_script=True,
+        require_speaker_id=True,
+        source_language=cfg.source_language,
+    )
+    return check.accepted
+
+
+def _source_minor_bucket_should_remain_distinct(
+    row: dict[str, Any],
+    similarity: float | None,
+    cfg: ProjectConfig,
+) -> bool:
+    clean_duration = float(row["clean_training_duration_sec"])
+    min_distinct_sec = max(float(cfg.gsv_ref_min_sec), few_shot_min_total_sec(cfg) * 0.15)
+    if clean_duration < min_distinct_sec:
+        return False
+    if similarity is None:
+        return True
+    return similarity <= _SOURCE_DISTINCT_MINOR_MAX_CENTROID_SIMILARITY
+
+
+def _source_effect_augmented_bucket_matches(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+    stats: dict[str, dict[str, Any]],
+    major_ids: list[str],
+    minor_ids: list[str],
+    centroids: dict[str, np.ndarray],
+    embedding_backend_factory: Callable[[], Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if not minor_ids or embedding_backend_factory is None:
+        return {}
+    threshold = _source_effect_augmented_match_threshold(cfg)
+    try:
+        backend = embedding_backend_factory()
+    except Exception:
+        return {}
+    prototypes = _source_effect_augmented_prototypes(project_dir, manifest, stats, major_ids, backend)
+    if not prototypes:
+        return {}
+    matches: dict[str, dict[str, Any]] = {}
+    for minor_id in minor_ids:
+        minor_centroid = centroids.get(minor_id)
+        if minor_centroid is None:
+            continue
+        best: dict[str, Any] | None = None
+        for target_id, target_prototypes in prototypes.items():
+            for prototype in target_prototypes:
+                embedding = prototype["embedding"]
+                if embedding.shape != minor_centroid.shape:
+                    continue
+                similarity = float(np.dot(minor_centroid, embedding))
+                if best is None or similarity > float(best["similarity"]):
+                    best = {
+                        "speaker_id": target_id,
+                        "profile": prototype["profile"],
+                        "similarity": similarity,
+                    }
+        if best is not None:
+            best["threshold"] = round(threshold, 6)
+            best["accepted"] = float(best["similarity"]) >= threshold
+            matches[minor_id] = best
+    return matches
+
+
+def _source_effect_augmented_match_threshold(cfg: ProjectConfig) -> float:
+    return max(
+        _SOURCE_EFFECT_AUGMENTED_MIN_MATCH_THRESHOLD,
+        float(cfg.diarization_embedding_match_threshold) - 0.15,
+    )
+
+
+def _source_effect_augmented_prototypes(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    stats: dict[str, dict[str, Any]],
+    major_ids: list[str],
+    backend: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    by_id = {segment.id: segment for segment in manifest.segments}
+    output_root = ensure_inside_project(project_dir, project_dir / "work" / "diarization" / "effect_augmented")
+    prototypes: dict[str, list[dict[str, Any]]] = {}
+    for speaker_id in major_ids:
+        selected_ids = list(stats[speaker_id].get("clean_training_segment_ids") or [])
+        for segment_id in selected_ids[:_SOURCE_EFFECT_AUGMENTED_MAX_SEGMENTS_PER_SPEAKER]:
+            segment = by_id.get(str(segment_id))
+            if segment is None or not segment.audio_for_mix:
+                continue
+            try:
+                audio_path = _resolve_project_or_absolute(project_dir, segment.audio_for_mix)
+                data, sample_rate = load_audio(audio_path)
+            except Exception:
+                continue
+            safe_segment_id = validate_file_safe_id(segment.id, "segment_id")
+            speaker_dir = ensure_inside_project(project_dir, output_root / validate_file_safe_id(speaker_id, "speaker_id"))
+            for profile, augmented in _source_effect_augmented_audio_variants(data, sample_rate):
+                output_path = ensure_inside_project(
+                    project_dir,
+                    speaker_dir / f"{safe_segment_id}_{profile}.wav",
+                )
+                try:
+                    write_audio(output_path, augmented, sample_rate)
+                    embedding = _normalize_embedding(np.asarray(backend.embed_clip(output_path), dtype=np.float32).reshape(-1))
+                except Exception:
+                    continue
+                prototypes.setdefault(speaker_id, []).append(
+                    {
+                        "profile": profile,
+                        "embedding": embedding,
+                    }
+                )
+    return prototypes
+
+
+def _source_effect_augmented_audio_variants(data: np.ndarray, sample_rate: int) -> list[tuple[str, np.ndarray]]:
+    stereo = ensure_stereo(data).astype(np.float32, copy=True)
+    variants = {
+        "sfx_center": _mix_source_sfx_bed(stereo, sample_rate, pan="center"),
+        "sfx_left": _mix_source_sfx_bed(stereo, sample_rate, pan="left"),
+        "sfx_right": _mix_source_sfx_bed(stereo, sample_rate, pan="right"),
+        "echo": _source_echo_effect(stereo, sample_rate),
+    }
+    return [(profile, variants[profile]) for profile in _SOURCE_EFFECT_AUGMENTED_PROFILES]
+
+
+def _mix_source_sfx_bed(data: np.ndarray, sample_rate: int, *, pan: str) -> np.ndarray:
+    frames = data.shape[0]
+    if frames <= 0:
+        return data
+    bed = _source_sfx_texture(frames, sample_rate)
+    speech_rms = max(float(np.sqrt(np.mean(np.square(data)))), 1e-5)
+    bed_rms = max(float(np.sqrt(np.mean(np.square(bed)))), 1e-5)
+    bed = bed * (speech_rms * (10 ** (-12.0 / 20.0)) / bed_rms)
+    if pan == "left":
+        stereo_bed = np.stack([bed, bed * 0.18], axis=1)
+    elif pan == "right":
+        stereo_bed = np.stack([bed * 0.18, bed], axis=1)
+    else:
+        stereo_bed = np.repeat(bed[:, None], 2, axis=1)
+    return _peak_guard(data + stereo_bed)
+
+
+def _source_sfx_texture(frames: int, sample_rate: int) -> np.ndarray:
+    rng = np.random.default_rng(9173)
+    noise = rng.standard_normal(frames).astype(np.float32)
+    rustle_window = max(1, int(round(sample_rate / 240.0)))
+    if rustle_window > 1 and frames > 1:
+        kernel = np.ones(rustle_window, dtype=np.float32) / float(rustle_window)
+        noise = np.convolve(noise, kernel, mode="same").astype(np.float32)
+    t = np.arange(frames, dtype=np.float32) / float(max(1, sample_rate))
+    breath = 0.35 * np.sin(2.0 * np.pi * 7.0 * t).astype(np.float32)
+    texture = noise + breath
+    texture -= float(np.mean(texture))
+    return texture.astype(np.float32)
+
+
+def _source_echo_effect(data: np.ndarray, sample_rate: int) -> np.ndarray:
+    out = data.astype(np.float32, copy=True)
+    for delay_ms, decay in ((26.0, 0.16), (58.0, 0.09)):
+        delay = int(round(sample_rate * delay_ms / 1000.0))
+        if 0 < delay < len(out):
+            out[delay:] += data[:-delay] * decay
+    return _peak_guard(out)
+
+
+def _peak_guard(data: np.ndarray, peak_limit: float = 0.98) -> np.ndarray:
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak > peak_limit > 0:
+        data = data * (peak_limit / peak)
+    return np.clip(data, -1.0, 1.0).astype(np.float32)
+
+
+def _speaker_centroids_from_turns(turns: list[DiarizationTurn]) -> dict[str, np.ndarray]:
+    grouped: dict[str, list[np.ndarray]] = {}
+    for turn in turns:
+        if turn.speaker_id and turn.embedding is not None:
+            grouped.setdefault(turn.speaker_id, []).append(_normalize_embedding(turn.embedding))
+    return {
+        speaker_id: _normalize_embedding(np.mean(np.stack(embeddings), axis=0))
+        for speaker_id, embeddings in grouped.items()
+        if embeddings
+    }
+
+
+def _best_source_bucket_merge_target(
+    speaker_id: str,
+    major_ids: list[str],
+    stats: dict[str, dict[str, Any]],
+    centroids: dict[str, np.ndarray],
+) -> tuple[str | None, float | None]:
+    minor_centroid = centroids.get(speaker_id)
+    best_id: str | None = None
+    best_similarity: float | None = None
+    for target_id in major_ids:
+        target_centroid = centroids.get(target_id)
+        similarity = (
+            float(np.dot(minor_centroid, target_centroid))
+            if minor_centroid is not None and target_centroid is not None
+            else None
+        )
+        if best_id is None:
+            best_id = target_id
+            best_similarity = similarity
+            continue
+        if similarity is not None and (best_similarity is None or similarity > best_similarity):
+            best_id = target_id
+            best_similarity = similarity
+            continue
+        if similarity is None and best_similarity is None:
+            current_duration = float(stats[target_id]["clean_training_duration_sec"])
+            best_duration = float(stats[best_id]["clean_training_duration_sec"])
+            if current_duration > best_duration:
+                best_id = target_id
+    return best_id, best_similarity
+
+
+def _apply_source_bucket_merge(manifest: PipelineManifest, merge: dict[str, Any]) -> None:
+    original = str(merge["original_speaker_id"])
+    target = str(merge["merged_into_speaker_id"])
+    for segment in manifest.segments:
+        if segment.speaker_id != original:
+            continue
+        segment.speaker_id = target
+        segment.analysis["source_speaker_bucket_normalization"] = dict(merge)
+        voice_training = dict(segment.analysis.get("voice_training") or {})
+        voice_training["exclude"] = True
+        voice_training["reason"] = "minor_bucket_auto_merged"
+        segment.analysis["voice_training"] = voice_training
+
+
+def _apply_source_bucket_model_fallback(manifest: PipelineManifest, preserve: dict[str, Any]) -> None:
+    speaker_id = str(preserve["speaker_id"])
+    fallback_id = str(preserve["model_fallback_speaker_id"])
+    for segment in manifest.segments:
+        if segment.speaker_id != speaker_id:
+            continue
+        segment.analysis["source_speaker_bucket_normalization"] = dict(preserve)
+        segment.analysis["source_speaker_model_fallback"] = {
+            "speaker_id": fallback_id,
+            "reason": "insufficient_distinct_speaker_training_data",
+            "match_basis": preserve["match_basis"],
+            "centroid_similarity": preserve["centroid_similarity"],
+        }
+        voice_training = dict(segment.analysis.get("voice_training") or {})
+        voice_training["exclude"] = True
+        voice_training["reason"] = "insufficient_distinct_speaker_training_data"
+        segment.analysis["voice_training"] = voice_training
+
+
+def _source_speaker_bucket_qc_payload(
+    stats: dict[str, dict[str, Any]],
+    merges: list[dict[str, Any]],
+    preserves: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    preserves = preserves or []
+    return {
+        "speakers": list(stats.values()),
+        "merges": merges,
+        "preserves": preserves,
+        "summary": {
+            "speaker_bucket_count": len(stats),
+            "major_bucket_count": len(stats) - len(merges) - len(preserves),
+            "merged_bucket_count": len(merges),
+            "preserved_bucket_count": len(preserves),
+        },
     }
 
 

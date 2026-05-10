@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from asmr_dub_pipeline.asr.base import create_asr_backend
 from asmr_dub_pipeline.asr.faster_whisper import (
@@ -76,6 +77,7 @@ def test_faster_whisper_backend_uses_batched_pipeline_options() -> None:
         end = 1.0
         text = "テスト"
         avg_logprob = -0.25
+        words = [SimpleNamespace(word="テスト", start=0.1, end=0.8, probability=0.77)]
 
     class FakeBatchedModel:
         def __init__(self) -> None:
@@ -97,6 +99,9 @@ def test_faster_whisper_backend_uses_batched_pipeline_options() -> None:
     chunks = backend.transcribe_with_options(Path("audio.wav"), [])
 
     assert len(chunks) == 1
+    assert [(word.text, word.start, word.end, word.confidence) for word in chunks[0].words] == [
+        ("テスト", 0.1, 0.8, 0.77)
+    ]
     assert fake_batched.kwargs is not None
     assert fake_batched.kwargs["batch_size"] == 16
     assert fake_batched.kwargs["beam_size"] == 5
@@ -117,3 +122,9 @@ def test_asr_whisper_preset_updates_effective_backend_options() -> None:
     assert backend_config["vad_parameters"]["max_speech_duration_s"] <= 24
     assert backend_config["word_timestamps"] is True
     assert backend_config["hallucination_silence_threshold"] is not None
+
+    lean_cfg = pipeline_steps._effective_asr_config(
+        ProjectConfig(asr_preset="whisper"),
+        asr_repair_enabled=False,
+    )
+    assert lean_cfg.asr_repair_enabled is False

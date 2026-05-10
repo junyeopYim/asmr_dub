@@ -12,6 +12,8 @@ from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSClient
 from asmr_dub_pipeline.gpt_sovits.schemas import GPTSoVITSRef, GPTSoVITSTTSOptions
 from asmr_dub_pipeline.schemas import Segment
 
+pytestmark = [pytest.mark.real_model, pytest.mark.smoke]
+
 
 def sample_segment() -> Segment:
     return Segment(

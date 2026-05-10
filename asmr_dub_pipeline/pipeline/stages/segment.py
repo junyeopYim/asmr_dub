@@ -14,6 +14,13 @@ def run_segment_stage(ctx: PipelineContext, confirm_rights: bool = False) -> Pip
     _require_audio_stage_rights(manifest, "segment", confirm_rights)
     cfg = manifest.project_config
     if manifest.stage_state.get("transcribe", {}).get("status") == "completed" and manifest.segments:
+        countdown_summary = _countdown_timeline_summary(manifest.segments)
+        transcribe_state = manifest.stage_state.get("transcribe", {})
+        _warn_missing_countdown_timelines(
+            manifest,
+            countdown_summary,
+            word_timestamps_enabled=bool(transcribe_state.get("asr_word_timestamps", False)),
+        )
         raw_path = project_dir / "work" / "segments" / "manifests" / "segments_raw.json"
         final_path = project_dir / "work" / "segments" / "manifests" / "segments_final.json"
         _write_segments_manifest(raw_path, manifest.segments)
@@ -27,6 +34,7 @@ def run_segment_stage(ctx: PipelineContext, confirm_rights: bool = False) -> Pip
             source="transcribe",
             segment_count=len(manifest.segments),
             segment_counts=_segment_counts(manifest),
+            **countdown_summary,
         )
         save_manifest(project_dir, manifest)
         _log_stage_complete("segment", manifest, f"finalized={len(manifest.segments)}")

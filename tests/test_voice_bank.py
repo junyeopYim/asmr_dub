@@ -21,6 +21,7 @@ from asmr_dub_pipeline.schemas import (
     RVCSpeakerConfig,
     Segment,
     SourceInfo,
+    SourceScript,
     VoiceBankManifest,
     VoiceBankSourceSegment,
     VoiceBankSpeaker,
@@ -37,6 +38,8 @@ from asmr_dub_pipeline.voice_bank import (
     validate_voice_bank_models,
 )
 from asmr_dub_pipeline.voice_bank import manager as voice_bank_manager
+
+pytestmark = pytest.mark.regression
 
 
 def _voice_bank_speaker(project_dir: Path, source_path: Path) -> VoiceBankSpeaker:
@@ -189,6 +192,44 @@ def test_pyannote_diarize_skips_subwindow_turns_before_embedding(
     assert len(turns) == 1
     assert turns[0].start == pytest.approx(0.3)
     assert turns[0].end == pytest.approx(1.0)
+
+
+def test_pyannote_diarize_can_skip_turn_embeddings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSegment:
+        start = 0.300
+        end = 1.000
+
+    class FakeAnnotation:
+        def itertracks(self, yield_label: bool):
+            assert yield_label is True
+            yield FakeSegment(), None, "SPEAKER_00"
+
+    class FakePipeline:
+        def __call__(self, audio_path: str, **kwargs):
+            _ = audio_path, kwargs
+            return FakeAnnotation()
+
+    backend = object.__new__(voice_bank_manager.PyannoteDiarizationBackend)
+    backend.pipeline = FakePipeline()
+    monkeypatch.setattr(
+        backend,
+        "embed_excerpt",
+        lambda audio_path, start, end: pytest.fail("source-speakers should skip turn embeddings"),
+    )
+
+    turns = backend.diarize(
+        tmp_path / "source.wav",
+        "source",
+        ProjectConfig(),
+        include_embeddings=False,
+    )
+
+    assert len(turns) == 1
+    assert turns[0].embedding is None
+    assert turns[0].local_speaker_label == "SPEAKER_00"
 
 
 def test_pyannote_diarize_reports_when_all_turns_are_too_short(
@@ -506,6 +547,66 @@ def test_pyannote_embedding_assignment_requires_configured_threshold(
     assert assigned.segments[0].speaker_id == "speaker_0001"
 
 
+def test_cluster_turns_defaults_to_075_cosine_threshold(tmp_project_dir: Path) -> None:
+    turns = [
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="SPEAKER_00",
+            start=0.0,
+            end=1.0,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+        ),
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="SPEAKER_01",
+            start=1.0,
+            end=2.0,
+            embedding=np.array([0.76, 0.649923], dtype=np.float32),
+        ),
+    ]
+
+    cluster_turns(turns)
+
+    assert [turn.speaker_id for turn in turns] == ["speaker_0001", "speaker_0001"]
+
+
+def test_source_turn_clustering_uses_part_label_centroids_for_noisy_embeddings(
+    tmp_project_dir: Path,
+) -> None:
+    turns = [
+        DiarizationTurn(
+            source_id="source_part_0001",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="SPEAKER_00",
+            start=0.0,
+            end=1.0,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+        ),
+        DiarizationTurn(
+            source_id="source_part_0001",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="SPEAKER_00",
+            start=1.0,
+            end=2.0,
+            embedding=np.array([0.0, 1.0], dtype=np.float32),
+        ),
+        DiarizationTurn(
+            source_id="source_part_0002",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="SPEAKER_09",
+            start=2.0,
+            end=3.0,
+            embedding=np.array([0.72, 0.69], dtype=np.float32),
+        ),
+    ]
+
+    voice_bank_manager._cluster_source_turns(turns, threshold=0.95)
+
+    assert [turn.speaker_id for turn in turns] == ["speaker_0001", "speaker_0001", "speaker_0001"]
+
+
 def test_source_speaker_assignment_marks_clean_and_overlapped_segments(
     tmp_project_dir: Path,
     tiny_wav_path: Path,
@@ -532,6 +633,7 @@ def test_source_speaker_assignment_marks_clean_and_overlapped_segments(
                 duration=0.7,
                 audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
                 audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+                analysis={"voice_training": {"exclude": True, "reason": "minor_bucket_auto_merged"}},
             ),
             Segment(
                 id="seg_0002",
@@ -579,6 +681,7 @@ def test_source_speaker_assignment_marks_clean_and_overlapped_segments(
     assigned = assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote")
 
     assert assigned.segments[0].speaker_id == "speaker_0001"
+    assert "voice_training" not in assigned.segments[0].analysis
     assert assigned.segments[1].speaker_id == "speaker_0002"
     overlapped = assigned.segments[2]
     assert overlapped.speaker_id is None
@@ -589,6 +692,619 @@ def test_source_speaker_assignment_marks_clean_and_overlapped_segments(
     }
 
 
+def test_source_speakers_auto_merges_minor_bucket_to_trainable_major(
+    tmp_project_dir: Path,
+    tiny_wav_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_project_dir / "work" / "audio" / "source_vocals_48k.wav"
+    write_tiny_wav(audio_path, duration=3.4)
+
+    def segment(segment_id: str, start: float, end: float) -> Segment:
+        clip = tmp_project_dir / "work" / "segments" / "audio" / f"{segment_id}_mix.wav"
+        write_tiny_wav(clip, duration=end - start)
+        return Segment(
+            id=segment_id,
+            start=start,
+            end=end,
+            duration=end - start,
+            audio_for_gemma=str(clip.relative_to(tmp_project_dir)),
+            audio_for_mix=str(clip.relative_to(tmp_project_dir)),
+            source_script=SourceScript(
+                text=f"台詞 {segment_id}",
+                language="ja",
+                backend="mock",
+                start=start,
+                end=end,
+            ),
+        )
+
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            gsv_few_shot_min_total_sec=2.0,
+            gsv_few_shot_min_clip_sec=0.5,
+            gsv_few_shot_max_clip_sec=10.0,
+        ),
+        source_info=SourceInfo(
+            path=str(tiny_wav_path.resolve()),
+            duration_sec=3.4,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+        ),
+        artifacts={"source_vocals_48k": str(audio_path)},
+        segments=[
+            segment("seg_0001", 0.0, 1.2),
+            segment("seg_0002", 1.2, 2.4),
+            segment("seg_0003", 2.4, 3.4),
+        ],
+    )
+
+    class MinorBucketBackend:
+        def diarize(self, audio_path: Path, source_id: str, cfg: ProjectConfig) -> list[DiarizationTurn]:
+            _ = cfg
+            return [
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="A",
+                    start=0.0,
+                    end=2.4,
+                    embedding=np.array([1.0, 0.0], dtype=np.float32),
+                ),
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="B",
+                    start=2.4,
+                    end=3.4,
+                    embedding=np.array([0.0, 1.0], dtype=np.float32),
+                ),
+            ]
+
+    monkeypatch.setattr(voice_bank_manager, "create_diarization_backend", lambda kind, cfg: MinorBucketBackend())
+
+    assigned = assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote")
+
+    assert [segment.speaker_id for segment in assigned.segments] == [
+        "speaker_0001",
+        "speaker_0001",
+        "speaker_0001",
+    ]
+    normalization = assigned.segments[2].analysis["source_speaker_bucket_normalization"]
+    assert normalization["original_speaker_id"] == "speaker_0002"
+    assert normalization["merged_into_speaker_id"] == "speaker_0001"
+    assert assigned.segments[2].analysis["voice_training"] == {
+        "exclude": True,
+        "reason": "minor_bucket_auto_merged",
+    }
+    assert assigned.stage_state["source-speakers"]["bucket_normalization"]["merged_bucket_count"] == 1
+    assert "source_speaker_bucket_qc" in assigned.artifacts
+
+
+def test_source_speaker_bucket_merge_can_use_effect_augmented_prototype(
+    tmp_project_dir: Path,
+) -> None:
+    def segment(segment_id: str, speaker_id: str, duration: float) -> Segment:
+        clip = tmp_project_dir / "work" / "segments" / "audio" / f"{segment_id}_mix.wav"
+        write_tiny_wav(clip, duration=duration)
+        return Segment(
+            id=segment_id,
+            speaker_id=speaker_id,
+            start=0.0,
+            end=duration,
+            duration=duration,
+            audio_for_gemma=str(clip.relative_to(tmp_project_dir)),
+            audio_for_mix=str(clip.relative_to(tmp_project_dir)),
+            source_script=SourceScript(
+                text=f"台詞 {segment_id}",
+                language="ja",
+                backend="mock",
+                start=0.0,
+                end=duration,
+            ),
+        )
+
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            gsv_few_shot_min_total_sec=2.0,
+            gsv_few_shot_min_clip_sec=0.5,
+            gsv_few_shot_max_clip_sec=10.0,
+        ),
+        segments=[
+            segment("seg_major_1", "speaker_0001", 1.1),
+            segment("seg_major_2", "speaker_0001", 1.1),
+            segment("seg_minor", "speaker_0002", 1.0),
+        ],
+    )
+    turns = [
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="A",
+            start=0.0,
+            end=2.2,
+            speaker_id="speaker_0001",
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+        ),
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="B",
+            start=2.2,
+            end=3.2,
+            speaker_id="speaker_0002",
+            embedding=np.array([0.0, 1.0], dtype=np.float32),
+        ),
+    ]
+
+    class EffectEmbeddingBackend:
+        def embed_clip(self, audio_path: Path) -> np.ndarray:
+            if "sfx_center" in audio_path.name:
+                return np.array([0.0, 1.0], dtype=np.float32)
+            return np.array([1.0, 0.0], dtype=np.float32)
+
+    payload = voice_bank_manager._normalize_source_speaker_buckets(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        turns,
+        embedding_backend_factory=lambda: EffectEmbeddingBackend(),
+    )
+
+    merge = payload["merges"][0]
+    assert merge["original_speaker_id"] == "speaker_0002"
+    assert merge["merged_into_speaker_id"] == "speaker_0001"
+    assert merge["match_basis"] == "effect_augmented"
+    assert merge["effect_profile"] == "sfx_center"
+    assert merge["effect_augmented_similarity"] == pytest.approx(1.0)
+    assert merge["clean_centroid_similarity"] == pytest.approx(0.0)
+    assert manifest.segments[2].speaker_id == "speaker_0001"
+
+
+def test_source_speaker_bucket_merge_records_rejected_effect_augmented_candidate(
+    tmp_project_dir: Path,
+) -> None:
+    def segment(segment_id: str, speaker_id: str, duration: float) -> Segment:
+        clip = tmp_project_dir / "work" / "segments" / "audio" / f"{segment_id}_mix.wav"
+        write_tiny_wav(clip, duration=duration)
+        return Segment(
+            id=segment_id,
+            speaker_id=speaker_id,
+            start=0.0,
+            end=duration,
+            duration=duration,
+            audio_for_gemma=str(clip.relative_to(tmp_project_dir)),
+            audio_for_mix=str(clip.relative_to(tmp_project_dir)),
+            source_script=SourceScript(
+                text=f"台詞 {segment_id}",
+                language="ja",
+                backend="mock",
+                start=0.0,
+                end=duration,
+            ),
+        )
+
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            gsv_few_shot_min_total_sec=2.0,
+            gsv_few_shot_min_clip_sec=0.5,
+            gsv_few_shot_max_clip_sec=10.0,
+        ),
+        segments=[
+            segment("seg_major_1", "speaker_0001", 1.1),
+            segment("seg_major_2", "speaker_0001", 1.1),
+            segment("seg_minor", "speaker_0002", 1.0),
+        ],
+    )
+    turns = [
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="A",
+            start=0.0,
+            end=2.2,
+            speaker_id="speaker_0001",
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+        ),
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="B",
+            start=2.2,
+            end=3.2,
+            speaker_id="speaker_0002",
+            embedding=np.array([0.0, 1.0], dtype=np.float32),
+        ),
+    ]
+
+    class WeakEffectEmbeddingBackend:
+        def embed_clip(self, audio_path: Path) -> np.ndarray:
+            if "sfx_center" in audio_path.name:
+                return np.array([0.8, 0.5], dtype=np.float32)
+            return np.array([1.0, 0.0], dtype=np.float32)
+
+    payload = voice_bank_manager._normalize_source_speaker_buckets(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        turns,
+        embedding_backend_factory=lambda: WeakEffectEmbeddingBackend(),
+    )
+
+    merge = payload["merges"][0]
+    assert merge["match_basis"] == "major_bucket_fallback"
+    assert merge["effect_augmented_similarity"] == pytest.approx(0.529999, abs=1e-6)
+    assert merge["effect_profile"] == "sfx_center"
+
+
+def test_source_speaker_bucket_preserves_substantial_low_confidence_minor_bucket(
+    tmp_project_dir: Path,
+) -> None:
+    def segment(segment_id: str, speaker_id: str, duration: float) -> Segment:
+        clip = tmp_project_dir / "work" / "segments" / "audio" / f"{segment_id}_mix.wav"
+        write_tiny_wav(clip, duration=duration)
+        return Segment(
+            id=segment_id,
+            speaker_id=speaker_id,
+            start=0.0,
+            end=duration,
+            duration=duration,
+            audio_for_gemma=str(clip.relative_to(tmp_project_dir)),
+            audio_for_mix=str(clip.relative_to(tmp_project_dir)),
+            source_script=SourceScript(
+                text=f"台詞 {segment_id}",
+                language="ja",
+                backend="mock",
+                start=0.0,
+                end=duration,
+            ),
+        )
+
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            gsv_few_shot_min_total_sec=10.0,
+            gsv_few_shot_min_clip_sec=0.5,
+            gsv_few_shot_max_clip_sec=20.0,
+        ),
+        segments=[
+            segment("seg_major_1", "speaker_0001", 5.1),
+            segment("seg_major_2", "speaker_0001", 5.1),
+            segment("seg_minor", "speaker_0002", 3.5),
+        ],
+    )
+    turns = [
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="A",
+            start=0.0,
+            end=10.2,
+            speaker_id="speaker_0001",
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+        ),
+        DiarizationTurn(
+            source_id="source",
+            source_path=tmp_project_dir / "source.wav",
+            local_speaker_label="B",
+            start=10.2,
+            end=13.7,
+            speaker_id="speaker_0002",
+            embedding=np.array([0.0, 1.0], dtype=np.float32),
+        ),
+    ]
+
+    payload = voice_bank_manager._normalize_source_speaker_buckets(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        turns,
+    )
+
+    assert payload["merges"] == []
+    preserve = payload["preserves"][0]
+    assert preserve["speaker_id"] == "speaker_0002"
+    assert preserve["model_fallback_speaker_id"] == "speaker_0001"
+    assert preserve["reason"] == "distinct_minor_bucket_insufficient_training_data"
+    assert manifest.segments[2].speaker_id == "speaker_0002"
+    assert manifest.segments[2].analysis["source_speaker_model_fallback"]["speaker_id"] == "speaker_0001"
+    assert manifest.segments[2].analysis["voice_training"] == {
+        "exclude": True,
+        "reason": "insufficient_distinct_speaker_training_data",
+    }
+
+
+def test_source_speakers_prefers_mono_analysis_audio(
+    tmp_project_dir: Path,
+    tiny_wav_path: Path,
+) -> None:
+    stereo_path = tmp_project_dir / "work" / "audio" / "source_vocals_48k.wav"
+    mono_path = tmp_project_dir / "work" / "audio" / "source_vocals_mono_16k.wav"
+    write_tiny_wav(stereo_path, sample_rate=48_000)
+    write_tiny_wav(mono_path, sample_rate=16_000)
+    manifest = PipelineManifest(
+        source_info=SourceInfo(
+            path=str(tiny_wav_path.resolve()),
+            duration_sec=1.2,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+        ),
+        artifacts={
+            "source_vocals_48k": str(stereo_path),
+            "source_vocals_mono_16k": str(mono_path),
+        },
+    )
+
+    assert voice_bank_manager._source_speaker_audio_path(tmp_project_dir, manifest) == mono_path.resolve()
+
+
+def test_source_speakers_reuses_cached_diarization_turns(
+    tmp_project_dir: Path,
+    tiny_wav_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_project_dir / "work" / "audio" / "source_vocals_mono_16k.wav"
+    write_tiny_wav(audio_path, sample_rate=16_000, duration=1.2)
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(diarization_embedding_match_threshold=0.78),
+        source_info=SourceInfo(
+            path=str(tiny_wav_path.resolve()),
+            duration_sec=1.2,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+        ),
+        artifacts={"source_vocals_mono_16k": str(audio_path)},
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0.0,
+                end=1.0,
+                duration=1.0,
+                audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+            )
+        ],
+    )
+    calls: list[tuple[Path, str, bool | None]] = []
+
+    class CachedBackend:
+        def diarize(
+            self,
+            audio_path: Path,
+            source_id: str,
+            cfg: ProjectConfig,
+            *,
+            include_embeddings: bool | None = None,
+        ) -> list[DiarizationTurn]:
+            _ = cfg
+            calls.append((audio_path, source_id, include_embeddings))
+            return [
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="A",
+                    start=0.0,
+                    end=1.0,
+                )
+            ]
+
+    monkeypatch.setattr(voice_bank_manager, "create_diarization_backend", lambda kind, cfg: CachedBackend())
+
+    assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote")
+    manifest.segments[0].speaker_id = None
+    assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote")
+
+    assert calls == [(audio_path.resolve(), "source", False)]
+    assert manifest.segments[0].speaker_id == "speaker_0001"
+    assert (tmp_project_dir / "work" / "diarization" / "source_turns.json").exists()
+
+
+def test_source_speakers_parallelizes_folder_tracks_and_reuses_part_caches(
+    tmp_project_dir: Path,
+    tiny_wav_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_project_dir / "work" / "audio" / "source_vocals_mono_16k.wav"
+    write_tiny_wav(audio_path, sample_rate=16_000, duration=2.0)
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(diarization_embedding_match_threshold=0.78),
+        source_info=SourceInfo(
+            path=str(tiny_wav_path.resolve()),
+            duration_sec=2.0,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+            raw={
+                "folder_input": {
+                    "input_kind": "folder",
+                    "asr_parts": [
+                        {"part_index": 1, "path": "part1.wav", "start_sec": 0.0, "end_sec": 1.0},
+                        {"part_index": 2, "path": "part2.wav", "start_sec": 1.0, "end_sec": 2.0},
+                    ],
+                }
+            },
+        ),
+        artifacts={"source_vocals_mono_16k": str(audio_path)},
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0.1,
+                end=0.9,
+                duration=0.8,
+                audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+            ),
+            Segment(
+                id="seg_0002",
+                start=1.1,
+                end=1.9,
+                duration=0.8,
+                audio_for_gemma="work/segments/audio/seg_0002_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0002_mix.wav",
+            ),
+        ],
+    )
+    calls: list[tuple[str, str, bool | None]] = []
+
+    class TrackBackend:
+        def diarize(
+            self,
+            audio_path: Path,
+            source_id: str,
+            cfg: ProjectConfig,
+            *,
+            include_embeddings: bool | None = None,
+        ) -> list[DiarizationTurn]:
+            _ = cfg
+            calls.append((audio_path.name, source_id, include_embeddings))
+            return [
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="SPEAKER_00",
+                    start=0.0,
+                    end=1.0,
+                )
+            ]
+
+    monkeypatch.setattr(voice_bank_manager, "create_diarization_backend", lambda kind, cfg: TrackBackend())
+
+    assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote", jobs=2)
+    manifest.segments[0].speaker_id = None
+    manifest.segments[1].speaker_id = None
+    assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote", jobs=2)
+
+    assert sorted(calls) == [
+        ("part_0001.wav", "source_part_0001", True),
+        ("part_0002.wav", "source_part_0002", True),
+    ]
+    assert [segment.speaker_id for segment in manifest.segments] == ["speaker_0001", "speaker_0001"]
+    assert manifest.stage_state["source-speakers"]["parallel_tracks"] == 2
+    assert manifest.stage_state["source-speakers"]["diarization_cache"] == "hit"
+    assert (
+        tmp_project_dir / "work" / "diarization" / "source_parts" / "part_0001_turns.json"
+    ).exists()
+    assert (
+        tmp_project_dir / "work" / "diarization" / "source_parts" / "part_0002_turns.json"
+    ).exists()
+
+
+def test_source_speakers_parallel_merges_part_labels_with_cached_embeddings(
+    tmp_project_dir: Path,
+    tiny_wav_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_project_dir / "work" / "audio" / "source_vocals_mono_16k.wav"
+    write_tiny_wav(audio_path, sample_rate=16_000, duration=2.0)
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(diarization_embedding_match_threshold=0.75),
+        source_info=SourceInfo(
+            path=str(tiny_wav_path.resolve()),
+            duration_sec=2.0,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+            raw={
+                "folder_input": {
+                    "input_kind": "folder",
+                    "asr_parts": [
+                        {"part_index": 1, "path": "part1.wav", "start_sec": 0.0, "end_sec": 1.0},
+                        {"part_index": 2, "path": "part2.wav", "start_sec": 1.0, "end_sec": 2.0},
+                    ],
+                }
+            },
+        ),
+        artifacts={"source_vocals_mono_16k": str(audio_path)},
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0.1,
+                end=0.9,
+                duration=0.8,
+                audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+            ),
+            Segment(
+                id="seg_0002",
+                start=1.1,
+                end=1.9,
+                duration=0.8,
+                audio_for_gemma="work/segments/audio/seg_0002_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0002_mix.wav",
+            ),
+        ],
+    )
+    calls: list[tuple[str, str, bool | None, bool]] = []
+
+    class TrackBackend:
+        def __init__(self, load_embedding_model: bool) -> None:
+            self.load_embedding_model = load_embedding_model
+
+        def diarize(
+            self,
+            audio_path: Path,
+            source_id: str,
+            cfg: ProjectConfig,
+            *,
+            include_embeddings: bool | None = None,
+        ) -> list[DiarizationTurn]:
+            _ = cfg
+            calls.append((audio_path.name, source_id, include_embeddings, self.load_embedding_model))
+            is_first_part = source_id.endswith("0001")
+            return [
+                DiarizationTurn(
+                    source_id=source_id,
+                    source_path=audio_path,
+                    local_speaker_label="SPEAKER_00" if is_first_part else "SPEAKER_09",
+                    start=0.0,
+                    end=1.0,
+                    embedding=np.array([1.0, 0.0], dtype=np.float32)
+                    if is_first_part and include_embeddings
+                    else np.array([0.99, 0.01], dtype=np.float32)
+                    if include_embeddings
+                    else None,
+                )
+            ]
+
+    def create_backend(
+        kind: str,
+        cfg: ProjectConfig,
+        *,
+        load_embedding_model: bool = True,
+    ) -> TrackBackend:
+        _ = kind, cfg
+        return TrackBackend(load_embedding_model)
+
+    monkeypatch.setattr(voice_bank_manager, "create_diarization_backend", create_backend)
+
+    assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote", jobs=2)
+
+    assert [segment.speaker_id for segment in manifest.segments] == ["speaker_0001", "speaker_0001"]
+    assert sorted(calls) == [
+        ("part_0001.wav", "source_part_0001", True, True),
+        ("part_0002.wav", "source_part_0002", True, True),
+    ]
+    cached = json.loads(
+        (tmp_project_dir / "work" / "diarization" / "source_parts" / "part_0002_turns.json").read_text("utf-8")
+    )
+    assert cached["turns"][0]["embedding"] == pytest.approx([0.99, 0.01])
+
+    calls.clear()
+    manifest.segments[0].speaker_id = None
+    manifest.segments[1].speaker_id = None
+    assign_source_speakers_to_manifest(tmp_project_dir, manifest, backend_kind="pyannote", jobs=2)
+
+    assert calls == []
+    assert [segment.speaker_id for segment in manifest.segments] == ["speaker_0001", "speaker_0001"]
+
+
 def test_source_speakers_cli_invokes_stage(
     cli_runner,
     tmp_project_dir: Path,
@@ -596,10 +1312,61 @@ def test_source_speakers_cli_invokes_stage(
 ) -> None:
     seen: dict[str, object] = {}
 
-    def fake_source_speakers_step(project_dir: Path, backend_kind: str | None = None, confirm_rights: bool = False):
+    def fake_source_speakers_step(
+        project_dir: Path,
+        backend_kind: str | None = None,
+        confirm_rights: bool = False,
+        jobs: int = 1,
+    ):
         seen["project_dir"] = project_dir
         seen["backend_kind"] = backend_kind
         seen["confirm_rights"] = confirm_rights
+        seen["jobs"] = jobs
+        return PipelineManifest(stage_state={"source-speakers": {"assigned_segments": 1}})
+
+    monkeypatch.setattr(cli_module, "source_speakers_step", fake_source_speakers_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "source-speakers",
+            "--project",
+            str(tmp_project_dir),
+            "--backend",
+            "mock",
+            "--jobs",
+            "2",
+            "--confirm-rights",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen == {
+        "project_dir": tmp_project_dir.resolve(),
+        "backend_kind": "mock",
+        "confirm_rights": True,
+        "jobs": 2,
+    }
+    assert "Source speaker assignment complete" in result.output
+
+
+def test_source_speakers_cli_defaults_to_four_jobs(
+    cli_runner,
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_source_speakers_step(
+        project_dir: Path,
+        backend_kind: str | None = None,
+        confirm_rights: bool = False,
+        jobs: int = 1,
+    ):
+        seen["project_dir"] = project_dir
+        seen["backend_kind"] = backend_kind
+        seen["confirm_rights"] = confirm_rights
+        seen["jobs"] = jobs
         return PipelineManifest(stage_state={"source-speakers": {"assigned_segments": 1}})
 
     monkeypatch.setattr(cli_module, "source_speakers_step", fake_source_speakers_step)
@@ -621,8 +1388,13 @@ def test_source_speakers_cli_invokes_stage(
         "project_dir": tmp_project_dir.resolve(),
         "backend_kind": "mock",
         "confirm_rights": True,
+        "jobs": 4,
     }
     assert "Source speaker assignment complete" in result.output
+
+
+def test_project_config_uses_default_diarization_threshold() -> None:
+    assert ProjectConfig().diarization_embedding_match_threshold == 0.75
 
 
 def test_pyannote_model_resolution_uses_local_cache_then_download(
@@ -779,4 +1551,4 @@ def test_voice_bank_build_audio_discovers_audio_dir_and_applies_personal_default
     cfg = load_project_config(project)
     assert cfg.speaker_assignment_backend == "pyannote"
     assert cfg.diarization_auto_download is True
-    assert cfg.diarization_embedding_match_threshold == 0.78
+    assert cfg.diarization_embedding_match_threshold == 0.75

@@ -14,7 +14,9 @@ import re
 import shlex
 import shutil
 import subprocess
+import unicodedata
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from inspect import signature
@@ -67,6 +69,7 @@ from asmr_dub_pipeline.audio.segmentation import (
     energy_segments,
     load_manual_segments,
     write_segment_audio_clips,
+    write_segment_audio_clips_from_parts,
 )
 from asmr_dub_pipeline.audio.separation import (
     SourceSeparationUnavailable,
@@ -104,6 +107,9 @@ from asmr_dub_pipeline.gpt_sovits.few_shot import (
     FEW_SHOT_ARTIFACT_SOVITS,
     FEW_SHOT_STAGE,
     FewShotTrainingProgress,
+    few_shot_min_total_sec,
+    select_training_items,
+    select_training_speaker_ids,
     train_few_shot,
 )
 from asmr_dub_pipeline.gpt_sovits.refs import load_refs, resolve_ref, resolve_refs_json_path
@@ -149,18 +155,38 @@ from asmr_dub_pipeline.rvc import (
     validate_rvc_training_config,
 )
 from asmr_dub_pipeline.schemas import (
+    GSVSpeakerConfig,
     JapaneseScript,
+    KoreanTranslation,
     PipelineManifest,
     ProjectConfig,
     RightsAudit,
     RVCMetadata,
     RVCProfile,
+    RVCSpeakerConfig,
     Segment,
     SourceScript,
     TTSCandidate,
     TTSMetadata,
 )
-from asmr_dub_pipeline.script.duration_rewrite import rewrite_for_duration
+from asmr_dub_pipeline.script.countdown import (
+    COUNTDOWN_EVENT_KEY,
+    COUNTDOWN_EVENT_NOTE,
+    countdown_korean_text,
+    countdown_korean_tokens,
+    is_descending_countdown,
+    is_descending_countdown_prefix,
+    native_korean_count_number,
+    repair_descending_countdown_text,
+    source_countdown_token_matches,
+    source_countdown_values,
+)
+from asmr_dub_pipeline.script.duration_rewrite import (
+    estimate_tts_duration,
+    korean_tts_speech_char_count,
+    korean_tts_timing_budget,
+    rewrite_for_duration,
+)
 from asmr_dub_pipeline.script.korean_colloquial import (
     COLLOQUIAL_REWRITE_NOTE,
     colloquialize_korean_translation,
@@ -176,8 +202,12 @@ from asmr_dub_pipeline.voice_bank import (
     validate_voice_bank_models,
 )
 
-NO_SPEECH_STATUSES = {"no_speech_detected"}
+NO_SPEECH_STATUSES = {"no_speech_detected", "non_speech_texture"}
 SKIP_STATUSES = {"needs_manual_review", "failed", *NO_SPEECH_STATUSES}
+ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_RATE = 0.02
+ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_COUNT = 3
+ASR_SOURCE_SEPARATION_FALLBACK_SEPARATED_SOURCES = {"source_vocals_mono_16k"}
+GSV_API_MIN_REF_SEC = 3.0
 GEMMA_TEXT_SERVER_UNAVAILABLE_MARKERS = (
     "Connection refused",
     "Connection reset",
@@ -192,7 +222,77 @@ KOREAN_ASR_HOMOPHONE_POSTPROCESS_NOTE = "korean_asr_homophone_postprocess"
 KOREAN_ONOMATOPOEIA_POSTPROCESS_NOTE = "korean_onomatopoeia_postprocess"
 KOREAN_FLUENCY_POSTPROCESS_NOTE = "korean_fluency_postprocess"
 NUMERIC_ONLY_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
+NUMERIC_SEQUENCE_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,，、]+\d+)+\s*$")
 NUMERIC_TOKEN_RE = re.compile(r"\d+")
+REPEATED_CHAR_RUNAWAY_RE = re.compile(r"(.)\1{24,}")
+NON_SPEECH_TEXTURE_REPEAT_RE = re.compile(r"(.)\1{2,}")
+NON_SPEECH_TEXTURE_DOMINANT_REPEAT_RE = re.compile(r"(.)\1{24,}")
+NON_SPEECH_TEXTURE_CHARS = frozenset(
+    "ぁあぃいぅうぇえぉおァアィイゥウェエォオ"
+    "んンっッはハひヒふフへヘほホゃゅょャュョ"
+    "ーｰ〜～"
+)
+NON_SPEECH_TEXTURE_MARKERS = frozenset("ぁぃぅぇぉァィゥェォっッーｰ〜～")
+NON_SPEECH_TEXTURE_DOMINANT_REPEAT_CHARS = frozenset(
+    "ぁあぃいぅうぇえぉおァアィイゥウェエォオんンっッ"
+)
+NON_SPEECH_TEXTURE_SPARSE_TOKENS = frozenset(
+    (
+        "ぁ",
+        "あ",
+        "ぃ",
+        "い",
+        "ぅ",
+        "う",
+        "ぇ",
+        "え",
+        "ぉ",
+        "お",
+        "ァ",
+        "ア",
+        "ィ",
+        "イ",
+        "ゥ",
+        "ウ",
+        "ェ",
+        "エ",
+        "ォ",
+        "オ",
+        "ん",
+        "ン",
+        "っ",
+        "ッ",
+        "は",
+        "ハ",
+        "ふ",
+        "フ",
+        "声",
+        "音",
+        "息",
+        "呼吸",
+        "吐息",
+        "再",
+        "び",
+        "ビ",
+    )
+)
+NON_SPEECH_TEXTURE_PUNCTUATION = frozenset("…♪♡❤・ーｰ〜～")
+SPARSE_SPEECH_NATURAL_CUES = (
+    "です",
+    "ます",
+    "まま",
+    "なさい",
+    "ください",
+    "して",
+    "した",
+    "いる",
+    "ない",
+    "反応",
+    "姿勢",
+    "吸って",
+    "吐いて",
+)
+SPARSE_SPEECH_PARTICLE_CUES = frozenset("のにをがはへともで")
 RAW_DIGIT_RE = re.compile(r"(?<![A-Za-z_])\d+(?![A-Za-z_])")
 JAPANESE_SECOND_ORDINAL_RE = re.compile(r"第\s*(?:二|2|２)\s*の")
 KOREAN_BAD_SECOND_ORDINAL_RE = re.compile(r"제\s*이의\s*")
@@ -270,6 +370,8 @@ RVC_REQUIRED_MESSAGE = (
     "RVC is required but has not completed. Run `asmr-dub rvc --project ... "
     "--confirm-rights` or use `asmr-dub full --real ...`."
 )
+RVC_INSUFFICIENT_TRAINING_DATA_PREFIX = "train-rvc insufficient clean source voice data:"
+RVC_TRAIN_AUGMENT_METHODS = ("gain_minus3", "gain_plus3", "highpass_80", "lowpass_7600")
 
 
 @dataclass(frozen=True)
@@ -530,7 +632,21 @@ def _resolve_gpt_weights_for_tts(
 def _gsv_speaker_cfg(cfg: ProjectConfig, segment: Segment):
     if not segment.speaker_id:
         return None
-    return cfg.gsv_speaker_models.get(segment.speaker_id)
+    speaker_cfg = cfg.gsv_speaker_models.get(segment.speaker_id)
+    if speaker_cfg is not None:
+        return speaker_cfg
+    fallback_id = _gsv_model_fallback_speaker_id(segment)
+    if fallback_id:
+        return cfg.gsv_speaker_models.get(fallback_id)
+    return None
+
+
+def _gsv_model_fallback_speaker_id(segment: Segment) -> str | None:
+    fallback = segment.analysis.get("source_speaker_model_fallback")
+    if not isinstance(fallback, dict):
+        return None
+    speaker_id = fallback.get("speaker_id")
+    return str(speaker_id) if speaker_id else None
 
 
 def _resolve_gsv_speaker_path(project_dir: Path, raw_path: str) -> Path:
@@ -549,12 +665,17 @@ def _validate_gsv_speaker_models(project_dir: Path, manifest: PipelineManifest) 
     missing: list[str] = []
     errors: list[str] = []
     for segment in _active_segments_requiring_voice_bank(manifest):
-        if not segment.speaker_id or segment.speaker_id not in cfg.gsv_speaker_models:
+        speaker_cfg = _gsv_speaker_cfg(cfg, segment)
+        effective_speaker_id = (
+            segment.speaker_id
+            if segment.speaker_id in cfg.gsv_speaker_models
+            else _gsv_model_fallback_speaker_id(segment)
+        )
+        if not segment.speaker_id or speaker_cfg is None or not effective_speaker_id:
             missing.append(segment.id)
             continue
-        speaker_cfg = cfg.gsv_speaker_models[segment.speaker_id]
         if not speaker_cfg.gpt_weights_path:
-            errors.append(f"{segment.speaker_id} GPT weights missing: <not configured>")
+            errors.append(f"{effective_speaker_id} GPT weights missing: <not configured>")
         for label, raw_path in (
             ("GPT weights", speaker_cfg.gpt_weights_path),
             ("SoVITS weights", speaker_cfg.sovits_weights_path),
@@ -564,7 +685,7 @@ def _validate_gsv_speaker_models(project_dir: Path, manifest: PipelineManifest) 
                 continue
             path = _resolve_gsv_speaker_path(project_dir, raw_path)
             if not path.exists():
-                errors.append(f"{segment.speaker_id} {label} missing: {path}")
+                errors.append(f"{effective_speaker_id} {label} missing: {path}")
     if missing:
         errors.append("missing speaker model mapping for segments: " + ", ".join(missing[:20]))
     if errors:
@@ -574,6 +695,228 @@ def _validate_gsv_speaker_models(project_dir: Path, manifest: PipelineManifest) 
 def _ref_for_tts_language(ref: GPTSoVITSRef, tts_language: str) -> GPTSoVITSRef:
     _ = tts_language
     return ref
+
+
+def _segment_source_ref_for_gsv(
+    project_dir: Path,
+    segment: Segment,
+    cfg: ProjectConfig,
+    all_segments: Sequence[Segment] | None = None,
+) -> tuple[GPTSoVITSRef | None, dict[str, Any]]:
+    mode = getattr(cfg, "gsv_ref_mode", "static")
+    metadata: dict[str, Any] = {
+        "mode": mode,
+        "segment_id": segment.id,
+        "used": False,
+        "reject_reasons": [],
+    }
+    if mode not in {"segment", "auto"}:
+        metadata["reject_reasons"] = ["ref_mode_static"]
+        return None, metadata
+    source_language = _canonical_language(getattr(cfg, "source_language", "ja"))
+    target_language = _canonical_language(getattr(cfg, "target_language", "ko"))
+    if mode == "auto" and source_language == target_language:
+        metadata["reject_reasons"] = ["auto_mode_same_source_and_target_language"]
+        return None, metadata
+    effective_ref_min_sec = max(float(cfg.gsv_ref_min_sec), GSV_API_MIN_REF_SEC)
+    if segment.duration < effective_ref_min_sec:
+        span = _build_segment_neighbor_ref_span(
+            all_segments or (),
+            segment,
+            source_language=source_language,
+            min_sec=effective_ref_min_sec,
+            max_sec=float(cfg.gsv_ref_max_sec),
+            max_gap_sec=float(getattr(cfg, "asr_resegment_merge_gap_sec", 1.0)),
+        )
+        if span is not None:
+            span_ref = _write_segment_neighbor_ref_for_gsv(
+                project_dir,
+                span,
+                segment,
+                cfg,
+                source_language=source_language,
+                target_language=target_language,
+                metadata=metadata,
+            )
+            if span_ref is not None:
+                return span_ref, metadata
+        reason = (
+            "duration_below_gsv_api_ref_min"
+            if effective_ref_min_sec > float(cfg.gsv_ref_min_sec)
+            else "duration_below_ref_min"
+        )
+        metadata["reject_reasons"] = [
+            f"{reason}:{segment.duration:.3f}<{effective_ref_min_sec:.3f}"
+        ]
+        return None, metadata
+    if segment.duration > cfg.gsv_ref_max_sec:
+        metadata["reject_reasons"] = [
+            f"duration_above_ref_max:{segment.duration:.3f}>{cfg.gsv_ref_max_sec:.3f}"
+        ]
+        return None, metadata
+    check = evaluate_voice_training_candidate(
+        project_dir,
+        segment,
+        cfg,
+        min_quality_score=cfg.gsv_ref_min_quality_score,
+        require_source_script=True,
+        require_speaker_id=False,
+        source_language=source_language,
+    )
+    if not check.accepted or not check.source_audio_path or not segment.source_script:
+        metadata["reject_reasons"] = list(check.reject_reasons or ("missing_segment_reference",))
+        metadata["clean_source_metrics"] = check.clean_source_metrics
+        return None, metadata
+    metadata.update(
+        {
+            "used": True,
+            "ref_audio_path": str(check.source_audio_path),
+            "prompt_lang": segment.source_script.language or source_language,
+            "clean_source_metrics": check.clean_source_metrics,
+        }
+    )
+    return (
+        GPTSoVITSRef(
+            ref_audio_path=str(check.source_audio_path),
+            prompt_text=segment.source_script.text.strip(),
+            prompt_lang=segment.source_script.language or source_language,
+            aux_ref_audio_paths=[],
+            source_language=source_language,
+            target_language=target_language,
+            cross_lingual_role="segment_source_prompt_for_tts",
+        ),
+        metadata,
+    )
+
+
+def _build_segment_neighbor_ref_span(
+    all_segments: Sequence[Segment],
+    target: Segment,
+    *,
+    source_language: str,
+    min_sec: float,
+    max_sec: float,
+    max_gap_sec: float,
+) -> _VoiceRefSpan | None:
+    candidates = [
+        segment
+        for segment in sorted(all_segments, key=lambda item: (item.start, item.end, item.id))
+        if _segment_can_seed_voice_ref(segment, source_language)
+    ]
+    try:
+        target_index = next(index for index, segment in enumerate(candidates) if segment.id == target.id)
+    except StopIteration:
+        return None
+    duration = target.duration
+    if duration <= 0 or duration >= min_sec or duration > max_sec:
+        return None
+    start_index = target_index
+    end_index = target_index
+    while duration < min_sec:
+        options: list[tuple[float, int, str, Segment]] = []
+        previous_index = start_index - 1
+        if previous_index >= 0:
+            previous = candidates[previous_index]
+            gap = max(0.0, candidates[start_index].start - previous.end)
+            if (
+                gap <= max_gap_sec
+                and duration + previous.duration <= max_sec
+                and _segments_can_share_segment_ref(target, previous)
+            ):
+                options.append((gap, 1, "previous", previous))
+        next_index = end_index + 1
+        if next_index < len(candidates):
+            next_segment = candidates[next_index]
+            gap = max(0.0, next_segment.start - candidates[end_index].end)
+            if (
+                gap <= max_gap_sec
+                and duration + next_segment.duration <= max_sec
+                and _segments_can_share_segment_ref(target, next_segment)
+            ):
+                options.append((gap, 0, "next", next_segment))
+        if not options:
+            return None
+        _, _, side, selected = min(options, key=lambda item: (item[0], item[1], item[3].start))
+        duration += selected.duration
+        if side == "previous":
+            start_index -= 1
+        else:
+            end_index += 1
+    return _VoiceRefSpan(tuple(candidates[start_index : end_index + 1]), duration)
+
+
+def _segments_can_share_segment_ref(target: Segment, neighbor: Segment) -> bool:
+    if target.speaker_id and neighbor.speaker_id and target.speaker_id != neighbor.speaker_id:
+        return False
+    target_count = _segment_ref_speaker_count(target.analysis)
+    neighbor_count = _segment_ref_speaker_count(neighbor.analysis)
+    return target_count in {None, 1} and neighbor_count in {None, 1}
+
+
+def _segment_ref_speaker_count(analysis: dict[str, Any]) -> int | None:
+    value = analysis.get("speaker_count")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _write_segment_neighbor_ref_for_gsv(
+    project_dir: Path,
+    span: _VoiceRefSpan,
+    target: Segment,
+    cfg: ProjectConfig,
+    *,
+    source_language: str,
+    target_language: str,
+    metadata: dict[str, Any],
+) -> GPTSoVITSRef | None:
+    ref_path = ensure_inside_project(
+        project_dir,
+        (project_dir / "work" / "gpt_sovits" / "segment_refs" / f"{target.id}_ref.wav").resolve(),
+    )
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_voice_ref_span(project_dir, span, ref_path)
+        metrics = measure_source_voice_quality(ref_path)
+    except Exception as exc:
+        metadata["reject_reasons"] = [f"neighbor_ref_write_failed:{exc}"]
+        return None
+    if metrics.score < cfg.gsv_ref_min_quality_score:
+        metadata["reject_reasons"] = [
+            f"quality_score_below_ref_min:{metrics.score:.3f}<{cfg.gsv_ref_min_quality_score:.3f}"
+        ]
+        metadata["clean_source_metrics"] = metrics.as_payload()
+        return None
+    prompt_text = _voice_ref_span_prompt_text(span)
+    prompt_lang = (
+        span.segments[0].source_script.language
+        if span.segments[0].source_script
+        else source_language
+    )
+    metadata.update(
+        {
+            "used": True,
+            "expanded_with_neighbors": True,
+            "ref_audio_path": str(ref_path),
+            "prompt_lang": prompt_lang,
+            "span_segment_ids": [segment.id for segment in span.segments],
+            "span_duration_sec": round(span.duration, 6),
+            "clean_source_metrics": metrics.as_payload(),
+        }
+    )
+    return GPTSoVITSRef(
+        ref_audio_path=str(ref_path),
+        prompt_text=prompt_text,
+        prompt_lang=prompt_lang,
+        aux_ref_audio_paths=[],
+        source_language=source_language,
+        target_language=target_language,
+        cross_lingual_role="segment_neighbor_span_source_prompt_for_tts",
+    )
 
 
 def _tts_request_debug_payload(
@@ -599,6 +942,56 @@ def _can_rewrite_script_for_duration(script: JapaneseScript) -> bool:
     return normalized in JAPANESE_TTS_LANGUAGES or normalized in KOREAN_TTS_LANGUAGES
 
 
+def _clipped_asr_words(chunk: ASRChunk, *, start: float, end: float) -> list[Any]:
+    clipped: list[Any] = []
+    for word in chunk.words:
+        text = word.text.strip()
+        word_start = max(start, float(word.start))
+        word_end = min(end, float(word.end))
+        if not text or word_end <= word_start:
+            continue
+        clipped.append(word.model_copy(update={"start": word_start, "end": word_end, "text": text}))
+    return clipped
+
+
+def _tighten_sparse_asr_chunk_timing_from_words(
+    chunk: ASRChunk,
+    *,
+    sparse_chunk_min_chars_per_sec: float,
+    audio_duration_sec: float | None,
+    sparse_timing_min_sec: float = 12.0,
+    padding_sec: float = 0.4,
+) -> ASRChunk:
+    if not chunk.words or sparse_chunk_min_chars_per_sec <= 0:
+        return chunk
+    text = chunk.text.strip()
+    duration = max(0.001, float(chunk.end) - float(chunk.start))
+    if duration < sparse_timing_min_sec or len(text) / duration >= sparse_chunk_min_chars_per_sec:
+        return chunk
+    word_starts = [float(word.start) for word in chunk.words if word.text.strip()]
+    word_ends = [float(word.end) for word in chunk.words if word.text.strip()]
+    if not word_starts or not word_ends:
+        return chunk
+    word_start = max(float(chunk.start), min(word_starts))
+    word_end = min(float(chunk.end), max(word_ends))
+    if word_end <= word_start:
+        return chunk
+    start = max(0.0, word_start - padding_sec)
+    end = word_end + padding_sec
+    if audio_duration_sec is not None:
+        end = min(float(audio_duration_sec), end)
+    end = max(start + 0.05, end)
+    if end - start >= duration * 0.8:
+        return chunk
+    return chunk.model_copy(
+        update={
+            "start": start,
+            "end": end,
+            "words": _clipped_asr_words(chunk, start=start, end=end),
+        }
+    )
+
+
 def _valid_asr_chunks(
     chunks: list[ASRChunk],
     audio_duration_sec: float | None,
@@ -618,14 +1011,26 @@ def _valid_asr_chunks(
             end = min(float(audio_duration_sec), end)
         if end - start <= 0.05:
             continue
-        duration = end - start
+        normalized = chunk.model_copy(
+            update={
+                "start": start,
+                "end": end,
+                "text": text,
+                "words": _clipped_asr_words(chunk, start=start, end=end),
+            }
+        )
+        normalized = _tighten_sparse_asr_chunk_timing_from_words(
+            normalized,
+            sparse_chunk_min_chars_per_sec=sparse_chunk_min_chars_per_sec,
+            audio_duration_sec=audio_duration_sec,
+        )
+        duration = normalized.end - normalized.start
         if (
             duration > sparse_chunk_max_sec
             and sparse_chunk_min_chars_per_sec > 0
             and len(text) / duration < sparse_chunk_min_chars_per_sec
         ):
             continue
-        normalized = chunk.model_copy(update={"start": start, "end": end, "text": text})
         valid.extend(_split_long_asr_chunk(normalized, max_chunk_sec=max_chunk_sec))
     return valid
 
@@ -634,10 +1039,13 @@ def _split_long_asr_chunk(chunk: ASRChunk, *, max_chunk_sec: float) -> list[ASRC
     duration = chunk.end - chunk.start
     if duration <= max_chunk_sec:
         return [chunk]
-    part_count = max(1, int(math.ceil(duration / max_chunk_sec)))
     text = chunk.text.strip()
     if not text:
         return []
+    desired_part_count = max(1, int(math.ceil(duration / max_chunk_sec)))
+    part_count = min(desired_part_count, len(text))
+    if part_count <= 1:
+        return [chunk]
     split_points = _preferred_asr_text_split_points(text, part_count)
     start_indexes = [0, *split_points]
     end_indexes = [*split_points, len(text)]
@@ -650,7 +1058,16 @@ def _split_long_asr_chunk(chunk: ASRChunk, *, max_chunk_sec: float) -> list[ASRC
     for index, part in enumerate(parts):
         start = chunk.start + part_duration * index
         end = chunk.end if index == len(parts) - 1 else chunk.start + part_duration * (index + 1)
-        split_chunks.append(chunk.model_copy(update={"start": start, "end": end, "text": part}))
+        split_chunks.append(
+            chunk.model_copy(
+                update={
+                    "start": start,
+                    "end": end,
+                    "text": part,
+                    "words": _clipped_asr_words(chunk, start=start, end=end),
+                }
+            )
+        )
     return split_chunks
 
 
@@ -753,6 +1170,648 @@ def _group_asr_chunks_for_tts(
     return groups
 
 
+def _asr_group_text(group: list[ASRChunk]) -> str:
+    return " ".join(chunk.text.strip() for chunk in group if chunk.text.strip()).strip()
+
+
+def _segment_text_density(text: str, duration: float) -> float:
+    compact = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+", "", text)
+    return len(compact) / max(0.001, duration)
+
+
+def _segment_is_sparse_edge_candidate(segment: Segment, cfg: Any) -> bool:
+    source_script = segment.source_script
+    if source_script is None:
+        return False
+    text = source_script.text.strip()
+    if not text or _asr_text_looks_non_speech_texture(text, duration=segment.duration):
+        return False
+    compact = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+", "", text)
+    sparse_min_sec = float(getattr(cfg, "asr_repair_sparse_min_sec", 12.0))
+    short_sparse_fragment = segment.duration >= 8.0 and len(compact) <= 2
+    if segment.duration < sparse_min_sec and not short_sparse_fragment:
+        return False
+    min_density = float(getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0))
+    return _segment_text_density(text, segment.duration) < min_density
+
+
+def _segment_audio_activity_spans(
+    audio_path: Path,
+    *,
+    threshold_db: float,
+    frame_ms: float = 50.0,
+    merge_gap_sec: float = 0.35,
+) -> list[tuple[float, float]]:
+    data, sample_rate = load_audio(audio_path)
+    mono = to_mono(data)
+    frame = max(1, int(round(sample_rate * frame_ms / 1000.0)))
+    threshold = 10 ** (threshold_db / 20.0)
+    active: list[tuple[float, float]] = []
+    for start in range(0, len(mono), frame):
+        chunk = mono[start : start + frame]
+        if len(chunk) == 0:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(chunk))))
+        if rms <= threshold:
+            continue
+        active.append((start / sample_rate, min(len(mono), start + frame) / sample_rate))
+    if not active:
+        return []
+    merged: list[tuple[float, float]] = []
+    for start, end in active:
+        if merged and start - merged[-1][1] <= merge_gap_sec:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _texts_for_activity_spans(text: str, span_count: int) -> list[str] | None:
+    if span_count <= 0:
+        return None
+    text = text.strip()
+    if span_count == 1:
+        return [text]
+    tokens = [token for token in re.split(r"[\s　]+", text) if token]
+    if len(tokens) < span_count:
+        return None
+    if len(tokens) == span_count:
+        return tokens
+    groups: list[str] = []
+    for index in range(span_count):
+        start = round(len(tokens) * index / span_count)
+        end = round(len(tokens) * (index + 1) / span_count)
+        groups.append(" ".join(tokens[start:end]).strip())
+    return groups if all(groups) else None
+
+
+def _copy_source_script_for_span(
+    source_script: SourceScript,
+    *,
+    start: float,
+    end: float,
+    text: str | None = None,
+    backend: str | None = None,
+) -> SourceScript:
+    return source_script.model_copy(
+        update={
+            "text": source_script.text.strip() if text is None else text,
+            "start": start,
+            "end": end,
+            "backend": source_script.backend if backend is None else backend,
+        }
+    )
+
+
+def _make_segment_like(
+    segment: Segment,
+    *,
+    start: float,
+    end: float,
+    source_script: SourceScript | None,
+    status: str = "raw",
+    errors: list[str] | None = None,
+    analysis: dict[str, Any] | None = None,
+) -> Segment:
+    start = round(start, 3)
+    end = round(max(start + 0.05, end), 3)
+    return segment.model_copy(
+        update={
+            "start": start,
+            "end": end,
+            "duration": round(end - start, 3),
+            "source_script": source_script,
+            "status": status,
+            "errors": list(errors or []),
+            "analysis": dict(analysis or {}),
+            "script": None,
+            "translation_ko": None,
+            "tts": None,
+            "rvc": None,
+            "qc": None,
+            "mix": {},
+        }
+    )
+
+
+def _split_sparse_segment_by_activity(
+    segment: Segment,
+    *,
+    cfg: Any,
+) -> list[Segment] | None:
+    source_script = segment.source_script
+    if source_script is None or not _segment_is_sparse_edge_candidate(segment, cfg):
+        return None
+    audio_path = Path(segment.audio_for_gemma)
+    if not audio_path.exists():
+        return None
+    threshold_db = float(getattr(cfg, "asr_segmentation_silence_db", -45.0))
+    spans = _segment_audio_activity_spans(audio_path, threshold_db=threshold_db)
+    if not spans:
+        return None
+    active_total = sum(end - start for start, end in spans)
+    if active_total / max(0.001, segment.duration) > 0.35:
+        return None
+    texts = _texts_for_activity_spans(source_script.text, len(spans))
+    if texts is None:
+        return None
+    pieces: list[Segment] = []
+    cursor = float(segment.start)
+    pad_sec = 0.25
+    min_texture_sec = 1.0
+    for (active_start, active_end), text in zip(spans, texts, strict=True):
+        speech_start = max(float(segment.start), float(segment.start) + active_start - pad_sec)
+        speech_end = min(float(segment.end), float(segment.start) + active_end + pad_sec)
+        if speech_start - cursor >= min_texture_sec:
+            texture_script = SourceScript(
+                text="…",
+                language=source_script.language,
+                backend="audio_energy",
+                start=cursor,
+                end=speech_start,
+                confidence=None,
+            )
+            pieces.append(
+                _make_segment_like(
+                    segment,
+                    start=cursor,
+                    end=speech_start,
+                    source_script=texture_script,
+                    status="non_speech_texture",
+                    errors=["asr_non_speech_texture"],
+                )
+            )
+        speech_script = _copy_source_script_for_span(
+            source_script,
+            start=speech_start,
+            end=speech_end,
+            text=text,
+        )
+        pieces.append(
+            _make_segment_like(
+                segment,
+                start=speech_start,
+                end=speech_end,
+                source_script=speech_script,
+                analysis={"asr_sparse_edge_speech": True},
+            )
+        )
+        cursor = speech_end
+    if float(segment.end) - cursor >= min_texture_sec:
+        texture_script = SourceScript(
+            text="…",
+            language=source_script.language,
+            backend="audio_energy",
+            start=cursor,
+            end=float(segment.end),
+            confidence=None,
+        )
+        pieces.append(
+            _make_segment_like(
+                segment,
+                start=cursor,
+                end=float(segment.end),
+                source_script=texture_script,
+                status="non_speech_texture",
+                errors=["asr_non_speech_texture"],
+            )
+        )
+    return pieces if pieces else None
+
+
+def _merge_source_scripts(left: SourceScript, right: SourceScript, *, start: float, end: float) -> SourceScript:
+    left_text = left.text.strip()
+    right_text = right.text.strip()
+    confidence: float | None = None
+    if left.confidence is not None or right.confidence is not None:
+        left_duration = max(0.0, left.end - left.start)
+        right_duration = max(0.0, right.end - right.start)
+        weighted: list[tuple[float, float]] = []
+        if left.confidence is not None:
+            weighted.append((float(left.confidence), left_duration))
+        if right.confidence is not None:
+            weighted.append((float(right.confidence), right_duration))
+        total = sum(weight for _, weight in weighted)
+        confidence = (
+            sum(value * weight for value, weight in weighted) / total
+            if total > 0
+            else left.confidence or right.confidence
+        )
+    return left.model_copy(
+        update={
+            "text": " ".join(part for part in (left_text, right_text) if part),
+            "start": start,
+            "end": end,
+            "confidence": confidence,
+        }
+    )
+
+
+def _merge_sparse_edge_speech_segments(
+    segments: list[Segment],
+    *,
+    merge_gap_sec: float,
+    max_segment_sec: float,
+) -> list[Segment]:
+    merged = [segment.model_copy(deep=True) for segment in segments]
+    index = 0
+    while index < len(merged):
+        segment = merged[index]
+        if not segment.analysis.get("asr_sparse_edge_speech") or segment.source_script is None:
+            index += 1
+            continue
+        candidates: list[tuple[float, str, int]] = []
+        if index > 0 and merged[index - 1].status not in NO_SPEECH_STATUSES and merged[index - 1].source_script:
+            left = merged[index - 1]
+            gap = segment.start - left.end
+            if 0 <= gap <= merge_gap_sec and segment.end - left.start <= max_segment_sec:
+                candidates.append((gap, "left", index - 1))
+        if (
+            index + 1 < len(merged)
+            and merged[index + 1].status not in NO_SPEECH_STATUSES
+            and merged[index + 1].source_script
+        ):
+            right = merged[index + 1]
+            gap = right.start - segment.end
+            if 0 <= gap <= merge_gap_sec and right.end - segment.start <= max_segment_sec:
+                candidates.append((gap, "right", index + 1))
+        if not candidates:
+            segment.analysis.pop("asr_sparse_edge_speech", None)
+            index += 1
+            continue
+        _, side, target_index = min(candidates, key=lambda item: (item[0], item[1] != "left"))
+        if side == "left":
+            target = merged[target_index]
+            assert target.source_script is not None
+            source_script = _merge_source_scripts(
+                target.source_script,
+                segment.source_script,
+                start=target.start,
+                end=segment.end,
+            )
+            merged[target_index] = target.model_copy(
+                update={
+                    "end": segment.end,
+                    "duration": round(segment.end - target.start, 3),
+                    "source_script": source_script,
+                }
+            )
+            del merged[index]
+            index = max(0, target_index)
+        else:
+            target = merged[target_index]
+            assert target.source_script is not None
+            source_script = _merge_source_scripts(
+                segment.source_script,
+                target.source_script,
+                start=segment.start,
+                end=target.end,
+            )
+            merged[target_index] = target.model_copy(
+                update={
+                    "start": segment.start,
+                    "duration": round(target.end - segment.start, 3),
+                    "source_script": source_script,
+                }
+            )
+            del merged[index]
+    return merged
+
+
+def _renumber_segments_for_project(segments: list[Segment], project_dir: Path) -> list[Segment]:
+    audio_base = project_dir / "work" / "segments" / "audio"
+    renumbered: list[Segment] = []
+    for index, segment in enumerate(segments, start=1):
+        seg_id = f"seg_{index:04d}"
+        source_script = segment.source_script
+        if source_script is not None:
+            source_script = source_script.model_copy(
+                update={"start": segment.start, "end": segment.end}
+            )
+        renumbered.append(
+            segment.model_copy(
+                update={
+                    "id": seg_id,
+                    "audio_for_gemma": str(audio_base / f"{seg_id}_gemma.wav"),
+                    "audio_for_mix": str(audio_base / f"{seg_id}_mix.wav"),
+                    "source_script": source_script,
+                }
+            )
+        )
+    return renumbered
+
+
+def _split_sparse_edge_segments_by_audio(
+    segments: list[Segment],
+    *,
+    project_dir: Path,
+    cfg: Any,
+    merge_gap_sec: float,
+) -> list[Segment]:
+    pieces: list[Segment] = []
+    changed = False
+    for segment in segments:
+        split = _split_sparse_segment_by_activity(segment, cfg=cfg)
+        if split is None:
+            pieces.append(segment)
+            continue
+        pieces.extend(split)
+        changed = True
+    if not changed:
+        return segments
+    pieces.sort(key=lambda item: (item.start, item.end))
+    pieces = _merge_sparse_edge_speech_segments(
+        pieces,
+        merge_gap_sec=merge_gap_sec,
+        max_segment_sec=float(getattr(cfg, "asr_resegment_max_sec", 20.0)),
+    )
+    return _renumber_segments_for_project(pieces, project_dir)
+
+
+def _embedded_source_countdown_matches(text: str) -> list[tuple[int, str]] | None:
+    matches = source_countdown_token_matches(text)
+    if not matches:
+        return None
+    values = [value for value, _raw, _start, _end in matches]
+    if not is_descending_countdown(values):
+        return None
+    return [(value, raw) for value, raw, _start, _end in matches]
+
+
+def _embedded_source_countdown_values(text: str) -> list[int] | None:
+    matches = _embedded_source_countdown_matches(text)
+    if matches is None:
+        return None
+    return [value for value, _raw in matches]
+
+
+def _asr_group_countdown_values(group: list[ASRChunk]) -> list[int] | None:
+    text = _asr_group_text(group)
+    values = source_countdown_values(text)
+    if values is None:
+        values = _embedded_source_countdown_values(text)
+    if values is None or not values:
+        return None
+    return values
+
+
+def _merge_countdown_asr_groups(
+    groups: list[list[ASRChunk]],
+    *,
+    enabled: bool,
+    merge_gap_sec: float,
+    max_span_sec: float,
+) -> list[list[ASRChunk]]:
+    if not enabled or not groups:
+        return groups
+    merged: list[list[ASRChunk]] = []
+    current: list[list[ASRChunk]] = []
+    current_values: list[int] = []
+
+    def flush_current() -> None:
+        nonlocal current, current_values
+        if current and is_descending_countdown(current_values):
+            merged.append([chunk for group in current for chunk in group])
+        else:
+            merged.extend(current)
+        current = []
+        current_values = []
+
+    for group in groups:
+        values = _asr_group_countdown_values(group)
+        if values is None:
+            flush_current()
+            merged.append(group)
+            continue
+        if not current:
+            current = [group]
+            current_values = list(values)
+            continue
+        gap = group[0].start - current[-1][-1].end
+        span = group[-1].end - current[0][0].start
+        candidate_values = [*current_values, *values]
+        if (
+            gap <= merge_gap_sec
+            and span <= max_span_sec
+            and is_descending_countdown_prefix(candidate_values)
+        ):
+            current.append(group)
+            current_values = candidate_values
+            continue
+        flush_current()
+        current = [group]
+        current_values = list(values)
+    flush_current()
+    return merged
+
+
+def _absorb_micro_asr_groups_for_tts(
+    groups: list[list[ASRChunk]],
+    *,
+    merge_gap_sec: float,
+    max_segment_sec: float,
+    micro_max_sec: float = 0.6,
+) -> list[list[ASRChunk]]:
+    if len(groups) <= 1:
+        return groups
+    absorbed = [list(group) for group in groups]
+    absorb_gap_sec = max(float(merge_gap_sec), 1.5)
+    index = 0
+    while index < len(absorbed):
+        group = absorbed[index]
+        duration = group[-1].end - group[0].start
+        if duration <= 0 or duration > micro_max_sec or _asr_group_countdown_values(group):
+            index += 1
+            continue
+
+        candidates: list[tuple[float, str, int]] = []
+        if index > 0:
+            left = absorbed[index - 1]
+            gap = group[0].start - left[-1].end
+            combined_duration = group[-1].end - left[0].start
+            if 0 <= gap <= absorb_gap_sec and combined_duration <= max_segment_sec:
+                candidates.append((gap, "left", index - 1))
+        if index + 1 < len(absorbed):
+            right = absorbed[index + 1]
+            gap = right[0].start - group[-1].end
+            combined_duration = right[-1].end - group[0].start
+            if 0 <= gap <= absorb_gap_sec and combined_duration <= max_segment_sec:
+                candidates.append((gap, "right", index + 1))
+        if not candidates:
+            index += 1
+            continue
+
+        _, side, target_index = min(candidates, key=lambda item: (item[0], item[1] != "left"))
+        if side == "left":
+            absorbed[target_index].extend(group)
+            del absorbed[index]
+            index = max(0, target_index)
+        else:
+            absorbed[target_index] = [*group, *absorbed[target_index]]
+            del absorbed[index]
+    return absorbed
+
+
+def _asr_word_countdown_timeline(
+    group: list[ASRChunk],
+    values: list[int],
+) -> list[dict[str, Any]] | None:
+    tokens = countdown_korean_tokens(values)
+    if tokens is None:
+        return None
+    timeline: list[dict[str, Any]] = []
+    for chunk in sorted(group, key=lambda item: (item.start, item.end)):
+        for word in sorted(chunk.words, key=lambda item: (item.start, item.end)):
+            source_text = word.text.strip()
+            if not source_text:
+                continue
+            word_values = source_countdown_values(source_text.strip(".,、。"))
+            if word_values is None or len(word_values) != 1:
+                continue
+            start = float(word.start)
+            end = float(word.end)
+            if end <= start:
+                continue
+            item: dict[str, Any] = {
+                "value": word_values[0],
+                "source_text": source_text,
+                "start": round(start, 6),
+                "end": round(end, 6),
+            }
+            if word.confidence is not None:
+                item["confidence"] = round(float(word.confidence), 6)
+            timeline.append(item)
+    if [int(item["value"]) for item in timeline] != values:
+        return _asr_chunk_countdown_timeline(group, values)
+    for item, token in zip(timeline, tokens, strict=True):
+        item["korean_token"] = token
+    return timeline
+
+
+def _asr_chunk_countdown_timeline(
+    group: list[ASRChunk],
+    values: list[int],
+) -> list[dict[str, Any]] | None:
+    tokens = countdown_korean_tokens(values)
+    if tokens is None:
+        return None
+    timeline: list[dict[str, Any]] = []
+    for chunk in sorted(group, key=lambda item: (item.start, item.end)):
+        chunk_matches: list[tuple[int, str]]
+        chunk_values = source_countdown_values(chunk.text.strip())
+        if chunk_values is not None:
+            chunk_matches = [(value, str(value)) for value in chunk_values]
+        else:
+            embedded_matches = _embedded_source_countdown_matches(chunk.text.strip())
+            if embedded_matches is None:
+                return None
+            chunk_matches = embedded_matches
+            chunk_values = [value for value, _raw in chunk_matches]
+        if not chunk_values:
+            return None
+        value_count = len(chunk_values)
+        if value_count <= 0:
+            return None
+        duration = max(0.0, float(chunk.end) - float(chunk.start))
+        if duration <= 0:
+            return None
+        for local_index, value in enumerate(chunk_values):
+            start = float(chunk.start) + duration * local_index / value_count
+            end = float(chunk.start) + duration * (local_index + 1) / value_count
+            raw_text = chunk_matches[local_index][1]
+            source_text = chunk.text.strip() if value_count == 1 else raw_text
+            item: dict[str, Any] = {
+                "value": value,
+                "source_text": source_text,
+                "start": round(start, 6),
+                "end": round(end, 6),
+            }
+            if chunk.confidence is not None:
+                item["confidence"] = round(float(chunk.confidence), 6)
+            timeline.append(item)
+    if [int(item["value"]) for item in timeline] != values:
+        return None
+    for item, token in zip(timeline, tokens, strict=True):
+        item["korean_token"] = token
+    return timeline
+
+
+def _countdown_timeline_summary(segments: Sequence[Segment]) -> dict[str, Any]:
+    event_count = 0
+    timeline_count = 0
+    missing_ids: list[str] = []
+    for segment in segments:
+        event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
+        if not isinstance(event, dict):
+            continue
+        raw_values = event.get("values")
+        if not isinstance(raw_values, list) or not all(isinstance(value, int) for value in raw_values):
+            continue
+        values = [int(value) for value in raw_values]
+        if not is_descending_countdown(values):
+            continue
+        event_count += 1
+        raw_timeline = event.get("token_timeline")
+        if isinstance(raw_timeline, list) and len(raw_timeline) == len(values):
+            timeline_count += 1
+        else:
+            missing_ids.append(segment.id)
+    return {
+        "countdown_event_count": event_count,
+        "countdown_token_timeline_count": timeline_count,
+        "countdown_token_timeline_missing": len(missing_ids),
+        "countdown_token_timeline_missing_ids": missing_ids[:50],
+    }
+
+
+def _warn_missing_countdown_timelines(
+    manifest: PipelineManifest,
+    summary: Mapping[str, Any],
+    *,
+    word_timestamps_enabled: bool,
+) -> None:
+    missing = int(summary.get("countdown_token_timeline_missing", 0) or 0)
+    total = int(summary.get("countdown_event_count", 0) or 0)
+    if not word_timestamps_enabled or total <= 0 or missing <= 0:
+        return
+    ids = [str(value) for value in summary.get("countdown_token_timeline_missing_ids", [])]
+    suffix = f" ids={','.join(ids[:10])}" if ids else ""
+    _manifest_warning_once(
+        manifest,
+        f"countdown token timeline missing for {missing}/{total} countdown segments; "
+        f"TTS will use chunk/equal-slot fallback where needed.{suffix}",
+    )
+
+
+def _countdown_event_payload(
+    values: list[int],
+    *,
+    source_chunk_texts: list[str],
+    source_chunk_count: int,
+    merge_gap_sec: float,
+    max_span_sec: float,
+    token_timeline: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    korean_text = countdown_korean_text(values)
+    tokens = countdown_korean_tokens(values)
+    if korean_text is None or tokens is None:
+        return None
+    payload = {
+        "kind": "descending_countdown",
+        "values": values,
+        "korean_text": korean_text,
+        "korean_tokens": tokens,
+        "source_chunk_texts": source_chunk_texts,
+        "source_chunk_count": source_chunk_count,
+        "merge_gap_sec": merge_gap_sec,
+        "max_span_sec": max_span_sec,
+        "preserve_wall_clock_span": True,
+    }
+    if token_timeline:
+        payload["token_timeline"] = token_timeline
+    return payload
+
+
 def _segments_from_asr_chunks(
     chunks: list[ASRChunk],
     *,
@@ -765,6 +1824,9 @@ def _segments_from_asr_chunks(
     max_segment_sec: float = 20.0,
     sparse_chunk_max_sec: float = 30.0,
     sparse_chunk_min_chars_per_sec: float = 0.5,
+    countdown_merge_enabled: bool = True,
+    countdown_merge_gap_sec: float = 2.5,
+    countdown_merge_max_span_sec: float = 60.0,
 ) -> list[Segment]:
     groups = _group_asr_chunks_for_tts(
         _valid_asr_chunks(
@@ -777,6 +1839,17 @@ def _segments_from_asr_chunks(
         min_segment_sec=min_segment_sec,
         merge_gap_sec=merge_gap_sec,
     )
+    groups = _merge_countdown_asr_groups(
+        groups,
+        enabled=countdown_merge_enabled,
+        merge_gap_sec=countdown_merge_gap_sec,
+        max_span_sec=countdown_merge_max_span_sec,
+    )
+    groups = _absorb_micro_asr_groups_for_tts(
+        groups,
+        merge_gap_sec=merge_gap_sec,
+        max_segment_sec=max_segment_sec,
+    )
     segments: list[Segment] = []
     last_end = 0.0
     for index, group in enumerate(groups, start=1):
@@ -788,29 +1861,40 @@ def _segments_from_asr_chunks(
             continue
         duration = round(end - start, 3)
         seg_id = f"seg_{index:04d}"
-        text = " ".join(chunk.text.strip() for chunk in group if chunk.text.strip()).strip()
+        text = _asr_group_text(group)
         language = next((chunk.language for chunk in group if chunk.language), fallback_language)
         confidence = _asr_group_confidence(group)
         audio_base = project_dir / "work" / "segments" / "audio"
-        segments.append(
-            Segment(
-                id=seg_id,
+        segment = Segment(
+            id=seg_id,
+            start=start,
+            end=end,
+            duration=duration,
+            audio_for_gemma=str(audio_base / f"{seg_id}_gemma.wav"),
+            audio_for_mix=str(audio_base / f"{seg_id}_mix.wav"),
+            keep_original_texture=True,
+            source_script=SourceScript(
+                text=text,
+                language=language,
+                confidence=confidence,
+                backend=backend,
                 start=start,
                 end=end,
-                duration=duration,
-                audio_for_gemma=str(audio_base / f"{seg_id}_gemma.wav"),
-                audio_for_mix=str(audio_base / f"{seg_id}_mix.wav"),
-                keep_original_texture=True,
-                source_script=SourceScript(
-                    text=text,
-                    language=language,
-                    confidence=confidence,
-                    backend=backend,
-                    start=start,
-                    end=end,
-                ),
-            )
+            ),
         )
+        countdown_values = _asr_group_countdown_values(group)
+        if countdown_values is not None and is_descending_countdown(countdown_values):
+            payload = _countdown_event_payload(
+                countdown_values,
+                source_chunk_texts=[chunk.text.strip() for chunk in group if chunk.text.strip()],
+                source_chunk_count=len(group),
+                merge_gap_sec=countdown_merge_gap_sec,
+                max_span_sec=countdown_merge_max_span_sec,
+                token_timeline=_asr_word_countdown_timeline(group, countdown_values),
+            )
+            if payload is not None:
+                segment.analysis[COUNTDOWN_EVENT_KEY] = payload
+        segments.append(segment)
         last_end = end
     return segments
 
@@ -832,6 +1916,44 @@ def _asr_text_density(chunk: ASRChunk) -> float:
     return len(chunk.text.strip()) / duration
 
 
+def _asr_text_has_dominant_non_speech_repetition(compact: str) -> bool:
+    if len(compact) < 30:
+        return False
+    for match in NON_SPEECH_TEXTURE_DOMINANT_REPEAT_RE.finditer(compact):
+        repeated = match.group(1)
+        if repeated not in NON_SPEECH_TEXTURE_DOMINANT_REPEAT_CHARS:
+            continue
+        run_length = match.end() - match.start()
+        if run_length / max(1, len(compact)) >= 0.55 or len(compact) - run_length <= 16:
+            return True
+    return False
+
+
+def _asr_text_looks_non_speech_texture(text: str, *, duration: float) -> bool:
+    stripped = text.strip()
+    if source_countdown_values(text) is not None or NUMERIC_ONLY_SOURCE_RE.fullmatch(stripped):
+        return False
+    compact = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤]+", "", stripped)
+    if not compact:
+        return duration >= 2.0 and any(char in NON_SPEECH_TEXTURE_PUNCTUATION for char in stripped)
+    density = len(compact) / max(0.001, duration)
+    if duration >= 6.0 and compact in NON_SPEECH_TEXTURE_SPARSE_TOKENS:
+        return True
+    if _asr_text_has_dominant_non_speech_repetition(compact):
+        return True
+    if any(char not in NON_SPEECH_TEXTURE_CHARS for char in compact):
+        return False
+    has_texture_marker = bool(
+        NON_SPEECH_TEXTURE_REPEAT_RE.search(compact)
+        or any(char in NON_SPEECH_TEXTURE_MARKERS for char in compact)
+    )
+    if not has_texture_marker:
+        return False
+    if len(compact) <= 24:
+        return True
+    return duration >= 6.0 and density < 1.0
+
+
 def _asr_text_matches_suspicious_pattern(
     text: str,
     suspicious_text_patterns: list[str] | tuple[str, ...],
@@ -849,9 +1971,8 @@ def _asr_suspicious_pattern_hits(
         if not pattern:
             continue
         try:
-            if re.search(pattern, text):
-                if pattern not in hits:
-                    hits.append(pattern)
+            if re.search(pattern, text) and pattern not in hits:
+                hits.append(pattern)
         except re.error:
             if pattern in text and pattern not in hits:
                 hits.append(pattern)
@@ -867,13 +1988,17 @@ def _asr_chunk_needs_repair(
     suspicious_text_patterns: list[str] | tuple[str, ...] = (),
 ) -> bool:
     text = chunk.text.strip()
+    if not text:
+        return False
+    duration = chunk.end - chunk.start
+    if _asr_text_looks_non_speech_texture(text, duration=duration):
+        return False
     if NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
         return False
     if _asr_text_matches_suspicious_pattern(text, suspicious_text_patterns):
         return True
     if chunk.confidence is not None and chunk.confidence < confidence_threshold:
         return True
-    duration = chunk.end - chunk.start
     return duration >= sparse_min_sec and _asr_text_density(chunk) < sparse_min_chars_per_sec
 
 
@@ -891,6 +2016,48 @@ def _asr_candidate_confidence(chunks: list[ASRChunk]) -> float | None:
 
 def _asr_candidate_text(chunks: list[ASRChunk]) -> str:
     return " ".join(chunk.text.strip() for chunk in chunks if chunk.text.strip()).strip()
+
+
+def _numeric_values_are_monotonic_step(values: list[int]) -> bool:
+    if len(values) <= 1:
+        return True
+    deltas = [right - left for left, right in zip(values, values[1:], strict=False)]
+    return all(delta == 1 for delta in deltas) or all(delta == -1 for delta in deltas)
+
+
+def _asr_anomalous_text_reason(text: str, *, duration: float) -> str | None:
+    normalized = text.strip()
+    compact = re.sub(r"\s+", "", normalized)
+    if not compact:
+        return None
+    if len(compact) >= 30 and REPEATED_CHAR_RUNAWAY_RE.search(compact):
+        return "degenerate_repetition"
+
+    numeric_tokens = NUMERIC_TOKEN_RE.findall(normalized)
+    numeric_values = [int(token) for token in numeric_tokens]
+    if len(numeric_values) >= 6:
+        max_repeat = max(Counter(numeric_values).values(), default=0)
+        has_countdown_cue = any(cue in normalized for cue in ("あと", "カウント", "count", "COUNT"))
+        if max_repeat >= 4:
+            return "numeric_runaway"
+        if has_countdown_cue and not _numeric_values_are_monotonic_step(numeric_values):
+            return "numeric_runaway"
+    digitish_chars = sum(
+        1
+        for char in normalized
+        if char.isdigit() or char in ",，、.．・ \t\n\r"
+    )
+    if (
+        len(normalized) >= 80
+        and len(numeric_tokens) >= 32
+        and digitish_chars / max(1, len(normalized)) >= 0.85
+    ):
+        return "numeric_runaway"
+
+    text_density = len(normalized) / max(0.001, duration)
+    if len(compact) >= 80 and text_density >= 18.0:
+        return "excessive_text_density"
+    return None
 
 
 def _apply_asr_text_replacements_to_chunks(
@@ -932,12 +2099,340 @@ def _replacement_hits(text: str, replacements: dict[str, str]) -> list[dict[str,
     return hits
 
 
+def _apply_countdown_sequence_repairs_with_hits(text: str) -> tuple[str, list[dict[str, Any]]]:
+    repaired = repair_descending_countdown_text(text)
+    if repaired is None or repaired == text:
+        return text, []
+    return repaired, [{"source": "descending_countdown_sequence", "target": repaired, "count": 1}]
+
+
+ASR_AKUME_CONTEXT_CUES = (
+    "18禁",
+    "ASMR",
+    "アクメ",
+    "女の悪夢",
+    "イキ",
+    "イーチ",
+    "イク",
+    "オナニー",
+    "オナホ",
+    "あと",
+    "カウント",
+    "クリ",
+    "チンポ",
+    "ポルチオ",
+    "ピストン",
+    "メス",
+    "ゼロ",
+    "だらしない",
+    "エネルギー",
+    "実験",
+    "被験者",
+    "確認",
+    "継続",
+    "発生",
+    "自動",
+    "連続",
+    "直前",
+    "寸前",
+    "機械",
+    "計測",
+    "命令",
+    "指令",
+    "回路",
+    "融合",
+    "暴走",
+    "発動",
+    "生体",
+    "波",
+    "震え",
+    "打ち寄せ",
+    "ゾワゾワ",
+    "感覚",
+    "広が",
+    "望んだ悪夢",
+    "一瞬",
+    "支配",
+    "腰",
+    "背筋",
+    "漏らし",
+    "体そら",
+    "真っ白",
+    "亀頭",
+    "催眠",
+    "子宮",
+    "射精",
+    "受精",
+    "出産",
+    "性感",
+    "性器",
+    "絶頂",
+    "男性器",
+    "潮",
+    "膣",
+    "快感",
+    "女性器",
+    "顔",
+    "していい",
+    "いいですよ",
+)
+ASR_AKUME_SOURCE_TOKENS = ("悪夢", "悪目", "明け目", "アカメ")
+ASR_AKUME_GRAMMATICAL_SOURCE_CUES = (
+    "悪夢し",
+    "悪夢する",
+    "悪夢させ",
+    "悪夢します",
+    "悪夢になる",
+    "悪夢声",
+    "悪目声",
+    "明け目声",
+    "アカメ声",
+)
+ASR_NIGHTMARE_CONTEXT_CUES = (
+    "悪夢を見",
+    "夢を見",
+    "夢の中",
+    "眠",
+    "睡眠",
+    "寝",
+    "怖い",
+    "恐怖",
+    "うなされ",
+    "目が覚め",
+    "ホラー",
+)
+ASR_DENMA_CONTEXT_CUES = (
+    "電マ",
+    "電動",
+    "バイブ",
+    "振動",
+    "マッサージ",
+    "クリ",
+    "乳首",
+    "股",
+    "腰",
+    "おまんこ",
+    "陰核",
+    "刺激",
+    "当て",
+    "押し当て",
+    "挟",
+    "こす",
+    "擦",
+    "スイッチ",
+    "強さ",
+    "強め",
+    "弱め",
+    "弱く",
+    "ブルブル",
+    "震え",
+)
+ASR_DENMA_DIRECT_CUES = ("電話邪魔",)
+ASR_PHONE_CONTEXT_CUES = (
+    "電話をかけ",
+    "電話かけ",
+    "電話に出",
+    "電話出",
+    "電話が鳴",
+    "電波",
+    "着信",
+    "通話",
+    "スマホ",
+    "携帯",
+    "番号",
+    "留守電",
+    "受話器",
+    "電話越し",
+    "電話口",
+)
+ASR_KAIKAN_SOURCE_TOKENS = ("会館", "開館")
+ASR_KAIKAN_CONTEXT_CUES = (
+    "快感",
+    "気持ち",
+    "感じ",
+    "絶頂",
+    "アクメ",
+    "イク",
+    "イキ",
+    "体",
+    "脳",
+    "脳みそ",
+    "性感",
+    "疼",
+    "電流",
+    "真っ白",
+    "ゾワゾワ",
+    "腰",
+    "背筋",
+    "波",
+    "支配",
+    "飲み込",
+    "知りたくない",
+    "やめないで",
+    "耳の奥",
+    "広げ",
+    "迎え入れ",
+    "言葉も飛",
+    "言葉が飛",
+    "飛んじゃ",
+)
+ASR_HALL_CONTEXT_CUES = (
+    "市民会館",
+    "公民館",
+    "文化会館",
+    "会館ホール",
+    "会館のホール",
+    "ホール",
+    "イベント",
+    "建物",
+    "会場",
+    "住所",
+    "駅",
+)
+
+
+def _compact_asr_context(text: str) -> str:
+    return re.sub(r"[\s　、。,.，．!！?？]+", "", text)
+
+
+def _should_apply_contextual_akume_replacement(text: str, source: str, target: str) -> bool:
+    if "アクメ" not in target or not any(token in source for token in ASR_AKUME_SOURCE_TOKENS):
+        return False
+    compact = _compact_asr_context(text)
+    has_nightmare_context = any(cue in compact for cue in ASR_NIGHTMARE_CONTEXT_CUES)
+    if has_nightmare_context:
+        return False
+    has_domain_context = any(cue in compact for cue in ASR_AKUME_CONTEXT_CUES)
+    if has_domain_context:
+        return True
+    return any(cue in source for cue in ASR_AKUME_GRAMMATICAL_SOURCE_CUES)
+
+
+def _is_contextual_akume_replacement(source: str, target: str) -> bool:
+    return "アクメ" in target and any(token in source for token in ASR_AKUME_SOURCE_TOKENS)
+
+
+def _is_contextual_denma_replacement(source: str, target: str) -> bool:
+    return source == "電話" and target == "電マ"
+
+
+def _is_contextual_kaikan_replacement(source: str, target: str) -> bool:
+    return source in ASR_KAIKAN_SOURCE_TOKENS and target == "快感"
+
+
+def _should_apply_contextual_denma_replacement(text: str, source: str, target: str) -> bool:
+    if not _is_contextual_denma_replacement(source, target):
+        return False
+    compact = _compact_asr_context(text)
+    if any(cue in compact for cue in ASR_PHONE_CONTEXT_CUES):
+        return False
+    if any(cue in compact for cue in ASR_DENMA_DIRECT_CUES):
+        return True
+    return any(cue in compact for cue in ASR_DENMA_CONTEXT_CUES)
+
+
+def _should_apply_contextual_kaikan_replacement(text: str, source: str, target: str) -> bool:
+    if not _is_contextual_kaikan_replacement(source, target):
+        return False
+    compact = _compact_asr_context(text)
+    if any(cue in compact for cue in ASR_HALL_CONTEXT_CUES):
+        return False
+    return any(cue in compact for cue in ASR_KAIKAN_CONTEXT_CUES)
+
+
+def _is_contextual_asr_replacement(source: str, target: str) -> bool:
+    return (
+        _is_contextual_akume_replacement(source, target)
+        or _is_contextual_denma_replacement(
+            source,
+            target,
+        )
+        or _is_contextual_kaikan_replacement(source, target)
+    )
+
+
+def _should_apply_contextual_asr_replacement(text: str, source: str, target: str) -> bool:
+    if _is_contextual_akume_replacement(source, target):
+        return _should_apply_contextual_akume_replacement(text, source, target)
+    if _is_contextual_denma_replacement(source, target):
+        return _should_apply_contextual_denma_replacement(text, source, target)
+    if _is_contextual_kaikan_replacement(source, target):
+        return _should_apply_contextual_kaikan_replacement(text, source, target)
+    return False
+
+
+def _has_contextual_asr_replacement_negative_evidence(text: str, source: str, target: str) -> bool:
+    compact = _compact_asr_context(text)
+    if _is_contextual_akume_replacement(source, target):
+        return any(cue in compact for cue in ASR_NIGHTMARE_CONTEXT_CUES)
+    if _is_contextual_denma_replacement(source, target):
+        return any(cue in compact for cue in ASR_PHONE_CONTEXT_CUES)
+    if _is_contextual_kaikan_replacement(source, target):
+        return any(cue in compact for cue in ASR_HALL_CONTEXT_CUES)
+    return False
+
+
+def _asr_candidate_replacement_should_be_contextual(text: str, source: str, target: str) -> bool:
+    if not _is_contextual_asr_replacement(source, target):
+        return True
+    return _should_apply_contextual_asr_replacement(text, source, target)
+
+
+def _asr_text_with_review_candidate_replacements(text: str, replacements: Mapping[str, str]) -> str:
+    plain_replacements = {
+        source: target
+        for source, target in replacements.items()
+        if not _is_contextual_asr_replacement(source, target)
+    }
+    normalized, _hits = _apply_text_replacements_with_hits(text, plain_replacements)
+    normalized, _contextual_hits = _apply_contextual_asr_replacements_with_hits(normalized, replacements)
+    return normalized
+
+
+def _asr_contextual_suspicious_pattern_hits(
+    text: str,
+    patterns: list[str] | tuple[str, ...],
+    cfg: Any,
+) -> list[str]:
+    hits = _asr_suspicious_pattern_hits(text, patterns)
+    replacements = getattr(cfg, "asr_review_candidate_replacements", {}) or {}
+    filtered: list[str] = []
+    for pattern in hits:
+        target = replacements.get(pattern)
+        if isinstance(target, str) and not _asr_candidate_replacement_should_be_contextual(
+            text,
+            pattern,
+            target,
+        ) and _has_contextual_asr_replacement_negative_evidence(text, pattern, target):
+            continue
+        filtered.append(pattern)
+    return filtered
+
+
+def _apply_contextual_asr_replacements_with_hits(
+    text: str,
+    replacements: Mapping[str, str],
+) -> tuple[str, list[dict[str, Any]]]:
+    hits: list[dict[str, Any]] = []
+    normalized = text
+    for source, target in replacements.items():
+        if not source or source not in normalized:
+            continue
+        if not _should_apply_contextual_asr_replacement(normalized, source, target):
+            continue
+        count = normalized.count(source)
+        hits.append({"source": source, "target": target, "count": count})
+        normalized = normalized.replace(source, target)
+    return normalized, hits
+
+
 def _apply_asr_text_replacements_to_chunks_with_summary(
     chunks: list[ASRChunk],
     replacements: dict[str, str],
+    *,
+    contextual_replacements: Mapping[str, str] | None = None,
 ) -> tuple[list[ASRChunk], dict[str, Any]]:
-    if not replacements:
-        return chunks, {"chunks_changed": 0, "total_replacements": 0, "items": []}
+    contextual_replacements = contextual_replacements or {}
     chunks_changed = 0
     total_replacements = 0
     items: list[dict[str, Any]] = []
@@ -945,6 +2440,13 @@ def _apply_asr_text_replacements_to_chunks_with_summary(
     for index, chunk in enumerate(chunks, start=1):
         text = chunk.text
         normalized, hits = _apply_text_replacements_with_hits(text, replacements)
+        normalized, contextual_hits = _apply_contextual_asr_replacements_with_hits(
+            normalized,
+            contextual_replacements,
+        )
+        hits.extend(contextual_hits)
+        normalized, countdown_hits = _apply_countdown_sequence_repairs_with_hits(normalized)
+        hits.extend(countdown_hits)
         if normalized != text:
             chunks_changed += 1
             total_replacements += sum(int(hit["count"]) for hit in hits)
@@ -958,13 +2460,25 @@ def _apply_asr_text_replacements_to_chunks_with_summary(
                     "hits": hits,
                 }
             )
-            normalized_chunks.append(chunk.model_copy(update={"text": normalized}))
+            normalized_chunks.append(chunk.model_copy(update={"text": normalized, "words": []}))
         else:
             normalized_chunks.append(chunk)
     return normalized_chunks, {
         "chunks_changed": chunks_changed,
         "total_replacements": total_replacements,
         "items": items,
+    }
+
+
+def _merge_asr_text_replacement_summaries(*summaries: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "chunks_changed": sum(int(summary.get("chunks_changed", 0)) for summary in summaries),
+        "total_replacements": sum(int(summary.get("total_replacements", 0)) for summary in summaries),
+        "items": [
+            item
+            for summary in summaries
+            for item in list(summary.get("items") or [])
+        ],
     }
 
 
@@ -1033,6 +2547,12 @@ ASR_HARD_PROMPT_LEAK_MARKERS = (
     "İ",
     "さくら ジンジン 痺れる",
     "気持ちいい イっちゃう 飛んじゃってください",
+    "Japanese ASMR speech",
+    "Prefer audio evidence",
+    "domain assumptions",
+    "do not infer work-specific terms",
+    "JapaneseASMR",
+    "Japanesewhisperingdialogue",
 )
 ASR_SOFT_ENDING_MARKERS = (
     "ありがとうございました",
@@ -1042,6 +2562,65 @@ ASR_PROMPT_LEAK_MARKERS = ASR_HARD_PROMPT_LEAK_MARKERS
 ASR_SOURCE_VOCALS_RELATIVE_QUIET_MAX_RMS_DBFS = -45.0
 ASR_SOURCE_VOCALS_RELATIVE_QUIET_MIN_RMS_DELTA_DB = 24.0
 ASR_SOURCE_VOCALS_RELATIVE_QUIET_MIN_PEAK_DELTA_DB = 6.0
+ASR_PROMPT_LEAK_TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u3040-\u30ff\u3400-\u9fff々〆〤ー]{2,}")
+ASR_PROMPT_LEAK_SPLIT_RE = re.compile(r"[\s、。,.，・/|:;：；!！?？「」『』（）()]+")
+
+
+def _asr_prompt_leak_source_texts(cfg: Any) -> list[str]:
+    sources: list[str] = []
+    for attr in (
+        "asr_initial_prompt",
+        "asr_review_initial_prompt",
+        "asr_hotwords",
+        "qwen_asr_context",
+        "qwen_context",
+    ):
+        value = str(getattr(cfg, attr, "") or "").strip()
+        if value:
+            sources.append(value)
+    asr_cfg = getattr(cfg, "asr", None)
+    if asr_cfg is not None:
+        value = str(getattr(asr_cfg, "qwen_context", "") or "").strip()
+        if value:
+            sources.append(value)
+        profile = getattr(asr_cfg, "correction_profile", None)
+        if profile is not None:
+            for attr in ("initial_prompt", "review_initial_prompt", "hotwords", "qwen_context"):
+                value = str(getattr(profile, attr, "") or "").strip()
+                if value:
+                    sources.append(value)
+    return list(dict.fromkeys(sources))
+
+
+def _asr_prompt_leak_terms(cfg: Any) -> set[str]:
+    terms: set[str] = set()
+    for source in _asr_prompt_leak_source_texts(cfg):
+        for match in ASR_PROMPT_LEAK_TERM_RE.findall(source):
+            term = match.strip()
+            if len(term) >= 3:
+                terms.add(term)
+    return terms
+
+
+def _asr_candidate_looks_like_prompt_term_list(normalized: str, cfg: Any) -> bool:
+    compact = re.sub(r"\s+", "", normalized)
+    if not compact or len(compact) > 64:
+        return False
+    terms = _asr_prompt_leak_terms(cfg)
+    if not terms:
+        return False
+
+    pieces = [piece for piece in ASR_PROMPT_LEAK_SPLIT_RE.split(normalized) if piece]
+    exact_matches = [piece for piece in pieces if piece in terms]
+    if len(exact_matches) >= 3 and len(exact_matches) == len(pieces):
+        return True
+
+    contained: list[str] = []
+    for term in sorted(terms, key=len, reverse=True):
+        if term in compact and not any(term in longer for longer in contained):
+            contained.append(term)
+    covered_chars = sum(len(term) for term in contained)
+    return len(contained) >= 3 and covered_chars / max(1, len(compact)) >= 0.65
 
 
 def _asr_candidate_looks_prompt_leaked(text: str, cfg: Any) -> bool:
@@ -1052,14 +2631,10 @@ def _asr_candidate_looks_prompt_leaked(text: str, cfg: Any) -> bool:
         return True
     if normalized.count("おやすみ") >= 2:
         return True
-    prompt = str(getattr(cfg, "asr_initial_prompt", "") or "").strip()
-    if prompt and prompt in normalized:
-        return True
-    review_prompt = str(getattr(cfg, "asr_review_initial_prompt", "") or "").strip()
-    if review_prompt and review_prompt in normalized:
-        return True
-    hotwords = str(getattr(cfg, "asr_hotwords", "") or "").strip()
-    return bool(hotwords and hotwords in normalized)
+    for source in _asr_prompt_leak_source_texts(cfg):
+        if source in normalized:
+            return True
+    return _asr_candidate_looks_like_prompt_term_list(normalized, cfg)
 
 
 def _transcribe_with_backend_options(
@@ -1135,6 +2710,7 @@ def _asr_repair_candidate_score(
     *,
     cfg: Any,
     prompt_leaked: bool,
+    candidate_id: str | None = None,
 ) -> tuple[bool, float, str]:
     candidate_text = _asr_candidate_text(candidate_chunks)
     original_text = original.text.strip()
@@ -1142,6 +2718,19 @@ def _asr_repair_candidate_score(
         return False, -100.0, "empty_candidate"
     if prompt_leaked:
         return False, -90.0, "prompt_or_hallucination_leak"
+    candidate_duration = max(0.001, candidate_chunks[-1].end - candidate_chunks[0].start)
+    anomalous_reason = _asr_anomalous_text_reason(candidate_text, duration=candidate_duration)
+    if anomalous_reason:
+        return False, -80.0, anomalous_reason
+    if candidate_id == "qwen_asr_fallback":
+        candidate_patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
+            getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
+        )
+        if _asr_suspicious_pattern_hits(candidate_text, candidate_patterns):
+            return False, -70.0, "qwen_fallback_still_suspicious"
+    candidate_review_reasons = _asr_repair_candidate_review_reasons(candidate_chunks, cfg)
+    if candidate_review_reasons:
+        return False, -75.0, f"candidate_review_blocked:{candidate_review_reasons[0]}"
     if _asr_candidate_looks_prompt_leaked(original_text, cfg) and not _asr_candidate_looks_prompt_leaked(candidate_text, cfg):
         leak_improvement = 2.0
     else:
@@ -1171,7 +2760,6 @@ def _asr_repair_candidate_score(
     )
     suspicious_improvement = 2.0 if original_suspicious and not candidate_suspicious else 0.0
     original_density = _asr_text_density(original)
-    candidate_duration = max(0.001, candidate_chunks[-1].end - candidate_chunks[0].start)
     candidate_density = len(candidate_text) / candidate_duration
     density_delta = min(2.0, max(-2.0, candidate_density - original_density))
     length_ratio = len(candidate_text) / max(1, len(original_text))
@@ -1184,6 +2772,41 @@ def _asr_repair_candidate_score(
         + length_score
     )
     return True, score, "accepted"
+
+
+def _asr_repair_candidate_review_reasons(candidate_chunks: list[ASRChunk], cfg: Any) -> list[str]:
+    candidate_text = _asr_candidate_text(candidate_chunks)
+    if not candidate_text or not candidate_chunks:
+        return []
+    original_source_script = SourceScript(
+        text=candidate_text,
+        language=next((chunk.language for chunk in candidate_chunks if chunk.language), cfg.asr_language),
+        backend="asr_repair_candidate",
+        start=float(candidate_chunks[0].start),
+        end=float(candidate_chunks[-1].end),
+        confidence=_asr_candidate_confidence(candidate_chunks),
+    )
+    original_reasons = _source_script_asr_review_reasons(original_source_script, cfg)
+    if original_reasons:
+        return original_reasons
+    replaced_candidate = _asr_text_with_review_candidate_replacements(
+        candidate_text,
+        getattr(cfg, "asr_review_candidate_replacements", {}) or {},
+    ).strip()
+    source_script = SourceScript(
+        text=replaced_candidate or candidate_text,
+        language=next((chunk.language for chunk in candidate_chunks if chunk.language), cfg.asr_language),
+        backend="asr_repair_candidate",
+        start=float(candidate_chunks[0].start),
+        end=float(candidate_chunks[-1].end),
+        confidence=_asr_candidate_confidence(candidate_chunks),
+    )
+    reasons = _source_script_asr_review_reasons(source_script, cfg)
+    if reasons:
+        return reasons
+    if replaced_candidate and replaced_candidate != candidate_text.strip():
+        return ["asr_candidate_replacement_available"]
+    return []
 
 
 def _asr_repair_attempt_payload(
@@ -1224,6 +2847,99 @@ def _asr_repair_attempt_payload(
     }
 
 
+def _run_asr_repair_option(
+    option: dict[str, Any],
+    *,
+    backend: Any,
+    repair_audio_path: Path,
+    repair_dir: Path,
+    attempted: int,
+    group_start: float,
+    group_end: float,
+    audio_duration_sec: float,
+    original: ASRChunk,
+    cfg: Any,
+) -> tuple[dict[str, Any], list[ASRChunk], float, str | None]:
+    candidate_id = str(option["candidate_id"])
+    padding_sec = float(option["padding_sec"])
+    clip_start = max(0.0, group_start - padding_sec)
+    clip_end = min(audio_duration_sec, group_end + padding_sec)
+    clip_path = repair_dir / f"repair_{attempted:04d}_{candidate_id}.wav"
+    try:
+        ffmpeg.slice_audio(
+            repair_audio_path,
+            clip_start,
+            clip_end,
+            clip_path,
+            sample_rate=cfg.gemma_sample_rate,
+            channels=1,
+        )
+        candidate_backend = option.get("backend", backend)
+        candidate_local = _transcribe_with_backend_options(
+            candidate_backend,
+            clip_path,
+            [],
+            **dict(option.get("overrides") or {}),
+        )
+        candidate_text = _asr_candidate_text(candidate_local)
+        prompt_leaked = _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
+        candidate_abs = [
+            candidate.model_copy(
+                update={
+                    "start": max(group_start, min(group_end, clip_start + candidate.start)),
+                    "end": max(group_start, min(group_end, clip_start + candidate.end)),
+                }
+            )
+            for candidate in candidate_local
+        ]
+        candidate_abs = _valid_asr_chunks(
+            candidate_abs,
+            audio_duration_sec,
+            max_chunk_sec=cfg.asr_resegment_max_sec,
+            sparse_chunk_max_sec=cfg.asr_sparse_chunk_max_sec,
+            sparse_chunk_min_chars_per_sec=cfg.asr_sparse_chunk_min_chars_per_sec,
+        )
+        accepted, score, reason = _asr_repair_candidate_score(
+            original,
+            candidate_abs,
+            cfg=cfg,
+            prompt_leaked=prompt_leaked,
+            candidate_id=candidate_id,
+        )
+        return (
+            _asr_repair_attempt_payload(
+                candidate_id=candidate_id,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                candidate_chunks=candidate_abs,
+                prompt_leaked=prompt_leaked,
+                accepted=accepted,
+                score=score,
+                reason=reason,
+            ),
+            candidate_abs if accepted else [],
+            score,
+            candidate_id if accepted else None,
+        )
+    except Exception as exc:
+        return (
+            _asr_repair_attempt_payload(
+                candidate_id=candidate_id,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                candidate_chunks=[],
+                prompt_leaked=False,
+                accepted=False,
+                score=-100.0,
+                reason="transcribe_failed",
+                error=str(exc),
+            ),
+            [],
+            -100.0,
+            None,
+        )
+
+
 def _split_asr_chunks_for_repair(
     chunks: list[ASRChunk],
     *,
@@ -1239,7 +2955,14 @@ def _split_asr_chunks_for_repair(
         end = min(float(audio_duration_sec), max(start, float(chunk.end)))
         if end - start <= 0.05:
             continue
-        normalized = chunk.model_copy(update={"start": start, "end": end, "text": text})
+        normalized = chunk.model_copy(
+            update={
+                "start": start,
+                "end": end,
+                "text": text,
+                "words": _clipped_asr_words(chunk, start=start, end=end),
+            }
+        )
         repair_chunks.extend(_split_long_asr_chunk(normalized, max_chunk_sec=max_chunk_sec))
     return repair_chunks
 
@@ -1264,9 +2987,7 @@ def _repair_asr_chunks(
     }
     if not cfg.asr_repair_enabled or not chunks or not repair_audio_path.exists():
         return chunks, summary
-    if not callable(getattr(backend, "transcribe_with_options", None)):
-        summary["skipped"] = len(chunks)
-        return chunks, summary
+    supports_option_overrides = callable(getattr(backend, "transcribe_with_options", None))
 
     repair_groups: list[tuple[bool, list[ASRChunk]]] = []
     current_repair_group: list[ASRChunk] = []
@@ -1328,98 +3049,70 @@ def _repair_asr_chunks(
             language=group[0].language,
             confidence=_asr_candidate_confidence(group),
         )
-        option_specs = _asr_repair_candidate_options(cfg)
-        if qwen_fallback_backend is not None:
-            option_specs.append(
+        option_specs = (
+            _asr_repair_candidate_options(cfg)
+            if supports_option_overrides
+            else [
                 {
-                    "candidate_id": "qwen_asr_fallback",
+                    "candidate_id": "plain_transcribe",
                     "padding_sec": float(getattr(cfg, "asr_repair_padding_sec", 1.0)),
                     "overrides": {},
-                    "backend": qwen_fallback_backend,
                 }
-            )
+            ]
+        )
+        qwen_option_spec = (
+            {
+                "candidate_id": "qwen_asr_fallback",
+                "padding_sec": float(getattr(cfg, "asr_repair_padding_sec", 1.0)),
+                "overrides": {},
+                "backend": qwen_fallback_backend,
+            }
+            if qwen_fallback_backend is not None
+            else None
+        )
         attempts: list[dict[str, Any]] = []
         best_candidate: list[ASRChunk] = []
         best_candidate_id: str | None = None
         best_score = -math.inf
+
         for option in option_specs:
-            candidate_id = str(option["candidate_id"])
-            padding_sec = float(option["padding_sec"])
-            clip_start = max(0.0, group_start - padding_sec)
-            clip_end = min(audio_duration_sec, group_end + padding_sec)
-            clip_path = repair_dir / f"repair_{attempted:04d}_{candidate_id}.wav"
-            try:
-                ffmpeg.slice_audio(
-                    repair_audio_path,
-                    clip_start,
-                    clip_end,
-                    clip_path,
-                    sample_rate=cfg.gemma_sample_rate,
-                    channels=1,
-                )
-                candidate_backend = option.get("backend", backend)
-                candidate_local = _transcribe_with_backend_options(
-                    candidate_backend,
-                    clip_path,
-                    [],
-                    **dict(option.get("overrides") or {}),
-                )
-                candidate_text = _asr_candidate_text(candidate_local)
-                prompt_leaked = _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
-                candidate_abs = [
-                    candidate.model_copy(
-                        update={
-                            "start": max(group_start, min(group_end, clip_start + candidate.start)),
-                            "end": max(group_start, min(group_end, clip_start + candidate.end)),
-                        }
-                    )
-                    for candidate in candidate_local
-                ]
-                candidate_abs = _valid_asr_chunks(
-                    candidate_abs,
-                    audio_duration_sec,
-                    max_chunk_sec=cfg.asr_resegment_max_sec,
-                    sparse_chunk_max_sec=cfg.asr_sparse_chunk_max_sec,
-                    sparse_chunk_min_chars_per_sec=cfg.asr_sparse_chunk_min_chars_per_sec,
-                )
-                accepted, score, reason = _asr_repair_candidate_score(
-                    original,
-                    candidate_abs,
-                    cfg=cfg,
-                    prompt_leaked=prompt_leaked,
-                )
-                attempts.append(
-                    _asr_repair_attempt_payload(
-                        candidate_id=candidate_id,
-                        clip_start=clip_start,
-                        clip_end=clip_end,
-                        candidate_chunks=candidate_abs,
-                        prompt_leaked=prompt_leaked,
-                        accepted=accepted,
-                        score=score,
-                        reason=reason,
-                    )
-                )
-                if accepted and score > best_score:
-                    best_score = score
-                    best_candidate = candidate_abs
-                    best_candidate_id = candidate_id
-                    if score >= 0.5:
-                        break
-            except Exception as exc:
-                attempts.append(
-                    _asr_repair_attempt_payload(
-                        candidate_id=candidate_id,
-                        clip_start=clip_start,
-                        clip_end=clip_end,
-                        candidate_chunks=[],
-                        prompt_leaked=False,
-                        accepted=False,
-                        score=-100.0,
-                        reason="transcribe_failed",
-                        error=str(exc),
-                    )
-                )
+            attempt_payload, candidate, score, candidate_id = _run_asr_repair_option(
+                option,
+                backend=backend,
+                repair_audio_path=repair_audio_path,
+                repair_dir=repair_dir,
+                attempted=attempted,
+                group_start=group_start,
+                group_end=group_end,
+                audio_duration_sec=audio_duration_sec,
+                original=original,
+                cfg=cfg,
+            )
+            attempts.append(attempt_payload)
+            if candidate and score > best_score:
+                best_score = score
+                best_candidate = candidate
+                best_candidate_id = candidate_id
+            if best_candidate and best_score >= 0.5:
+                break
+        if qwen_option_spec is not None and not best_candidate:
+            attempt_payload, candidate, score, candidate_id = _run_asr_repair_option(
+                qwen_option_spec,
+                backend=backend,
+                repair_audio_path=repair_audio_path,
+                repair_dir=repair_dir,
+                attempted=attempted,
+                group_start=group_start,
+                group_end=group_end,
+                audio_duration_sec=audio_duration_sec,
+                original=original,
+                cfg=cfg,
+            )
+            attempts.append(attempt_payload)
+            if candidate and score > best_score:
+                best_score = score
+                best_candidate = candidate
+                best_candidate_id = candidate_id
         accepted = bool(best_candidate)
         summary["items"].append(
             {
@@ -1451,6 +3144,7 @@ ASR_REVIEW_GLOSSARY = [
     "暗示",
     "快感",
     "10数える",
+    "電マ",
 ]
 
 
@@ -1485,14 +3179,26 @@ def _asr_review_item(
 ) -> dict[str, Any] | None:
     chunk = chunks[index]
     text = chunk.text.strip()
-    if not text or NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
+    if not text:
         return None
-    suspicious_patterns = [
-        pattern
-        for pattern in cfg.asr_review_suspicious_text_patterns
-        if pattern and pattern in text
-    ]
-    candidate_text = _asr_text_with_replacements(
+    duration = max(0.0, chunk.end - chunk.start)
+    if _asr_text_looks_non_speech_texture(text, duration=duration):
+        return None
+    sparse_text_density = (
+        duration >= getattr(cfg, "asr_repair_sparse_min_sec", 12.0)
+        and len(text) / max(0.001, duration)
+        < getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)
+    )
+    if NUMERIC_ONLY_SOURCE_RE.fullmatch(text) and not sparse_text_density:
+        return None
+    suspicious_patterns = _asr_contextual_suspicious_pattern_hits(
+        text,
+        cfg.asr_review_suspicious_text_patterns,
+        cfg,
+    )
+    if sparse_text_density:
+        suspicious_patterns.append("asr_sparse_text_density")
+    candidate_text = _asr_text_with_review_candidate_replacements(
         text,
         cfg.asr_review_candidate_replacements,
     ).strip()
@@ -1511,7 +3217,7 @@ def _asr_review_item(
         "chunk_index": index,
         "start": round(chunk.start, 3),
         "end": round(chunk.end, 3),
-        "duration": round(max(0.0, chunk.end - chunk.start), 3),
+        "duration": round(duration, 3),
         "confidence": chunk.confidence,
         "suspicious_patterns": suspicious_patterns,
         "context_before": _asr_review_context(
@@ -1630,7 +3336,7 @@ def _add_generated_asr_review_candidates(
                 text=candidate_text,
             ):
                 generated += 1
-            replaced_text = _asr_text_with_replacements(
+            replaced_text = _asr_text_with_review_candidate_replacements(
                 candidate_text,
                 cfg.asr_review_candidate_replacements,
             )
@@ -1731,10 +3437,12 @@ def _review_asr_chunks_with_model(
         "reviewed": 0,
         "replaced": 0,
         "manual_review": 0,
+        "failed": 0,
         "skipped": 0,
         "generated_candidates": 0,
         "audio_input": {"enabled": False, "created": 0, "error": None, "items": []},
         "error": None,
+        "errors": [],
         "items": [],
     }
     if not cfg.asr_review_enabled or not chunks:
@@ -1839,13 +3547,32 @@ def _review_asr_chunks_with_model(
         )
         for batch_index, batch in enumerate(review_batches, start=1):
             batch_id = f"asr_review_{batch_index:04d}"
-            if audio_review_enabled:
-                audio_path = Path(str(batch[0]["audio_clip_path"]))
-                review_results.update(
-                    client.review_asr_candidates_with_audio(batch, batch_id, audio_path)
-                )
-            else:
-                review_results.update(client.review_asr_candidates_for_mock(batch, batch_id))
+            batch_items = list(batch)
+            try:
+                if audio_review_enabled:
+                    audio_path = Path(str(batch_items[0]["audio_clip_path"]))
+                    review_results.update(
+                        client.review_asr_candidates_with_audio(batch_items, batch_id, audio_path)
+                    )
+                else:
+                    review_results.update(client.review_asr_candidates_for_mock(batch_items, batch_id))
+            except Exception as exc:
+                chunk_ids = [str(item.get("chunk_id") or "") for item in batch_items]
+                summary["failed"] += len(batch_items)
+                summary["errors"].append({"chunk_ids": chunk_ids, "error": str(exc)})
+                for item in batch_items:
+                    chunk_id = str(item.get("chunk_id") or "")
+                    if not chunk_id:
+                        continue
+                    review_results[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "decision": "manual_review",
+                        "selected_candidate_id": "original",
+                        "confidence": 0.0,
+                        "heard_text": "",
+                        "reason": f"ASR review failed: {exc}",
+                        "risk_terms": ["asr_review_error"],
+                    }
     except Exception as exc:
         summary["error"] = str(exc)
         return chunks, summary
@@ -1854,6 +3581,8 @@ def _review_asr_chunks_with_model(
             server_manager.stop()
 
     summary["attempted"] = len(review_items)
+    if summary["failed"]:
+        summary["error"] = f"{summary['failed']} ASR review item(s) failed; see errors"
     reviewed_chunks = [chunk.model_copy() for chunk in chunks]
     for chunk_id, review in review_results.items():
         item = review_by_chunk_id.get(chunk_id)
@@ -1874,6 +3603,19 @@ def _review_asr_chunks_with_model(
             and confidence is not None
             and confidence >= cfg.asr_review_confidence_threshold
         )
+        blocked_review_reasons: list[str] = []
+        if accepted and selected_text is not None:
+            selected_chunk = ASRChunk(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                text=selected_text,
+                language=cfg.asr_language,
+                confidence=float(confidence),
+            )
+            blocked_review_reasons = _asr_repair_candidate_review_reasons([selected_chunk], cfg)
+            if blocked_review_reasons:
+                accepted = False
+                summary["manual_review"] += 1
         if review.get("decision") == "manual_review":
             summary["manual_review"] += 1
         if accepted:
@@ -1893,8 +3635,16 @@ def _review_asr_chunks_with_model(
                 "candidates": list(item.get("candidates", [])),
                 "audio_clip": item.get("audio_clip"),
                 "heard_text": review.get("heard_text"),
-                "reason": review.get("reason"),
-                "risk_terms": review.get("risk_terms", []),
+                "reason": (
+                    f"selected_candidate_review_blocked:{blocked_review_reasons[0]}"
+                    if blocked_review_reasons
+                    else review.get("reason")
+                ),
+                "risk_terms": [
+                    *list(review.get("risk_terms", []) or []),
+                    *(["selected_candidate_review_blocked"] if blocked_review_reasons else []),
+                ],
+                "blocked_review_reasons": blocked_review_reasons,
                 "suspicious_patterns": item.get("suspicious_patterns", []),
             }
         )
@@ -1903,7 +3653,7 @@ def _review_asr_chunks_with_model(
         chunk_id = f"chunk_{index + 1:04d}"
         selected_text = selected_text_by_chunk_id.get(chunk_id)
         if selected_text is not None:
-            reviewed_chunks[index] = chunk.model_copy(update={"text": selected_text})
+            reviewed_chunks[index] = chunk.model_copy(update={"text": selected_text, "words": []})
 
     summary["reviewed"] = len(review_results)
     return reviewed_chunks, summary
@@ -1939,6 +3689,11 @@ def _log_stage_complete(stage: str, manifest: PipelineManifest, detail: str | No
     console.print(" - ".join(parts))
 
 
+def _log_stage_checkpoint(stage: str, message: str, detail: str | None = None) -> None:
+    suffix = f" {detail}" if detail else ""
+    console.print(f"[dim]{escape(f'{stage}: {message}{suffix}')}[/dim]")
+
+
 def _format_command_preview(command: list[str], max_chars: int = 360) -> str:
     rendered = shlex.join(str(part) for part in command)
     if len(rendered) <= max_chars:
@@ -1963,28 +3718,38 @@ def _log_segment_progress(
     started_at: float,
     last_logged_at: float,
     note: str | None = None,
+    progress_index: int | None = None,
+    progress_label: str = "done",
+    counts_label: str = "counts",
 ) -> float:
     now = monotonic()
     interval = _progress_interval(total)
+    display_index = progress_index if progress_index is not None else index
     should_log = (
-        index == 1
-        or index == total
-        or index % interval == 0
+        display_index == 1
+        or display_index == total
+        or display_index % interval == 0
         or now - last_logged_at >= PROGRESS_LOG_SECONDS
     )
     if not should_log:
         return last_logged_at
-    percent = (index / total * 100.0) if total else 100.0
+    percent = (display_index / total * 100.0) if total else 100.0
+    progress = (
+        f"{progress_label}={display_index}/{total}"
+        if progress_index is not None
+        else f"{index}/{total}"
+    )
+    segment_index = f" segment_index={index}" if progress_index is not None else ""
     counts = (
-        f" counts={_format_segment_counts(_segment_counts(manifest))}"
+        f" {counts_label}={_format_segment_counts(_segment_counts(manifest))}"
         if manifest and manifest.segments
         else ""
     )
     suffix = f" - {note}" if note else ""
     console.print(
-        f"[dim]{stage}: {index}/{total} ({percent:.1f}%) "
+        f"[dim]{stage}: {progress} ({percent:.1f}%) "
         f"elapsed={_format_elapsed(now - started_at)} "
-        f"latest={segment.id} status={segment.status}{counts}{suffix}[/dim]"
+        f"latest={segment.id}{segment_index} status={segment.status}{counts}{suffix}[/dim]"
     )
     return now
 
@@ -2458,17 +4223,7 @@ def _apply_korean_fluency_postprocess(
 
 
 def _native_korean_count_number(value: int) -> str | None:
-    if value in NATIVE_KOREAN_COUNT_ONES:
-        return NATIVE_KOREAN_COUNT_ONES[value]
-    if value in NATIVE_KOREAN_COUNT_TENS:
-        return NATIVE_KOREAN_COUNT_TENS[value]
-    if 10 < value < 100:
-        tens, ones = divmod(value, 10)
-        tens_text = NATIVE_KOREAN_COUNT_TENS.get(tens * 10)
-        ones_text = NATIVE_KOREAN_COUNT_ONES.get(ones)
-        if tens_text and ones_text:
-            return tens_text + ones_text
-    return None
+    return native_korean_count_number(value)
 
 
 def _numeric_source_values(segment: Segment) -> list[int] | None:
@@ -2918,6 +4673,80 @@ def _translation_source_text(segment: Segment) -> str:
     return segment.source_script.text.strip() if segment.source_script else ""
 
 
+def _countdown_values_for_segment(segment: Segment) -> list[int] | None:
+    event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
+    if isinstance(event, dict):
+        raw_values = event.get("values")
+        if isinstance(raw_values, list) and all(isinstance(value, int) for value in raw_values):
+            values = [int(value) for value in raw_values]
+            if is_descending_countdown(values):
+                return values
+    source_text = _translation_source_text(segment)
+    values = source_countdown_values(source_text)
+    if values is None:
+        values = _embedded_source_countdown_values(source_text)
+    if values is None or not is_descending_countdown(values):
+        return None
+    _ensure_countdown_event_analysis(segment, values)
+    return values
+
+
+def _ensure_countdown_event_analysis(segment: Segment, values: list[int]) -> None:
+    event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
+    if not isinstance(event, dict):
+        event = {}
+    payload = _countdown_event_payload(
+        values,
+        source_chunk_texts=[_translation_source_text(segment)],
+        source_chunk_count=1,
+        merge_gap_sec=0.0,
+        max_span_sec=segment.duration,
+    )
+    if payload is None:
+        return
+    payload.update({key: value for key, value in event.items() if key not in payload})
+    segment.analysis[COUNTDOWN_EVENT_KEY] = payload
+
+
+def _countdown_translation_for_segment(segment: Segment, values: list[int]) -> KoreanTranslation | None:
+    korean_text = countdown_korean_text(values)
+    if korean_text is None:
+        return None
+    _ensure_countdown_event_analysis(segment, values)
+    return KoreanTranslation(
+        ko_literal=korean_text,
+        ko_natural=korean_text,
+        notes=[COUNTDOWN_EVENT_NOTE],
+        confidence=1.0,
+        model="deterministic:countdown-event",
+        batch_id=f"countdown_{segment.id}",
+    )
+
+
+def _counting_values_for_segment(segment: Segment) -> list[int] | None:
+    values = source_countdown_values(_translation_source_text(segment))
+    if values is None or is_descending_countdown(values):
+        return None
+    if not _numeric_group_is_counting([(segment, values)]):
+        return None
+    return values
+
+
+def _counting_translation_for_segment(segment: Segment, values: list[int]) -> KoreanTranslation | None:
+    tokens = countdown_korean_tokens(values)
+    if tokens is None:
+        return None
+    korean_text = ", ".join(tokens)
+    return KoreanTranslation(
+        ko_literal=korean_text,
+        ko_natural=korean_text,
+        notes=[NUMERIC_COUNTING_POSTPROCESS_NOTE],
+        confidence=1.0,
+        model="deterministic:numeric-counting",
+        batch_id=f"numeric_counting_{segment.id}",
+    )
+
+
 def _clear_korean_translation_errors(segment: Segment) -> None:
     segment.errors = [
         error
@@ -3313,6 +5142,7 @@ def _effective_asr_config(
     asr_compute_type: str | None = None,
     asr_batched_inference: bool | None = None,
     asr_batch_size: int | None = None,
+    asr_repair_enabled: bool | None = None,
 ) -> Any:
     payload = cfg.model_dump(mode="json")
     preset = (asr_preset or getattr(cfg, "asr_preset", None) or "default").replace("-", "_")
@@ -3336,6 +5166,8 @@ def _effective_asr_config(
         payload["asr_batched_inference"] = bool(asr_batched_inference)
     if asr_batch_size is not None:
         payload["asr_batch_size"] = int(asr_batch_size)
+    if asr_repair_enabled is not None:
+        payload["asr_repair_enabled"] = bool(asr_repair_enabled)
     next_cfg = type(cfg).model_validate(payload)
     next_cfg.asr.correction_profile = cfg.asr.correction_profile
     return next_cfg
@@ -3534,6 +5366,19 @@ def _derive_original_mono_16k(project_dir: Path, manifest: PipelineManifest, cfg
     return output
 
 
+def _prefer_folder_asr_source_audio(manifest: PipelineManifest) -> bool:
+    folder_input = None
+    if manifest.source_info is not None:
+        raw_folder_input = manifest.source_info.raw.get("folder_input")
+        if isinstance(raw_folder_input, dict):
+            folder_input = raw_folder_input
+    if folder_input is None:
+        return False
+    status = str(folder_input.get("asr_source_status") or "")
+    silent_count = int(folder_input.get("asr_silent_part_count") or 0)
+    return status in {"separate_asr_parts", "mix_parts_silenced_duplicates"} or silent_count > 0
+
+
 def _select_asr_audio_input(
     project_dir: Path,
     manifest: PipelineManifest,
@@ -3572,16 +5417,19 @@ def _select_asr_audio_input(
             }
         )
 
-    add_candidate(
-        "source_vocals_mono_16k",
-        _resolve_manifest_artifact_path(project_dir, manifest, "source_vocals_mono_16k"),
-        strict_quality=backend_kind != "mock",
+    candidate_order = (
+        ("gemma_mono_16k", False),
+        ("source_vocals_mono_16k", backend_kind != "mock"),
+    ) if _prefer_folder_asr_source_audio(manifest) else (
+        ("source_vocals_mono_16k", backend_kind != "mock"),
+        ("gemma_mono_16k", False),
     )
-    add_candidate(
-        "gemma_mono_16k",
-        _resolve_manifest_artifact_path(project_dir, manifest, "gemma_mono_16k"),
-        strict_quality=False,
-    )
+    for source, strict_quality in candidate_order:
+        add_candidate(
+            source,
+            _resolve_manifest_artifact_path(project_dir, manifest, source),
+            strict_quality=strict_quality,
+        )
     _reject_relative_quiet_source_vocals(candidates)
     selected = next((candidate for candidate in candidates if not candidate["reject_reasons"]), None)
     if selected is None:
@@ -3700,6 +5548,7 @@ def _asr_chunk_diagnostics(
                 "text": text,
                 "language": chunk.language,
                 "confidence": chunk.confidence,
+                "word_count": len(chunk.words),
                 "text_density": round(len(text) / max(0.001, duration), 6),
                 "suspicious_pattern_hits": _asr_suspicious_pattern_hits(text, patterns),
                 "prompt_leak": _asr_candidate_looks_prompt_leaked(text, cfg),
@@ -3718,9 +5567,14 @@ def _filter_final_asr_chunks_for_hallucinations(
     dropped: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
         text = chunk.text.strip()
+        normalized = " ".join(text.split())
         duration = max(0.0, chunk.end - chunk.start)
         density = len(text) / max(0.001, duration)
         prompt_leak = _asr_candidate_looks_prompt_leaked(text, cfg)
+        prompt_term_list_leak = prompt_leak and _asr_candidate_looks_like_prompt_term_list(
+            normalized,
+            cfg,
+        )
         sparse_prompt_leak = (
             prompt_leak
             and duration >= max(2.0, float(getattr(cfg, "asr_repair_sparse_min_sec", 12.0)) * 0.5)
@@ -3731,14 +5585,20 @@ def _filter_final_asr_chunks_for_hallucinations(
             and any(marker in text for marker in ASR_HARD_PROMPT_LEAK_MARKERS)
             and duration >= 4.0
         )
-        if sparse_prompt_leak or repeated_outro:
+        if prompt_term_list_leak or sparse_prompt_leak or repeated_outro:
             dropped.append(
                 {
                     "chunk_id": f"chunk_{index:04d}",
                     "start": round(chunk.start, 3),
                     "end": round(chunk.end, 3),
                     "text": text,
-                    "reason": "sparse_prompt_leak" if sparse_prompt_leak else "repeated_outro_hallucination",
+                    "reason": (
+                        "prompt_term_list_leak"
+                        if prompt_term_list_leak
+                        else "sparse_prompt_leak"
+                        if sparse_prompt_leak
+                        else "repeated_outro_hallucination"
+                    ),
                     "text_density": round(density, 6),
                     "duration": round(duration, 3),
                 }
@@ -3753,26 +5613,188 @@ def _source_script_asr_review_reasons(source_script: SourceScript | None, cfg: A
         return ["missing_asr_text"]
     text = source_script.text.strip()
     reasons: list[str] = []
+    duration = max(0.001, source_script.end - source_script.start)
+    if _asr_text_looks_non_speech_texture(text, duration=duration):
+        return reasons
     if _asr_candidate_looks_prompt_leaked(text, cfg):
         reasons.append("asr_prompt_or_hallucination_leak")
+        return reasons
     patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
         getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
     )
-    hits = _asr_suspicious_pattern_hits(text, patterns)
+    hits = _asr_contextual_suspicious_pattern_hits(text, patterns, cfg)
     if hits:
         reasons.append("asr_suspicious_pattern:" + ",".join(hits[:5]))
+    anomalous_reason = _asr_anomalous_text_reason(text, duration=duration)
+    if anomalous_reason and not (
+        anomalous_reason == "numeric_runaway"
+        and not hits
+        and (
+            _source_script_countdown_unverified_reason(source_script)
+            or _source_script_numeric_sequence_unverified_reason(source_script)
+        )
+    ):
+        reasons.append(f"asr_{anomalous_reason}")
     if (
         source_script.confidence is not None
         and source_script.confidence < getattr(cfg, "asr_review_confidence_threshold", 0.78)
     ):
         reasons.append(f"asr_low_confidence:{source_script.confidence:.3f}")
-    duration = max(0.001, source_script.end - source_script.start)
+    compact_text = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+", "", text)
+    sparse_min_sec = getattr(cfg, "asr_repair_sparse_min_sec", 12.0)
+    sparse_min_chars_per_sec = getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)
+    short_sparse_fragment = duration >= 8.0 and len(compact_text) <= 2
     if (
-        duration >= getattr(cfg, "asr_repair_sparse_min_sec", 12.0)
-        and len(text) / duration < getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)
+        (duration >= sparse_min_sec or short_sparse_fragment)
+        and len(text) / duration < sparse_min_chars_per_sec
+        and not _source_script_asr_warning_reasons(source_script, cfg)
     ):
         reasons.append("asr_sparse_text_density")
     return reasons
+
+
+def _source_script_countdown_unverified_reason(source_script: SourceScript | None) -> str | None:
+    if source_script is None or not source_script.text.strip():
+        return None
+    text = source_script.text.strip()
+    values = source_countdown_values(text)
+    if values is not None:
+        if is_descending_countdown(values):
+            return None
+        if len(values) >= 4 and min(values) >= 0 and max(values) <= 30:
+            return "asr_countdown_unverified"
+        return None
+    embedded_values = _embedded_source_countdown_values(text)
+    if embedded_values is not None and is_descending_countdown(embedded_values):
+        return None
+    numeric_values = [int(token) for token in NUMERIC_TOKEN_RE.findall(text)]
+    if len(numeric_values) < 4 or min(numeric_values, default=99) < 0 or max(numeric_values, default=0) > 30:
+        return None
+    has_countdown_cue = any(cue in text for cue in ("あと", "カウント", "count", "COUNT"))
+    has_descending_pair = any(
+        left - right == 1 for left, right in zip(numeric_values, numeric_values[1:], strict=False)
+    )
+    edge_looks_like_countdown = numeric_values[0] <= 30 and numeric_values[-1] in {0, 1}
+    if (has_countdown_cue or edge_looks_like_countdown) and has_descending_pair:
+        return "asr_countdown_unverified"
+    return None
+
+
+def _source_script_numeric_sequence_unverified_reason(
+    source_script: SourceScript | None,
+) -> str | None:
+    if source_script is None or not source_script.text.strip():
+        return None
+    text = source_script.text.strip()
+    if not NUMERIC_SEQUENCE_SOURCE_RE.fullmatch(text):
+        return None
+    numeric_values = [int(token) for token in NUMERIC_TOKEN_RE.findall(text)]
+    if len(numeric_values) < 3 or max(numeric_values, default=0) <= 99:
+        return None
+    if _numeric_values_are_monotonic_step(numeric_values):
+        return "asr_numeric_sequence_unverified"
+    return None
+
+
+def _asr_text_looks_plausible_sparse_speech(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or NUMERIC_TOKEN_RE.search(stripped):
+        return False
+    compact = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+", "", stripped)
+    if len(compact) < 4:
+        return False
+    if not (
+        JAPANESE_HIRAGANA_RE.search(compact)
+        or JAPANESE_KATAKANA_RE.search(compact)
+        or JAPANESE_KANJI_RE.search(compact)
+    ):
+        return False
+
+    has_natural_cue = any(cue in compact for cue in SPARSE_SPEECH_NATURAL_CUES)
+    tokens = [
+        re.sub(r"[、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+", "", token)
+        for token in stripped.split()
+        if token.strip()
+    ]
+    if len(tokens) >= 3 and not has_natural_cue and all(len(token) <= 4 for token in tokens):
+        return False
+
+    has_particle_cue = any(char in SPARSE_SPEECH_PARTICLE_CUES for char in compact)
+    return has_natural_cue or (has_particle_cue and len(compact) >= 6)
+
+
+def _source_script_sparse_speech_unverified_reason(
+    source_script: SourceScript | None,
+    cfg: Any,
+) -> str | None:
+    if source_script is None or not source_script.text.strip():
+        return None
+    if (
+        _source_script_countdown_unverified_reason(source_script)
+        or _source_script_numeric_sequence_unverified_reason(source_script)
+    ):
+        return None
+    text = source_script.text.strip()
+    duration = max(0.001, source_script.end - source_script.start)
+    if (
+        duration < getattr(cfg, "asr_repair_sparse_min_sec", 12.0)
+        or len(text) / duration >= getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0)
+    ):
+        return None
+    if _asr_text_looks_non_speech_texture(text, duration=duration):
+        return None
+    if _asr_candidate_looks_prompt_leaked(text, cfg):
+        return None
+    patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
+        getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
+    )
+    if _asr_contextual_suspicious_pattern_hits(text, patterns, cfg):
+        return None
+    if _asr_anomalous_text_reason(text, duration=duration):
+        return None
+    if (
+        source_script.confidence is not None
+        and source_script.confidence < getattr(cfg, "asr_review_confidence_threshold", 0.78)
+    ):
+        return None
+    if not _asr_text_looks_plausible_sparse_speech(text):
+        return None
+    return "asr_sparse_speech_unverified"
+
+
+def _source_script_asr_warning_reasons(source_script: SourceScript | None, cfg: Any) -> list[str]:
+    reasons = [
+        _source_script_countdown_unverified_reason(source_script),
+        _source_script_numeric_sequence_unverified_reason(source_script),
+        _source_script_sparse_speech_unverified_reason(source_script, cfg),
+    ]
+    return list(dict.fromkeys(reason for reason in reasons if reason))
+
+
+def _filter_asr_repair_review_reasons(
+    source_script: SourceScript | None,
+    cfg: Any,
+    *,
+    review_reasons: Sequence[str],
+    repair_review_reasons: Sequence[str],
+) -> list[str]:
+    repair_reasons = [str(reason) for reason in repair_review_reasons if reason]
+    if not repair_reasons or review_reasons:
+        return repair_reasons
+    if _source_script_asr_warning_reasons(source_script, cfg) and all(
+        reason.startswith("asr_repair_rejected") for reason in repair_reasons
+    ):
+        return []
+    return repair_reasons
+
+
+def _source_script_non_speech_texture_reason(source_script: SourceScript | None) -> str | None:
+    if source_script is None or not source_script.text.strip():
+        return None
+    duration = max(0.001, source_script.end - source_script.start)
+    if _asr_text_looks_non_speech_texture(source_script.text, duration=duration):
+        return "asr_non_speech_texture"
+    return None
 
 
 def _source_script_rejected_repair_reasons(
@@ -3813,6 +5835,563 @@ def _source_script_rejected_repair_reasons(
     return reasons
 
 
+def _asr_summary_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _asr_source_separation_manual_review_threshold(segment_count: int) -> int:
+    if segment_count <= 0:
+        return ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_COUNT
+    rate_threshold = math.ceil(
+        segment_count * ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_RATE
+    )
+    return max(ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_COUNT, rate_threshold)
+
+
+def _asr_folder_input_parts(manifest: PipelineManifest) -> list[dict[str, Any]]:
+    if manifest.source_info is None:
+        return []
+    folder_input = manifest.source_info.raw.get("folder_input")
+    if not isinstance(folder_input, dict):
+        return []
+    raw_parts = folder_input.get("asr_parts") or folder_input.get("mix_parts")
+    if not isinstance(raw_parts, list):
+        return []
+    parts: list[dict[str, Any]] = []
+    for raw_part in raw_parts:
+        if not isinstance(raw_part, dict):
+            continue
+        try:
+            start_sec = float(raw_part.get("start_sec") or 0.0)
+            end_sec = float(raw_part.get("end_sec") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if end_sec <= start_sec:
+            continue
+        parts.append(
+            {
+                "part_index": int(raw_part.get("part_index") or len(parts) + 1),
+                "stem": str(raw_part.get("stem") or ""),
+                "path": str(raw_part.get("path") or ""),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+            }
+        )
+    return sorted(parts, key=lambda part: (float(part["start_sec"]), int(part["part_index"])))
+
+
+def _asr_segment_reference_start(segment: Segment) -> float:
+    if segment.source_script is not None:
+        return float(segment.source_script.start)
+    return float(segment.start)
+
+
+def _asr_part_for_segment_start(
+    parts: list[dict[str, Any]],
+    segment_start: float,
+) -> dict[str, Any] | None:
+    for index, part in enumerate(parts):
+        start_sec = float(part["start_sec"])
+        end_sec = float(part["end_sec"])
+        is_last = index == len(parts) - 1
+        if start_sec <= segment_start < end_sec or (is_last and segment_start == end_sec):
+            return part
+    return None
+
+
+def _asr_manual_review_file_metrics(manifest: PipelineManifest) -> list[dict[str, Any]]:
+    parts = _asr_folder_input_parts(manifest)
+    if not parts:
+        return []
+    stats: dict[int, dict[str, Any]] = {}
+    for part in parts:
+        part_index = int(part["part_index"])
+        stats[part_index] = {
+            "part_index": part_index,
+            "stem": part["stem"],
+            "path": part["path"],
+            "start_sec": round(float(part["start_sec"]), 6),
+            "end_sec": round(float(part["end_sec"]), 6),
+            "segment_count": 0,
+            "needs_manual_review": 0,
+        }
+    for segment in manifest.segments:
+        part = _asr_part_for_segment_start(parts, _asr_segment_reference_start(segment))
+        if part is None:
+            continue
+        part_stats = stats[int(part["part_index"])]
+        part_stats["segment_count"] += 1
+        if segment.status == "needs_manual_review":
+            part_stats["needs_manual_review"] += 1
+
+    metrics: list[dict[str, Any]] = []
+    for part in parts:
+        part_stats = stats[int(part["part_index"])]
+        part_segment_count = int(part_stats["segment_count"])
+        part_needs_manual_review = int(part_stats["needs_manual_review"])
+        part_manual_review_rate = (
+            part_needs_manual_review / part_segment_count if part_segment_count else 0.0
+        )
+        part_threshold = _asr_source_separation_manual_review_threshold(part_segment_count)
+        metrics.append(
+            {
+                **part_stats,
+                "manual_review_rate": round(part_manual_review_rate, 6),
+                "manual_review_threshold": part_threshold,
+                "recommended": (
+                    part_segment_count > 0
+                    and part_needs_manual_review >= part_threshold
+                ),
+            }
+        )
+    return metrics
+
+
+def _source_separation_fallback_recommendation(
+    manifest: PipelineManifest,
+    *,
+    cfg: Any,
+    input_diagnostics: dict[str, Any],
+    repair_summary: dict[str, Any],
+    asr_review_summary: dict[str, Any],
+) -> dict[str, Any]:
+    selected = input_diagnostics.get("selected")
+    selected_source = selected.get("source") if isinstance(selected, dict) else None
+    selected_source_text = str(selected_source or "")
+    backend = str(getattr(cfg, "source_separation_backend", "") or "")
+    segment_count = len(manifest.segments)
+    needs_manual_review = sum(
+        1 for segment in manifest.segments if segment.status == "needs_manual_review"
+    )
+    no_speech_count = sum(
+        1 for segment in manifest.segments if segment.status in NO_SPEECH_STATUSES
+    )
+    non_speech_texture_count = sum(
+        1 for segment in manifest.segments if segment.status == "non_speech_texture"
+    )
+    error_counts: Counter[str] = Counter()
+    for segment in manifest.segments:
+        error_counts.update(str(error) for error in segment.errors if error)
+
+    manual_review_rate = needs_manual_review / segment_count if segment_count else 0.0
+    manual_review_threshold = _asr_source_separation_manual_review_threshold(segment_count)
+    manual_review_file_metrics = _asr_manual_review_file_metrics(manifest)
+    manual_review_file_trigger_count = sum(
+        1 for item in manual_review_file_metrics if item.get("recommended")
+    )
+    repair_attempted = _asr_summary_int(repair_summary.get("attempted"))
+    repair_repaired = _asr_summary_int(repair_summary.get("repaired"))
+    asr_review_attempted = _asr_summary_int(asr_review_summary.get("attempted"))
+    asr_review_failed = _asr_summary_int(asr_review_summary.get("failed"))
+    metrics = {
+        "source_separation_backend": backend,
+        "asr_input_source": selected_source_text or None,
+        "segment_count": segment_count,
+        "needs_manual_review": needs_manual_review,
+        "manual_review_rate": round(manual_review_rate, 6),
+        "manual_review_threshold": manual_review_threshold,
+        "manual_review_file_metrics": manual_review_file_metrics,
+        "manual_review_file_trigger_count": manual_review_file_trigger_count,
+        "no_speech_detected": no_speech_count,
+        "non_speech_texture": non_speech_texture_count,
+        "repair_attempted": repair_attempted,
+        "repair_repaired": repair_repaired,
+        "asr_review_attempted": asr_review_attempted,
+        "asr_review_failed": asr_review_failed,
+        "error_counts": dict(sorted(error_counts.items())),
+    }
+    thresholds = {
+        "min_manual_review_rate": ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_RATE,
+        "min_manual_review_count": ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_COUNT,
+    }
+    if (
+        backend in {"demucs", "mock"}
+        or selected_source_text in ASR_SOURCE_SEPARATION_FALLBACK_SEPARATED_SOURCES
+    ):
+        return {
+            "recommended": False,
+            "recommended_backend": None,
+            "reason": "source_separation_already_used",
+            "reasons": [],
+            "metrics": metrics,
+            "thresholds": thresholds,
+        }
+
+    reasons: list[str] = []
+    has_file_metrics = any(item.get("segment_count", 0) for item in manual_review_file_metrics)
+    manual_review_triggered = (
+        manual_review_file_trigger_count > 0
+        if has_file_metrics
+        else needs_manual_review >= manual_review_threshold
+    )
+    if manual_review_triggered:
+        reasons.append("manual_review_rate")
+
+    recommended = bool(reasons)
+    return {
+        "recommended": recommended,
+        "recommended_backend": "demucs" if recommended else None,
+        "reason": (
+            "raw_asr_quality_gate_failed"
+            if recommended
+            else "raw_asr_quality_within_threshold"
+        ),
+        "reasons": reasons,
+        "metrics": metrics,
+        "thresholds": thresholds,
+    }
+
+
+def _asr_segment_replacement_hits(
+    segment: Segment,
+    replacements_summary: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if segment.source_script is None:
+        return []
+    segment_start = float(segment.source_script.start)
+    segment_end = float(segment.source_script.end)
+    segment_duration = max(0.001, segment_end - segment_start)
+    segment_text = segment.source_script.text.strip()
+    hits: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for item in replacements_summary.get("items", []) or []:
+        try:
+            item_start = float(item.get("start"))
+            item_end = float(item.get("end"))
+        except (TypeError, ValueError):
+            continue
+        item_duration = max(0.001, item_end - item_start)
+        overlap = max(0.0, min(segment_end, item_end) - max(segment_start, item_start))
+        if overlap / min(segment_duration, item_duration) < 0.3:
+            continue
+        item_segment_id = item.get("segment_id")
+        if item_segment_id is not None and str(item_segment_id) != segment.id:
+            continue
+        item_texts = [
+            str(item.get(key) or "").strip()
+            for key in ("replaced_text", "original_text")
+            if str(item.get(key) or "").strip()
+        ]
+        if item_texts and not any(
+            segment_text == item_text
+            or item_text in segment_text
+            or segment_text in item_text
+            for item_text in item_texts
+        ):
+            continue
+        for raw_hit in item.get("hits", []) or []:
+            if not isinstance(raw_hit, Mapping):
+                continue
+            source = str(raw_hit.get("source") or "")
+            target = str(raw_hit.get("target") or "")
+            try:
+                count = int(raw_hit.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            key = (source, target, count)
+            if not source or key in seen:
+                continue
+            seen.add(key)
+            hits.append({"source": source, "target": target, "count": count})
+    return hits
+
+
+def _asr_segment_countdown_verified(segment: Segment) -> bool:
+    return _asr_segment_countdown_state(segment) == "verified"
+
+
+def _asr_segment_countdown_state(segment: Segment) -> str:
+    if isinstance(segment.analysis.get("asr_countdown_unverified"), Mapping):
+        return "unverified"
+    event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
+    if not isinstance(event, Mapping):
+        return "none"
+    raw_values = event.get("values")
+    if not isinstance(raw_values, list) or not all(isinstance(value, int) for value in raw_values):
+        return "none"
+    values = [int(value) for value in raw_values]
+    if not is_descending_countdown(values):
+        return "none"
+    raw_timeline = event.get("token_timeline")
+    if isinstance(raw_timeline, list) and len(raw_timeline) == len(values):
+        return "verified"
+    return "missing_timeline"
+
+
+def _asr_segment_warning_decision(segment: Segment) -> str | None:
+    analysis_decisions = (
+        ("asr_sparse_speech_unverified", "sparse_speech_unverified"),
+        ("asr_numeric_sequence_unverified", "numeric_sequence_unverified"),
+    )
+    for key, decision in analysis_decisions:
+        if isinstance(segment.analysis.get(key), Mapping):
+            return decision
+
+    quality_gate = segment.analysis.get("asr_quality_gate")
+    raw_warnings = quality_gate.get("warnings") if isinstance(quality_gate, Mapping) else None
+    if not isinstance(raw_warnings, list):
+        return None
+    warnings = {str(reason) for reason in raw_warnings if reason}
+    if "asr_sparse_speech_unverified" in warnings:
+        return "sparse_speech_unverified"
+    if "asr_numeric_sequence_unverified" in warnings:
+        return "numeric_sequence_unverified"
+    return None
+
+
+def _asr_segment_audit_item(
+    segment: Segment,
+    *,
+    replacements_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_script = segment.source_script
+    status = str(segment.status or "")
+    errors = [str(error) for error in segment.errors if error]
+    quality_gate = segment.analysis.get("asr_quality_gate")
+    gate_reasons: list[str] = []
+    if isinstance(quality_gate, Mapping):
+        raw_reasons = quality_gate.get("reasons")
+        if isinstance(raw_reasons, list):
+            gate_reasons = [str(reason) for reason in raw_reasons if reason]
+        raw_warnings = quality_gate.get("warnings")
+        if isinstance(raw_warnings, list):
+            gate_reasons.extend(str(reason) for reason in raw_warnings if reason)
+    reasons = list(dict.fromkeys([*errors, *gate_reasons]))
+    replacement_hits = _asr_segment_replacement_hits(segment, replacements_summary)
+    countdown_state = _asr_segment_countdown_state(segment)
+    countdown_verified = countdown_state == "verified"
+    warning_decision = _asr_segment_warning_decision(segment)
+
+    if status in {"needs_manual_review", "failed"} or any(
+        reason.startswith(("asr_prompt_or_hallucination_leak", "asr_suspicious_pattern:"))
+        for reason in reasons
+    ):
+        decision = "needs_review"
+        severity = "severe"
+    elif status == "non_speech_texture" or status in NO_SPEECH_STATUSES:
+        decision = "texture"
+        severity = "info"
+    elif countdown_verified:
+        decision = "countdown_verified"
+        severity = "warning" if replacement_hits else "info"
+    elif countdown_state in {"missing_timeline", "unverified"}:
+        decision = "countdown_unverified"
+        severity = "warning"
+    elif warning_decision is not None:
+        decision = warning_decision
+        severity = "warning"
+    else:
+        decision = "auto_accept"
+        severity = "warning" if replacement_hits else "info"
+
+    item: dict[str, Any] = {
+        "segment_id": segment.id,
+        "start": round(float(segment.start), 3),
+        "end": round(float(segment.end), 3),
+        "status": status,
+        "decision": decision,
+        "severity": severity,
+        "reasons": reasons,
+        "replacement_hits": replacement_hits,
+        "countdown_state": countdown_state,
+        "countdown_verified": countdown_verified,
+        "keep_original_texture": bool(segment.keep_original_texture),
+    }
+    if source_script is not None:
+        item["source_text"] = source_script.text.strip()
+        item["source_confidence"] = source_script.confidence
+        item["source_backend"] = source_script.backend
+    return item
+
+
+def _asr_postprocess_candidate_text(source_text: str, cfg: Any) -> str | None:
+    candidate = _asr_text_with_review_candidate_replacements(
+        source_text,
+        getattr(cfg, "asr_review_candidate_replacements", {}) or {},
+    ).strip()
+    if candidate and candidate != source_text.strip():
+        return candidate
+    return None
+
+
+def _asr_postprocess_action(item: Mapping[str, Any], candidate_text: str | None) -> str:
+    decision = str(item.get("decision") or "")
+    status = str(item.get("status") or "")
+    if candidate_text:
+        return "candidate_review"
+    if status in {"needs_manual_review", "failed"} or decision in {
+        "needs_review",
+        "countdown_unverified",
+        "numeric_sequence_unverified",
+        "sparse_speech_unverified",
+    }:
+        return "manual_review"
+    if item.get("replacement_hits"):
+        return "auto_replace"
+    return "keep"
+
+
+def _asr_postprocess_review_item(
+    segment: Segment,
+    *,
+    cfg: Any,
+    replacements_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    item = _asr_segment_audit_item(segment, replacements_summary=replacements_summary)
+    source_text = str(item.get("source_text") or "").strip()
+    candidate_text = _asr_postprocess_candidate_text(source_text, cfg) if source_text else None
+    action = _asr_postprocess_action(item, candidate_text)
+    payload: dict[str, Any] = {
+        "segment_id": item["segment_id"],
+        "start": item["start"],
+        "end": item["end"],
+        "status": item["status"],
+        "action": action,
+        "reasons": item["reasons"],
+        "replacement_hits": item["replacement_hits"],
+        "review_required": action in {"candidate_review", "manual_review"},
+    }
+    for key in ("source_text", "source_confidence", "source_backend"):
+        if key in item:
+            payload[key] = item[key]
+    if (action == "auto_replace" or item.get("replacement_hits")) and source_text:
+        payload["candidate_text"] = source_text
+    elif candidate_text is not None:
+        payload["candidate_text"] = candidate_text
+    return payload
+
+
+def _build_asr_postprocess_review_report(
+    manifest: PipelineManifest,
+    *,
+    cfg: Any,
+    replacements_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    all_items = [
+        _asr_postprocess_review_item(
+            segment,
+            cfg=cfg,
+            replacements_summary=replacements_summary,
+        )
+        for segment in manifest.segments
+    ]
+    action_counts = Counter(str(item["action"]) for item in all_items)
+    report_items = [item for item in all_items if item["action"] != "keep"]
+    return {
+        "schema_version": 1,
+        "summary": {
+            "segment_count": len(all_items),
+            "item_count": len(report_items),
+            "auto_replace": int(action_counts["auto_replace"]),
+            "candidate_review": int(action_counts["candidate_review"]),
+            "manual_review": int(action_counts["manual_review"]),
+            "keep": int(action_counts["keep"]),
+        },
+        "items": report_items,
+    }
+
+
+def _write_asr_postprocess_review_artifact(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    cfg: Any,
+    replacements_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    report = _build_asr_postprocess_review_report(
+        manifest,
+        cfg=cfg,
+        replacements_summary=replacements_summary,
+    )
+    report_path = project_dir / "work" / "transcribe" / "asr_postprocess_review.json"
+    write_json_atomic(report_path, report)
+    manifest.artifacts["asr_postprocess_review"] = str(report_path)
+    return report
+
+
+def _build_asr_high_risk_report(
+    manifest: PipelineManifest,
+    *,
+    cfg: Any,
+    replacements_summary: Mapping[str, Any],
+    repair_summary: Mapping[str, Any],
+    asr_review_summary: Mapping[str, Any],
+    filtered_summary: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    del cfg
+    all_items = [
+        _asr_segment_audit_item(segment, replacements_summary=replacements_summary)
+        for segment in manifest.segments
+    ]
+    report_items = [
+        item
+        for item in all_items
+        if item["decision"] != "auto_accept" or item["severity"] != "info"
+    ]
+    decision_counts = Counter(str(item["decision"]) for item in all_items)
+    severity_counts = Counter(str(item["severity"]) for item in all_items)
+    blocking_reasons: list[str] = []
+    if decision_counts["needs_review"]:
+        blocking_reasons.append("needs_manual_review")
+    if any(str(item.get("status")) == "failed" for item in all_items):
+        blocking_reasons.append("failed_segments")
+    severe_count = int(severity_counts["severe"])
+    automated_dubbing_ready = severe_count == 0
+    summary = {
+        "segment_count": len(all_items),
+        "auto_accept": int(decision_counts["auto_accept"]),
+        "countdown_verified": int(decision_counts["countdown_verified"]),
+        "countdown_unverified": int(decision_counts["countdown_unverified"]),
+        "sparse_speech_unverified": int(decision_counts["sparse_speech_unverified"]),
+        "numeric_sequence_unverified": int(decision_counts["numeric_sequence_unverified"]),
+        "texture": int(decision_counts["texture"]),
+        "needs_review": int(decision_counts["needs_review"]),
+        "info": int(severity_counts["info"]),
+        "warning": int(severity_counts["warning"]),
+        "severe": severe_count,
+        "replacement_item_count": len(replacements_summary.get("items", []) or []),
+        "repair_attempted": _asr_summary_int(repair_summary.get("attempted")),
+        "repair_repaired": _asr_summary_int(repair_summary.get("repaired")),
+        "asr_review_attempted": _asr_summary_int(asr_review_summary.get("attempted")),
+        "asr_review_manual_review": _asr_summary_int(asr_review_summary.get("manual_review")),
+        "filtered_chunk_count": len(list(filtered_summary or [])),
+        "automated_dubbing_ready": automated_dubbing_ready,
+        "blocking_reasons": blocking_reasons,
+    }
+    return {
+        "schema_version": 1,
+        "summary": summary,
+        "items": report_items,
+    }
+
+
+def _write_asr_high_risk_report_artifact(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    cfg: Any,
+    replacements_summary: Mapping[str, Any],
+    repair_summary: Mapping[str, Any],
+    asr_review_summary: Mapping[str, Any],
+    filtered_summary: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    report = _build_asr_high_risk_report(
+        manifest,
+        cfg=cfg,
+        replacements_summary=replacements_summary,
+        repair_summary=repair_summary,
+        asr_review_summary=asr_review_summary,
+        filtered_summary=filtered_summary,
+    )
+    report_path = project_dir / "work" / "transcribe" / "asr_high_risk_report.json"
+    write_json_atomic(report_path, report)
+    manifest.artifacts["asr_high_risk_report"] = str(report_path)
+    return report
+
+
 def _write_asr_diagnostics_artifacts(
     project_dir: Path,
     manifest: PipelineManifest,
@@ -3851,6 +6430,13 @@ def _write_asr_diagnostics_artifacts(
             ):
                 row["replacement_hits"] = list(item.get("hits", []))
                 break
+    source_separation_fallback = _source_separation_fallback_recommendation(
+        manifest,
+        cfg=cfg,
+        input_diagnostics=input_diagnostics,
+        repair_summary=repair_summary,
+        asr_review_summary=asr_review_summary,
+    )
     diagnostics = {
         "backend": backend_kind,
         "backend_name": backend_name,
@@ -3880,6 +6466,7 @@ def _write_asr_diagnostics_artifacts(
         "text_replacements": replacements_summary,
         "filtered_chunks": filtered_summary,
         "qwen_repair_fallback": qwen_fallback_summary,
+        "source_separation_fallback": source_separation_fallback,
     }
     summary = {
         "backend": backend_kind,
@@ -3895,6 +6482,10 @@ def _write_asr_diagnostics_artifacts(
         "raw_asr_chunk_count": len(raw_chunks),
         "repaired_asr_chunk_count": len(repaired_chunks),
         "final_asr_chunk_count": len(final_chunks),
+        "raw_asr_word_chunk_count": sum(1 for chunk in raw_chunks if chunk.words),
+        "repaired_asr_word_chunk_count": sum(1 for chunk in repaired_chunks if chunk.words),
+        "final_asr_word_chunk_count": sum(1 for chunk in final_chunks if chunk.words),
+        "final_asr_word_count": sum(len(chunk.words) for chunk in final_chunks),
         "repair_attempted": repair_summary.get("attempted", 0),
         "repair_repaired": repair_summary.get("repaired", 0),
         "asr_review_attempted": asr_review_summary.get("attempted", 0),
@@ -3903,8 +6494,16 @@ def _write_asr_diagnostics_artifacts(
         "filtered_chunk_count": len(filtered_summary),
         "needs_manual_review": sum(1 for segment in manifest.segments if segment.status == "needs_manual_review"),
         "no_speech_detected": sum(1 for segment in manifest.segments if segment.status in NO_SPEECH_STATUSES),
+        "non_speech_texture": sum(1 for segment in manifest.segments if segment.status == "non_speech_texture"),
         "warnings": input_diagnostics.get("warnings", []),
         "qwen_repair_fallback": qwen_fallback_summary,
+        "source_separation_fallback": source_separation_fallback,
+        "recommend_source_separation_fallback": bool(
+            source_separation_fallback.get("recommended")
+        ),
+        "recommended_source_separation_backend": source_separation_fallback.get(
+            "recommended_backend"
+        ),
     }
     diagnostics_path = transcribe_dir / "asr_diagnostics.json"
     summary_path = transcribe_dir / "asr_diagnostics_summary.json"
@@ -3914,16 +6513,23 @@ def _write_asr_diagnostics_artifacts(
     manifest.artifacts["asr_diagnostics_summary"] = str(summary_path)
 
 
-def _format_server_command(command: list[str], base_url: str, lane_index: int) -> list[str]:
+def _format_server_command(
+    command: list[str],
+    base_url: str,
+    lane_index: int,
+    parallel_slots: int = 1,
+) -> list[str]:
     parsed = urlparse(base_url)
     host = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    effective_parallel_slots = max(1, int(parallel_slots))
     return [
         str(part)
         .replace("{base_url}", base_url)
         .replace("{host}", host)
         .replace("{port}", str(port))
         .replace("{lane}", str(lane_index))
+        .replace("{parallel}", str(effective_parallel_slots))
         for part in command
     ]
 
@@ -3934,13 +6540,16 @@ def _gemma_text_server_command(
     base_url: str | None = None,
     lane_index: int = 0,
     include_mmproj: bool = False,
+    parallel_slots: int = 1,
 ) -> list[str]:
     effective_base_url = base_url or cfg.gemma_text_server_url
+    effective_parallel_slots = max(1, int(parallel_slots))
     if cfg.gemma_text_server_command:
         return _format_server_command(
             [str(part) for part in cfg.gemma_text_server_command],
             effective_base_url,
             lane_index,
+            effective_parallel_slots,
         )
     return default_llama_server_command(
         base_url=effective_base_url,
@@ -3953,6 +6562,7 @@ def _gemma_text_server_command(
         ctx_size=cfg.gemma_llama_cpp_ctx_size,
         gpu_layers=cfg.gemma_llama_cpp_gpu_layers,
         n_predict=cfg.gemma_text_n_predict,
+        parallel_slots=effective_parallel_slots,
     )
 
 
@@ -3998,7 +6608,7 @@ def _select_voice_ref_spans(
             metrics = measure_source_voice_quality(source_audio)
         except Exception:
             pass
-        scored.append((_voice_ref_span_score(span, metrics), span, metrics))
+        scored.append((_voice_ref_span_score(span, metrics, cfg), span, metrics))
     selected = [
         (score, span, metrics)
         for score, span, metrics in sorted(scored, key=lambda item: item[0], reverse=True)
@@ -4006,6 +6616,13 @@ def _select_voice_ref_spans(
     ]
     if not selected:
         selected = sorted(scored, key=lambda item: item[0], reverse=True)
+    plain_selected = [
+        item
+        for item in selected
+        if _voice_ref_span_text_penalty(item[1], cfg) < 0.25
+    ]
+    if plain_selected:
+        selected = plain_selected
     spans: list[_VoiceRefSpan] = []
     used_segment_ids: set[str] = set()
     for _, span, _ in selected:
@@ -4050,16 +6667,59 @@ def _build_voice_ref_span(
 def _voice_ref_span_score(
     span: _VoiceRefSpan,
     metrics: AudioQualityMetrics | None = None,
+    cfg: Any | None = None,
 ) -> tuple[float, float, float, float]:
     first = span.segments[0]
-    text_len = sum(len(segment.source_script.text.strip()) for segment in span.segments if segment.source_script)
     quality = metrics.score if metrics is not None else 0.5
+    text_len = sum(len(segment.source_script.text.strip()) for segment in span.segments if segment.source_script)
+    quality -= _voice_ref_span_text_penalty(span, cfg)
     return (
-        quality,
+        max(0.0, min(1.0, quality)),
         span.duration,
         min(text_len / 80.0, 1.0),
         -first.start,
     )
+
+
+def _voice_ref_span_text_penalty(span: _VoiceRefSpan, cfg: Any | None = None) -> float:
+    text_len = sum(len(segment.source_script.text.strip()) for segment in span.segments if segment.source_script)
+    prompt_text = _voice_ref_span_prompt_text(span)
+    source_chars_per_sec = text_len / span.duration if span.duration > 0 else 0.0
+    return _voice_ref_text_penalty(prompt_text, source_chars_per_sec, cfg)
+
+
+def _voice_ref_text_penalty(
+    prompt_text: str,
+    source_chars_per_sec: float,
+    cfg: Any | None = None,
+) -> float:
+    penalty = 0.0
+    preferred = getattr(cfg, "gsv_few_shot_preferred_chars_per_sec", None) if cfg is not None else None
+    maximum = getattr(cfg, "gsv_few_shot_max_chars_per_sec", None) if cfg is not None else None
+    if preferred is not None and preferred > 0 and source_chars_per_sec > preferred:
+        if maximum is not None and maximum > preferred:
+            ratio = min(max((source_chars_per_sec - preferred) / (maximum - preferred), 0.0), 1.0)
+        else:
+            ratio = min(max((source_chars_per_sec - preferred) / preferred, 0.0), 1.0)
+        penalty += 0.25 * ratio
+    prefer_plain = getattr(cfg, "gsv_few_shot_prefer_plain_text", True) if cfg is not None else True
+    if not prefer_plain:
+        return min(penalty, 0.65)
+    if re.search(r"^\s*\d+\s+", prompt_text):
+        penalty += 0.18
+    if re.search(
+        r"(ピチッ|ピチョ|ピッチャ|ピキー|ピク|ぷしゃ|ぐちゃ|ぬめ|にゅる|ぎゅる|びく|喘ぎ|絶頂|貫く|貫通|触手|タイツ|電気ショック|電流)",
+        prompt_text,
+    ):
+        penalty += 0.28
+    if re.search(
+        r"(変態|快感|気持ちよ|股間|股|粘液|愛液|子宮|乳首|おっぱい|おまんこ|おちんちん|チンポ|チンチン|ビンビン|勃起|エッチ|エロ|嫌ら|濡れ|尿道|お漏らし|メス|ロリ|痙攣|卵巣|バギナ|ピストン|媚薬|限界|出ない|行けない|侵され)",
+        prompt_text,
+    ):
+        penalty += 0.18
+    if prompt_text.count(" ") >= 2 and len(prompt_text.replace(" ", "")) / max(prompt_text.count(" ") + 1, 1) < 9:
+        penalty += 0.10
+    return min(penalty, 0.65)
 
 
 def _voice_ref_span_prompt_text(span: _VoiceRefSpan) -> str:
@@ -4086,6 +6746,151 @@ def _write_voice_ref_span(project_dir: Path, span: _VoiceRefSpan, output_path: P
     if not clips or sample_rate is None:
         raise ValueError("Cannot write an empty voice reference span.")
     write_audio(output_path, np.concatenate(clips, axis=0), sample_rate)
+
+
+def _gsv_training_speaker_ids(project_dir: Path, manifest: PipelineManifest, cfg: ProjectConfig) -> list[str]:
+    speaker_ids = select_training_speaker_ids(project_dir, manifest, cfg)
+    if len(speaker_ids) > 1:
+        insufficient: list[str] = []
+        for speaker_id in speaker_ids:
+            try:
+                select_training_items(project_dir, manifest, cfg, speaker_id=speaker_id)
+            except GPTSoVITSError as exc:
+                if "Not enough source voice data" not in str(exc):
+                    raise
+                insufficient.append(_gsv_speaker_insufficient_detail(speaker_id, exc))
+        if insufficient:
+            raise GPTSoVITSError(
+                "source speaker sanity check failed before GPT-SoVITS few-shot training: "
+                + "; ".join(insufficient)
+                + ". Not enough source voice data for at least one project speaker_id; "
+                "this often means source-speakers over-split a real speaker across multiple "
+                "diarization labels. Re-run source-speakers after inspecting diarization, "
+                "or use zero-shot fallback for insufficient training data."
+            )
+    return speaker_ids
+
+
+def _gsv_speaker_insufficient_detail(speaker_id: str, exc: GPTSoVITSError) -> str:
+    match = re.search(r"selected ([0-9.]+)s, need ([0-9.]+)s", str(exc))
+    if not match:
+        return f"{speaker_id}: {exc}"
+    selected, needed = (float(match.group(1)), float(match.group(2)))
+    return f"{speaker_id} selected {selected:.2f}s, need {needed:.2f}s"
+
+
+def _rvc_training_speaker_ids(project_dir: Path, manifest: PipelineManifest, backend: str) -> list[str]:
+    cfg = manifest.project_config
+    speaker_ids: set[str] = set()
+    strict_training_filter = backend == "command"
+    for segment in manifest.segments:
+        if segment.status in SKIP_STATUSES or not segment.speaker_id:
+            continue
+        if strict_training_filter:
+            check = evaluate_voice_training_candidate(
+                project_dir,
+                segment,
+                cfg,
+                min_quality_score=cfg.rvc_train_min_quality_score,
+                require_source_script=False,
+                require_speaker_id=True,
+            )
+            if (
+                check.accepted
+                and not _rvc_train_text_reject_reasons(_source_script_chars_per_sec(segment), cfg)
+                and check.source_audio_path
+                and check.source_audio_path.exists()
+            ):
+                speaker_ids.add(segment.speaker_id)
+            continue
+        if not segment.audio_for_mix:
+            continue
+        try:
+            source_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+        except RightsError:
+            continue
+        if source_path.exists():
+            speaker_ids.add(segment.speaker_id)
+    return sorted(speaker_ids)
+
+
+def _config_with_gsv_speaker_models(
+    cfg: ProjectConfig,
+    speaker_models: dict[str, GSVSpeakerConfig],
+) -> ProjectConfig:
+    payload = cfg.model_dump(mode="json")
+    gsv_payload = dict(payload.get("gsv") or {})
+    existing = dict(gsv_payload.get("speaker_models") or {})
+    existing.update(
+        {speaker_id: speaker_cfg.model_dump(mode="json") for speaker_id, speaker_cfg in speaker_models.items()}
+    )
+    gsv_payload["speaker_models"] = existing
+    payload["gsv"] = gsv_payload
+    return ProjectConfig.model_validate(payload)
+
+
+def _config_with_rvc_speaker_models(
+    cfg: ProjectConfig,
+    speaker_models: dict[str, RVCSpeakerConfig],
+) -> ProjectConfig:
+    payload = cfg.model_dump(mode="json")
+    rvc_payload = dict(payload.get("rvc") or {})
+    existing = dict(rvc_payload.get("speaker_models") or {})
+    existing.update(
+        {speaker_id: speaker_cfg.model_dump(mode="json") for speaker_id, speaker_cfg in speaker_models.items()}
+    )
+    rvc_payload["speaker_models"] = existing
+    payload["rvc"] = rvc_payload
+    return ProjectConfig.model_validate(payload)
+
+
+def _prepare_gsv_speaker_refs(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+    speaker_id: str,
+) -> Path:
+    speaker_segments = [
+        segment.model_copy(deep=True)
+        for segment in manifest.segments
+        if segment.speaker_id == speaker_id and segment.status not in SKIP_STATUSES
+    ]
+    speaker_manifest = manifest.model_copy(update={"segments": speaker_segments})
+    selected_spans = _select_voice_ref_spans(project_dir, speaker_manifest, cfg)
+    selected_span = selected_spans[0] if selected_spans else None
+    if selected_span is None or not selected_span.segments[0].source_script:
+        raise ValueError(
+            f"Cannot prepare GPT-SoVITS refs for {speaker_id}: no transcribed clean span "
+            f"within {cfg.gsv_ref_min_sec:.2f}-{cfg.gsv_ref_max_sec:.2f} seconds."
+        )
+    refs_dir = ensure_inside_project(project_dir, project_dir / "refs" / "speakers" / speaker_id)
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    refs_path = ensure_inside_project(project_dir, refs_dir / "refs.json")
+    aux_spans = selected_spans[1:]
+    prompt_text = _voice_ref_span_prompt_text(selected_span)
+    data: dict[str, dict[str, Any]] = {}
+    for style in ("whisper_close", "sleepy"):
+        raw_ref_path = f"refs/speakers/{speaker_id}/{style}.wav"
+        ref_path = ensure_inside_project(project_dir, project_dir / raw_ref_path)
+        _write_voice_ref_span(project_dir, selected_span, ref_path)
+        aux_ref_audio_paths: list[str] = []
+        for aux_index, aux_span in enumerate(aux_spans, start=1):
+            aux_raw_path = f"refs/speakers/{speaker_id}/{style}_aux_{aux_index}.wav"
+            aux_path = ensure_inside_project(project_dir, project_dir / aux_raw_path)
+            _write_voice_ref_span(project_dir, aux_span, aux_path)
+            aux_ref_audio_paths.append(aux_raw_path)
+        data[style] = {
+            "ref_audio_path": raw_ref_path,
+            "prompt_text": prompt_text,
+            "prompt_lang": selected_span.segments[0].source_script.language or cfg.source_language,
+            "aux_ref_audio_paths": aux_ref_audio_paths,
+            "source_language": cfg.source_language,
+            "target_language": cfg.target_language,
+            "speaker_id": speaker_id,
+            "cross_lingual_role": "ja_source_prompt_for_ko_tts",
+        }
+    write_json_atomic(refs_path, data)
+    return refs_path
 
 
 def _mock_synthesize(output_path: Path, duration: float, seed: int, sample_rate: int = 48_000) -> Path:
@@ -4316,19 +7121,719 @@ def _require_rvc_ready_for_downstream(project_dir: Path, manifest: PipelineManif
             raise ValueError(f"{RVC_REQUIRED_MESSAGE} Segment {segment.id} RVC output is missing: {resolved}")
 
 
-def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: bool) -> tuple[Path, list[dict[str, str]]]:
-    dataset_dir = project_dir / "work" / "rvc_train" / "dataset"
+def _rvc_train_dataset_manifest_path(project_dir: Path, dataset_dir: Path | None = None) -> Path:
+    if dataset_dir is None or dataset_dir == project_dir / "work" / "rvc_train" / "dataset":
+        return project_dir / "work" / "rvc_train" / "dataset_manifest.json"
+    return dataset_dir.parent / "dataset_manifest.json"
+
+
+RVC_TRAIN_STRICT_DEFAULT_MAX_CLIP_SEC = 10.0
+RVC_TRAIN_STRICT_DEFAULT_MIN_SNR_DB = 20.0
+RVC_TRAIN_STRICT_DEFAULT_MAX_BACKGROUND_BLEED_DB = -30.0
+RVC_TRAIN_STRICT_DEFAULT_MAX_SIDE_TO_MID_DB = -12.0
+RVC_TRAIN_STRICT_DEFAULT_MIN_QUALITY_SCORE = 0.60
+RVC_TRAIN_RECOMMENDED_EPOCHS_BY_GRADE = {
+    "excellent": 160,
+    "good": 120,
+    "mixed": 60,
+    "poor": 25,
+}
+
+
+def _rvc_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _rvc_round(value: float | None) -> float | None:
+    return round(value, 6) if value is not None else None
+
+
+def _rvc_numeric_stats(values: Sequence[Any]) -> dict[str, Any]:
+    numeric = sorted(value for value in (_rvc_float(item) for item in values) if value is not None)
+    if not numeric:
+        return {"count": 0}
+
+    def percentile(fraction: float) -> float:
+        if len(numeric) == 1:
+            return numeric[0]
+        position = (len(numeric) - 1) * fraction
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return numeric[lower]
+        weight = position - lower
+        return numeric[lower] * (1.0 - weight) + numeric[upper] * weight
+
+    return {
+        "count": len(numeric),
+        "min": round(numeric[0], 6),
+        "p10": round(percentile(0.10), 6),
+        "median": round(percentile(0.50), 6),
+        "mean": round(sum(numeric) / len(numeric), 6),
+        "p90": round(percentile(0.90), 6),
+        "max": round(numeric[-1], 6),
+    }
+
+
+def _rvc_stat(stats: dict[str, Any], key: str) -> float | None:
+    return _rvc_float(stats.get(key))
+
+
+def _rvc_stats_for_rows(rows: Sequence[dict[str, Any]], key: str) -> dict[str, Any]:
+    return _rvc_numeric_stats([row.get(key) for row in rows])
+
+
+def _rvc_speaker_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "dominant_speaker_id": None,
+            "dominant_speaker_ratio": 0.0,
+            "missing_speaker_ratio": 0.0,
+            "speaker_counts": {},
+        }
+    speaker_ids = [str(row.get("speaker_id") or "") for row in rows]
+    missing = sum(1 for speaker_id in speaker_ids if not speaker_id)
+    counts = Counter(speaker_id for speaker_id in speaker_ids if speaker_id)
+    dominant_speaker_id: str | None = None
+    dominant_count = 0
+    if counts:
+        dominant_speaker_id, dominant_count = counts.most_common(1)[0]
+    return {
+        "dominant_speaker_id": dominant_speaker_id,
+        "dominant_speaker_ratio": round(dominant_count / len(rows), 6),
+        "missing_speaker_ratio": round(missing / len(rows), 6),
+        "speaker_counts": dict(sorted(counts.items())),
+    }
+
+
+def _rvc_reject_reason_counts(rejected_rows: Sequence[dict[str, Any]] | None) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for row in rejected_rows or []:
+        reasons = row.get("reject_reasons")
+        if not isinstance(reasons, Sequence) or isinstance(reasons, (str, bytes)):
+            continue
+        for reason in reasons:
+            key = str(reason).split(":", 1)[0]
+            counts[key] += 1
+    return dict(sorted(counts.items()))
+
+
+def _rvc_metric_passes_max(value: float | None, maximum: float) -> bool:
+    return value is None or value <= maximum
+
+
+def _rvc_metric_passes_min(value: float | None, minimum: float) -> bool:
+    return value is not None and value >= minimum
+
+
+def _rvc_dataset_quality_grade(
+    *,
+    clean_duration_sec: float,
+    quality_stats: dict[str, Any],
+    background_stats: dict[str, Any],
+    side_stats: dict[str, Any],
+    dominant_speaker_ratio: float,
+    missing_speaker_ratio: float,
+) -> str:
+    quality_median = _rvc_stat(quality_stats, "median")
+    quality_p10 = _rvc_stat(quality_stats, "p10")
+    background_median = _rvc_stat(background_stats, "median")
+    side_median = _rvc_stat(side_stats, "median")
+
+    if (
+        clean_duration_sec < 300.0
+        or missing_speaker_ratio > 0.25
+        or (quality_median is not None and quality_median < 0.55)
+    ):
+        return "poor"
+    if (
+        clean_duration_sec >= 600.0
+        and _rvc_metric_passes_min(quality_median, 0.78)
+        and _rvc_metric_passes_min(quality_p10, 0.62)
+        and _rvc_metric_passes_max(background_median, -30.0)
+        and _rvc_metric_passes_max(side_median, -12.0)
+        and dominant_speaker_ratio >= 0.95
+    ):
+        return "excellent"
+    if (
+        clean_duration_sec >= 600.0
+        and _rvc_metric_passes_min(quality_median, 0.70)
+        and _rvc_metric_passes_min(quality_p10, 0.50)
+        and _rvc_metric_passes_max(background_median, -25.0)
+        and _rvc_metric_passes_max(side_median, -8.0)
+        and dominant_speaker_ratio >= 0.90
+    ):
+        return "good"
+    return "mixed"
+
+
+def _rvc_recommended_epoch_count(quality_grade: str) -> int:
+    return RVC_TRAIN_RECOMMENDED_EPOCHS_BY_GRADE.get(quality_grade, 60)
+
+
+def _rvc_training_dataset_summary(
+    rows: Sequence[dict[str, Any]],
+    cfg: ProjectConfig,
+    rejected_rows: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    durations: list[float] = []
+    real_durations: list[float] = []
+    augmented_durations: list[float] = []
+    for row in rows:
+        source_path = Path(row["source_path"])
+        try:
+            row_duration = duration_sec(source_path)
+        except Exception:
+            row_duration = 0.0
+        durations.append(row_duration)
+        if row.get("augmentation_method"):
+            augmented_durations.append(row_duration)
+        else:
+            real_durations.append(row_duration)
+    clean_duration = round(sum(durations), 6)
+    clean_segment_count = len(rows)
+    insufficient_reasons: list[str] = []
+    if clean_segment_count < cfg.rvc_train_min_clean_segments:
+        insufficient_reasons.append(
+            f"clean_segment_count_below_min:{clean_segment_count}<{cfg.rvc_train_min_clean_segments}"
+        )
+    min_clean_sec = 0.0 if cfg.rvc_train_backend == "mock" else cfg.rvc_train_min_clean_sec
+    if clean_duration + 1e-6 < min_clean_sec:
+        insufficient_reasons.append(
+            f"clean_duration_sec_below_min:{clean_duration:g}<{min_clean_sec:g}"
+        )
+    quality_stats = _rvc_stats_for_rows(rows, "quality_score")
+    estimated_snr_stats = _rvc_stats_for_rows(rows, "estimated_snr_db")
+    background_stats = _rvc_stats_for_rows(rows, "background_bleed_db")
+    side_stats = _rvc_stats_for_rows(rows, "side_to_mid_db")
+    cps_stats = _rvc_stats_for_rows(rows, "source_chars_per_sec")
+    rank_stats = _rvc_stats_for_rows(rows, "training_rank_score")
+    speaker_summary = _rvc_speaker_summary(rows)
+    quality_grade = _rvc_dataset_quality_grade(
+        clean_duration_sec=clean_duration,
+        quality_stats=quality_stats,
+        background_stats=background_stats,
+        side_stats=side_stats,
+        dominant_speaker_ratio=speaker_summary["dominant_speaker_ratio"],
+        missing_speaker_ratio=speaker_summary["missing_speaker_ratio"],
+    )
+    return {
+        "clean_segment_count": clean_segment_count,
+        "clean_duration_sec": clean_duration,
+        "min_clean_segments": cfg.rvc_train_min_clean_segments,
+        "min_clean_sec": min_clean_sec,
+        "insufficient": bool(insufficient_reasons),
+        "insufficient_reasons": insufficient_reasons,
+        "real_clean_segment_count": clean_segment_count - len(augmented_durations),
+        "real_clean_duration_sec": round(sum(real_durations), 6),
+        "augmented_segment_count": len(augmented_durations),
+        "augmented_duration_sec": round(sum(augmented_durations), 6),
+        "augmentation_enabled": cfg.rvc_train_augment_enabled,
+        "augmentation_applied": bool(augmented_durations),
+        "augmentation_max_multiplier": cfg.rvc_train_augment_max_multiplier,
+        "augmentation_min_real_sec": cfg.rvc_train_augment_min_real_sec,
+        "augmentation_methods": list(dict.fromkeys(row["augmentation_method"] for row in rows if row.get("augmentation_method"))),
+        "quality_preset": cfg.rvc_train_quality_preset,
+        "epoch_policy": cfg.rvc_train_epoch_policy,
+        "quality_grade": quality_grade,
+        "recommended_epoch_count": _rvc_recommended_epoch_count(quality_grade),
+        "quality_score_stats": quality_stats,
+        "estimated_snr_db_stats": estimated_snr_stats,
+        "background_bleed_db_stats": background_stats,
+        "side_to_mid_db_stats": side_stats,
+        "source_chars_per_sec_stats": cps_stats,
+        "training_rank_score_stats": rank_stats,
+        "dominant_speaker_id": speaker_summary["dominant_speaker_id"],
+        "dominant_speaker_ratio": speaker_summary["dominant_speaker_ratio"],
+        "missing_speaker_ratio": speaker_summary["missing_speaker_ratio"],
+        "speaker_counts": speaker_summary["speaker_counts"],
+        "rejected_segment_count": len(rejected_rows or []),
+        "reject_reason_counts": _rvc_reject_reason_counts(rejected_rows),
+    }
+
+
+def _maybe_augment_rvc_training_rows(
+    rows: list[dict[str, Any]],
+    cfg: ProjectConfig,
+    *,
+    dataset_dir: Path,
+    force: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    summary = _rvc_training_dataset_summary(rows, cfg)
+    if not rows or not summary["insufficient"]:
+        return rows, summary
+    if not cfg.rvc_train_augment_enabled:
+        summary["augmentation_skipped_reason"] = "disabled"
+        return rows, summary
+    if summary["real_clean_duration_sec"] + 1e-6 < cfg.rvc_train_augment_min_real_sec:
+        summary["augmentation_skipped_reason"] = "real_clean_duration_below_augment_min"
+        return rows, summary
+
+    max_total_rows = max(len(rows), len(rows) * cfg.rvc_train_augment_max_multiplier)
+    if max_total_rows <= len(rows):
+        summary["augmentation_skipped_reason"] = "max_multiplier_exhausted"
+        return rows, summary
+
+    augmented_rows: list[dict[str, Any]] = []
+    base_rows = list(rows)
+    augment_dir = dataset_dir.parent / "augmented"
+    augment_dir.mkdir(parents=True, exist_ok=True)
+    for method in RVC_TRAIN_AUGMENT_METHODS:
+        for row in base_rows:
+            if len(rows) + len(augmented_rows) >= max_total_rows:
+                break
+            source_segment_id = row["segment_id"]
+            augmented_id = f"{source_segment_id}_aug_{method}"
+            augmented_source = augment_dir / f"{augmented_id}.wav"
+            _write_rvc_augmented_audio(Path(row["source_path"]), augmented_source, method, force=force)
+            augmented_row = {
+                key: value
+                for key, value in row.items()
+                if key
+                not in {
+                    "segment_id",
+                    "source_path",
+                    "dataset_path",
+                    "augmentation_method",
+                    "augmentation_source_segment_id",
+                }
+            }
+            augmented_row.update(
+                {
+                    "segment_id": augmented_id,
+                    "speaker_id": row.get("speaker_id", ""),
+                    "source_path": str(augmented_source),
+                    "dataset_path": str(dataset_dir / f"{augmented_id}.wav"),
+                    "augmentation_method": method,
+                    "augmentation_source_segment_id": source_segment_id,
+                }
+            )
+            augmented_rows.append(augmented_row)
+            trial_rows = [*rows, *augmented_rows]
+            trial_summary = _rvc_training_dataset_summary(trial_rows, cfg)
+            if not trial_summary["insufficient"]:
+                return trial_rows, trial_summary
+        if len(rows) + len(augmented_rows) >= max_total_rows:
+            break
+
+    augmented = [*rows, *augmented_rows]
+    summary = _rvc_training_dataset_summary(augmented, cfg)
+    if summary["insufficient"]:
+        summary["augmentation_skipped_reason"] = "max_multiplier_exhausted"
+    return augmented, summary
+
+
+def _write_rvc_augmented_audio(source_path: Path, output_path: Path, method: str, *, force: bool) -> None:
+    if not force and output_path.exists():
+        try:
+            source_stat = source_path.stat()
+            output_stat = output_path.stat()
+            if output_stat.st_mtime_ns >= source_stat.st_mtime_ns and output_stat.st_size > 0:
+                return
+        except OSError:
+            pass
+    data, sample_rate = load_audio(source_path)
+    augmented = _apply_rvc_training_augmentation(data, sample_rate, method)
+    write_audio(output_path, augmented, sample_rate)
+
+
+def _apply_rvc_training_augmentation(data: np.ndarray, sample_rate: int, method: str) -> np.ndarray:
+    audio = np.asarray(data, dtype=np.float32)
+    if method == "gain_minus3":
+        return _rvc_training_peak_guard(audio * (10 ** (-3.0 / 20.0)))
+    if method == "gain_plus3":
+        return _rvc_training_peak_guard(audio * (10 ** (3.0 / 20.0)))
+    if method == "highpass_80":
+        return _rvc_training_peak_guard(audio - _rvc_training_moving_average(audio, sample_rate / 80.0))
+    if method == "lowpass_7600":
+        return _rvc_training_peak_guard(_rvc_training_moving_average(audio, sample_rate / 7600.0))
+    raise RVCCommandError(f"Unknown RVC training augmentation method: {method}")
+
+
+def _rvc_training_moving_average(data: np.ndarray, window: float) -> np.ndarray:
+    window_size = max(1, int(round(window)))
+    if window_size <= 1 or len(data) <= 1:
+        return data.astype(np.float32, copy=True)
+    kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
+    channels = [
+        np.convolve(data[:, channel], kernel, mode="same")
+        for channel in range(data.shape[1])
+    ]
+    return np.stack(channels, axis=1).astype(np.float32)
+
+
+def _rvc_training_peak_guard(data: np.ndarray, peak_limit: float = 0.95) -> np.ndarray:
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak > peak_limit > 0:
+        data = data * (peak_limit / peak)
+    return np.clip(data, -1.0, 1.0).astype(np.float32)
+
+
+def _write_rvc_train_dataset_manifest(
+    project_dir: Path,
+    dataset_dir: Path | None,
+    *,
+    rows: Sequence[dict[str, Any]],
+    rejected_rows: Sequence[dict[str, Any]],
+    summary: dict[str, Any],
+) -> Path:
+    manifest_path = _rvc_train_dataset_manifest_path(project_dir, dataset_dir)
+    write_json_atomic(
+        manifest_path,
+        {
+            "segments": list(rows),
+            "rejected_segments": list(rejected_rows),
+            "summary": summary,
+        },
+    )
+    return manifest_path
+
+
+def _is_rvc_insufficient_training_data(exc: Exception) -> bool:
+    return str(exc).startswith(RVC_INSUFFICIENT_TRAINING_DATA_PREFIX)
+
+
+def _dedupe_rvc_training_rows(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    kept_by_source: dict[Path, dict[str, Any]] = {}
+    duplicate_rows: list[dict[str, Any]] = []
+    for row in rows:
+        source_key = Path(row["source_path"]).resolve()
+        kept = kept_by_source.get(source_key)
+        if kept is None:
+            kept_by_source[source_key] = dict(row)
+            continue
+        if _rvc_training_row_is_better(row, kept):
+            duplicate_rows.append(_rvc_duplicate_reject_row(kept, row))
+            kept_by_source[source_key] = dict(row)
+            continue
+        duplicate_rows.append(_rvc_duplicate_reject_row(row, kept))
+    kept_ids = {row["segment_id"] for row in kept_by_source.values()}
+    return [dict(row) for row in rows if row["segment_id"] in kept_ids], duplicate_rows
+
+
+def _rvc_training_row_is_better(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+    return _rvc_training_row_score(candidate) > _rvc_training_row_score(current)
+
+
+def _rvc_training_row_score(row: dict[str, Any]) -> tuple[float, float]:
+    quality = row.get("training_rank_score", row.get("quality_score"))
+    if not isinstance(quality, (int, float)):
+        quality = -1.0
+    duration = row.get("duration_sec")
+    if not isinstance(duration, (int, float)):
+        duration = 0.0
+    return (float(quality), float(duration))
+
+
+def _source_script_chars_per_sec(segment: Segment) -> float | None:
+    if segment.duration <= 0 or not segment.source_script:
+        return None
+    text = "".join(
+        char
+        for char in segment.source_script.text
+        if unicodedata.category(char)[0] in {"L", "N"}
+    )
+    if not text:
+        return None
+    return len(text) / segment.duration
+
+
+def _rvc_train_text_reject_reasons(
+    source_chars_per_sec: float | None,
+    cfg: ProjectConfig,
+) -> tuple[str, ...]:
+    max_chars_per_sec = getattr(cfg, "rvc_train_max_chars_per_sec", None)
+    if source_chars_per_sec is None or max_chars_per_sec is None or max_chars_per_sec <= 0:
+        return ()
+    if source_chars_per_sec <= max_chars_per_sec:
+        return ()
+    return (
+        "source_chars_per_sec_above_max:"
+        f"{source_chars_per_sec:.3f}>{float(max_chars_per_sec):.3f}",
+    )
+
+
+def _rvc_training_quality_tier(rank_score: float | None) -> str | None:
+    if rank_score is None:
+        return None
+    if rank_score >= 0.80:
+        return "excellent"
+    if rank_score >= 0.65:
+        return "good"
+    if rank_score >= 0.45:
+        return "mixed"
+    return "poor"
+
+
+def _rvc_training_rank_score(row: dict[str, Any], cfg: ProjectConfig) -> float:
+    score = _rvc_float(row.get("quality_score"))
+    if score is None:
+        score = 0.50
+
+    source_chars_per_sec = _rvc_float(row.get("source_chars_per_sec"))
+    preferred_chars_per_sec = _rvc_float(getattr(cfg, "rvc_train_preferred_chars_per_sec", None))
+    max_chars_per_sec = _rvc_float(getattr(cfg, "rvc_train_max_chars_per_sec", None))
+    if source_chars_per_sec is not None and preferred_chars_per_sec is not None and source_chars_per_sec > preferred_chars_per_sec:
+        hard_max = max(max_chars_per_sec or preferred_chars_per_sec, preferred_chars_per_sec + 1e-6)
+        score -= min(0.18, 0.18 * ((source_chars_per_sec - preferred_chars_per_sec) / (hard_max - preferred_chars_per_sec)))
+
+    estimated_snr_db = _rvc_float(row.get("estimated_snr_db"))
+    if estimated_snr_db is not None and estimated_snr_db < 20.0:
+        score -= min(0.12, (20.0 - estimated_snr_db) / 100.0)
+
+    background_bleed_db = _rvc_float(row.get("background_bleed_db"))
+    if background_bleed_db is not None and background_bleed_db > -30.0:
+        score -= min(0.18, (background_bleed_db + 30.0) / 80.0)
+
+    side_to_mid_db = _rvc_float(row.get("side_to_mid_db"))
+    if side_to_mid_db is not None and side_to_mid_db > -12.0:
+        score -= min(0.12, (side_to_mid_db + 12.0) / 80.0)
+
+    duration = _rvc_float(row.get("duration_sec"))
+    max_clip_sec = _rvc_float(getattr(cfg, "rvc_train_max_clip_sec", None))
+    if duration is not None and max_clip_sec is not None and duration > max_clip_sec:
+        score -= min(0.10, (duration - max_clip_sec) / max(max_clip_sec * 10.0, 1.0))
+
+    return round(max(0.0, min(1.0, score)), 6)
+
+
+def _rvc_training_audit_fields(
+    metrics: AudioQualityMetrics | None,
+    clean_source_metrics: dict[str, float | None],
+    source_chars_per_sec: float | None,
+    cfg: ProjectConfig,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {}
+    if metrics is not None:
+        row.update(
+            {
+                "quality_score": round(metrics.score, 6),
+                "peak_dbfs": round(metrics.peak_dbfs, 6),
+                "rms_dbfs": round(metrics.rms_dbfs, 6),
+                "clipping_ratio": round(metrics.clipping_ratio, 6),
+                "leading_silence_sec": round(metrics.leading_silence_sec, 6),
+                "trailing_silence_sec": round(metrics.trailing_silence_sec, 6),
+                "active_ratio": round(metrics.active_ratio, 6),
+                "silence_ratio": round(metrics.silence_ratio, 6),
+                "estimated_snr_db": _rvc_round(metrics.estimated_snr_db),
+                "quality_issues": list(metrics.issues),
+            }
+        )
+    if clean_source_metrics:
+        row["background_bleed_db"] = _rvc_round(clean_source_metrics.get("background_bleed_db"))
+        row["side_to_mid_db"] = _rvc_round(clean_source_metrics.get("side_to_mid_db"))
+    if source_chars_per_sec is not None:
+        row["source_chars_per_sec"] = round(source_chars_per_sec, 6)
+    rank_score = _rvc_training_rank_score(row, cfg)
+    row["training_rank_score"] = rank_score
+    row["training_quality_tier"] = _rvc_training_quality_tier(rank_score)
+    return row
+
+
+def _rvc_train_policy_reject_reasons(row: dict[str, Any], cfg: ProjectConfig) -> tuple[str, ...]:
+    if cfg.rvc_train_quality_preset != "strict":
+        return ()
+    reasons: list[str] = []
+    duration = _rvc_float(row.get("duration_sec"))
+    max_clip_sec = _rvc_float(cfg.rvc_train_max_clip_sec) or RVC_TRAIN_STRICT_DEFAULT_MAX_CLIP_SEC
+    if duration is not None and duration > max_clip_sec:
+        reasons.append(f"rvc_train_duration_sec_above_max:{duration:.3f}>{max_clip_sec:.3f}")
+
+    quality_score = _rvc_float(row.get("quality_score"))
+    min_quality_score = max(float(cfg.rvc_train_min_quality_score), RVC_TRAIN_STRICT_DEFAULT_MIN_QUALITY_SCORE)
+    if quality_score is not None and quality_score < min_quality_score:
+        reasons.append(f"rvc_train_quality_score_below_strict_min:{quality_score:.3f}<{min_quality_score:.3f}")
+
+    estimated_snr_db = _rvc_float(row.get("estimated_snr_db"))
+    min_snr_db = _rvc_float(cfg.rvc_train_min_snr_db) or RVC_TRAIN_STRICT_DEFAULT_MIN_SNR_DB
+    if estimated_snr_db is not None and estimated_snr_db < min_snr_db:
+        reasons.append(f"rvc_train_estimated_snr_db_below_min:{estimated_snr_db:.3f}<{min_snr_db:.3f}")
+
+    background_bleed_db = _rvc_float(row.get("background_bleed_db"))
+    max_background_bleed_db = (
+        _rvc_float(cfg.rvc_train_max_background_bleed_db)
+        if cfg.rvc_train_max_background_bleed_db is not None
+        else RVC_TRAIN_STRICT_DEFAULT_MAX_BACKGROUND_BLEED_DB
+    )
+    if background_bleed_db is not None and background_bleed_db > max_background_bleed_db:
+        reasons.append(
+            f"rvc_train_background_bleed_db_above_max:{background_bleed_db:.3f}>{max_background_bleed_db:.3f}"
+        )
+
+    side_to_mid_db = _rvc_float(row.get("side_to_mid_db"))
+    max_side_to_mid_db = (
+        _rvc_float(cfg.rvc_train_max_side_to_mid_db)
+        if cfg.rvc_train_max_side_to_mid_db is not None
+        else RVC_TRAIN_STRICT_DEFAULT_MAX_SIDE_TO_MID_DB
+    )
+    if side_to_mid_db is not None and side_to_mid_db > max_side_to_mid_db:
+        reasons.append(f"rvc_train_side_to_mid_db_above_max:{side_to_mid_db:.3f}>{max_side_to_mid_db:.3f}")
+    return tuple(reasons)
+
+
+def _rvc_rejected_training_row(row: dict[str, Any], reject_reasons: Sequence[str]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "segment_id": row.get("segment_id"),
+        "source_path": row.get("source_path") or None,
+        "reject_reasons": list(dict.fromkeys(reject_reasons)),
+    }
+    for key in (
+        "speaker_id",
+        "analysis_speaker_count",
+        "duration_sec",
+        "quality_score",
+        "quality_issues",
+        "peak_dbfs",
+        "rms_dbfs",
+        "clipping_ratio",
+        "leading_silence_sec",
+        "trailing_silence_sec",
+        "active_ratio",
+        "silence_ratio",
+        "estimated_snr_db",
+        "background_bleed_db",
+        "side_to_mid_db",
+        "source_chars_per_sec",
+        "training_rank_score",
+        "training_quality_tier",
+    ):
+        if key in row:
+            payload[key] = row.get(key)
+    return payload
+
+
+def _rvc_train_effective_epoch_config(
+    cfg: ProjectConfig,
+    dataset_summary: dict[str, Any],
+) -> tuple[ProjectConfig, dict[str, Any]]:
+    configured_epochs = int(cfg.rvc_train_epochs)
+    recommended_epochs = int(dataset_summary.get("recommended_epoch_count") or configured_epochs)
+    auto_min = int(cfg.rvc_train_auto_epoch_min)
+    auto_max = int(cfg.rvc_train_auto_epoch_max)
+    effective_epochs = configured_epochs
+    if cfg.rvc_train_epoch_policy == "auto":
+        effective_epochs = max(auto_min, min(auto_max, recommended_epochs))
+    decision = {
+        "policy": cfg.rvc_train_epoch_policy,
+        "quality_preset": cfg.rvc_train_quality_preset,
+        "quality_grade": dataset_summary.get("quality_grade"),
+        "configured_epochs": configured_epochs,
+        "recommended_epoch_count": recommended_epochs,
+        "effective_epochs": effective_epochs,
+        "auto_epoch_min": auto_min,
+        "auto_epoch_max": auto_max,
+    }
+    if effective_epochs == configured_epochs:
+        return cfg, decision
+    payload = cfg.model_dump(mode="json")
+    rvc_payload = dict(payload.get("rvc") or {})
+    rvc_payload["train_epochs"] = effective_epochs
+    payload["rvc"] = rvc_payload
+    return ProjectConfig.model_validate(payload), decision
+
+
+def _rvc_train_dataset_summary_from_manifest(project_dir: Path, dataset_dir: Path | None) -> dict[str, Any]:
+    dataset_manifest_path = _rvc_train_dataset_manifest_path(project_dir, dataset_dir)
+    if not dataset_manifest_path.exists():
+        return {}
+    try:
+        payload = json.loads(dataset_manifest_path.read_text("utf-8"))
+    except Exception:
+        return {}
+    summary = payload.get("summary")
+    return summary if isinstance(summary, dict) else {}
+
+
+def _rvc_duplicate_reject_row(row: dict[str, Any], kept: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "segment_id": row["segment_id"],
+        "source_path": row["source_path"],
+        "reject_reasons": [f"duplicate_source_audio:{kept['segment_id']}"],
+        "speaker_id": row.get("speaker_id") or "",
+        "quality_score": row.get("quality_score"),
+        "source_chars_per_sec": row.get("source_chars_per_sec"),
+    }
+    for key in (
+        "estimated_snr_db",
+        "background_bleed_db",
+        "side_to_mid_db",
+        "training_rank_score",
+        "training_quality_tier",
+    ):
+        if key in row:
+            payload[key] = row.get(key)
+    return payload
+
+
+def _trim_rvc_training_rows_to_target(
+    rows: Sequence[dict[str, Any]],
+    cfg: ProjectConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    target_clean_sec = _rvc_float(cfg.rvc_train_target_clean_sec)
+    if target_clean_sec is None or target_clean_sec <= 0:
+        return [dict(row) for row in rows], []
+    current_duration = sum(_rvc_float(row.get("duration_sec")) or 0.0 for row in rows)
+    if current_duration <= target_clean_sec + 1e-6:
+        return [dict(row) for row in rows], []
+
+    ranked_rows = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            -(_rvc_float(row.get("training_rank_score")) or 0.0),
+            -float(row.get("duration_sec") if isinstance(row.get("duration_sec"), (int, float)) else 0.0),
+            str(row.get("segment_id") or ""),
+        ),
+    )
+    kept: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    kept_duration = 0.0
+    for row in ranked_rows:
+        if kept and kept_duration >= target_clean_sec:
+            rejected.append(_rvc_rejected_training_row(row, [f"target_clean_sec_trimmed:{target_clean_sec:.3f}"]))
+            continue
+        kept.append(row)
+        kept_duration += _rvc_float(row.get("duration_sec")) or 0.0
+    kept_ids = {row["segment_id"] for row in kept}
+    ordered_kept = [dict(row) for row in rows if row["segment_id"] in kept_ids]
+    return ordered_kept, rejected
+
+
+def _rvc_train_dataset(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    force: bool,
+    *,
+    speaker_id: str | None = None,
+    dataset_dir: Path | None = None,
+) -> tuple[Path, list[dict[str, Any]]]:
+    dataset_dir = dataset_dir or project_dir / "work" / "rvc_train" / "dataset"
     if force and dataset_dir.exists():
         shutil.rmtree(dataset_dir)
     dataset_dir.mkdir(parents=True, exist_ok=True)
+    augment_dir = dataset_dir.parent / "augmented"
+    if force and augment_dir.exists():
+        shutil.rmtree(augment_dir)
     stale_manifest = dataset_dir / "dataset_manifest.json"
     if stale_manifest.exists():
         stale_manifest.unlink()
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     rejected_rows: list[dict[str, Any]] = []
     cfg = manifest.project_config
     strict_training_filter = cfg.rvc_train_backend == "command"
     for segment in manifest.segments:
+        if speaker_id is not None and segment.speaker_id != speaker_id:
+            continue
+        source_chars_per_sec = _source_script_chars_per_sec(segment)
         if segment.status in SKIP_STATUSES:
             rejected_rows.append(
                 {
@@ -4347,27 +7852,89 @@ def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: boo
                 require_source_script=False,
                 require_speaker_id=True,
             )
-            if not check.accepted:
-                rejected_rows.append(
-                    {
-                        "segment_id": segment.id,
-                        "source_path": str(check.source_audio_path) if check.source_audio_path else None,
-                        "reject_reasons": list(check.reject_reasons),
-                        "quality_score": round(check.metrics.score, 6) if check.metrics else None,
-                        "quality_issues": list(check.metrics.issues) if check.metrics else [],
-                        "speaker_id": segment.speaker_id,
-                        "analysis_speaker_count": segment.analysis.get("speaker_count"),
-                    }
+            row = {
+                "segment_id": segment.id,
+                "speaker_id": segment.speaker_id or "",
+                "source_path": str(check.source_audio_path) if check.source_audio_path else "",
+                "dataset_path": str(dataset_dir / f"{segment.id}.wav"),
+                "duration_sec": round(segment.duration, 6),
+                "analysis_speaker_count": segment.analysis.get("speaker_count"),
+            }
+            row.update(
+                _rvc_training_audit_fields(
+                    check.metrics,
+                    check.clean_source_metrics,
+                    source_chars_per_sec,
+                    cfg,
                 )
+            )
+            reject_reasons = [
+                *check.reject_reasons,
+                *_rvc_train_text_reject_reasons(source_chars_per_sec, cfg),
+                *_rvc_train_policy_reject_reasons(row, cfg),
+            ]
+            if reject_reasons:
+                rejected_rows.append(_rvc_rejected_training_row(row, reject_reasons))
                 continue
             if not check.source_audio_path:
                 raise RVCCommandError(f"train-rvc source segment audio is missing for {segment.id}")
             source_path = check.source_audio_path
         else:
             source_path = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+            row = {
+                "segment_id": segment.id,
+                "speaker_id": segment.speaker_id or "",
+                "source_path": str(source_path),
+                "dataset_path": str(dataset_dir / f"{segment.id}.wav"),
+                "duration_sec": round(segment.duration, 6),
+            }
+            if source_chars_per_sec is not None:
+                row["source_chars_per_sec"] = round(source_chars_per_sec, 6)
+            rank_score = _rvc_training_rank_score(row, cfg)
+            row["training_rank_score"] = rank_score
+            row["training_quality_tier"] = _rvc_training_quality_tier(rank_score)
         if not source_path.exists():
             raise RVCCommandError(f"train-rvc source segment audio is missing: {source_path}")
-        output_path = dataset_dir / f"{segment.id}.wav"
+        rows.append(row)
+    rows, duplicate_rows = _dedupe_rvc_training_rows(rows)
+    rejected_rows.extend(duplicate_rows)
+    rows, target_trimmed_rows = _trim_rvc_training_rows_to_target(rows, cfg)
+    rejected_rows.extend(target_trimmed_rows)
+    summary = _rvc_training_dataset_summary(rows, cfg, rejected_rows)
+    if not rows:
+        _write_rvc_train_dataset_manifest(
+            project_dir,
+            dataset_dir,
+            rows=rows,
+            rejected_rows=rejected_rows,
+            summary=summary,
+        )
+        raise RVCCommandError(
+            f"{RVC_INSUFFICIENT_TRAINING_DATA_PREFIX} "
+            "requires at least one clean source voice segment audio file."
+        )
+    rows, summary = _maybe_augment_rvc_training_rows(rows, cfg, dataset_dir=dataset_dir, force=force)
+    augmentation_skipped_reason = summary.get("augmentation_skipped_reason")
+    summary = _rvc_training_dataset_summary(rows, cfg, rejected_rows)
+    if augmentation_skipped_reason is not None:
+        summary["augmentation_skipped_reason"] = augmentation_skipped_reason
+    if summary["insufficient"]:
+        _write_rvc_train_dataset_manifest(
+            project_dir,
+            dataset_dir,
+            rows=rows,
+            rejected_rows=rejected_rows,
+            summary=summary,
+        )
+        raise RVCCommandError(
+            f"{RVC_INSUFFICIENT_TRAINING_DATA_PREFIX} "
+            + ", ".join(summary["insufficient_reasons"])
+        )
+    if speaker_id is None:
+        _ensure_single_rvc_training_speaker(rows)
+    for row in rows:
+        source_path = Path(row["source_path"])
+        output_path = Path(row["dataset_path"])
         source_stat = source_path.stat()
         if (
             force
@@ -4376,25 +7943,49 @@ def _rvc_train_dataset(project_dir: Path, manifest: PipelineManifest, force: boo
             or output_path.stat().st_mtime_ns != source_stat.st_mtime_ns
         ):
             shutil.copy2(source_path, output_path)
-        rows.append({"segment_id": segment.id, "source_path": str(source_path), "dataset_path": str(output_path)})
-    accepted_names = {f"{row['segment_id']}.wav" for row in rows}
+    accepted_names = {Path(row["dataset_path"]).name for row in rows}
     for stale_wav in dataset_dir.glob("*.wav"):
         if stale_wav.name not in accepted_names:
             stale_wav.unlink()
-    if not rows:
-        raise RVCCommandError("train-rvc requires at least one clean source voice segment audio file.")
-    write_json_atomic(
-        project_dir / "work" / "rvc_train" / "dataset_manifest.json",
-        {"segments": rows, "rejected_segments": rejected_rows},
+    _write_rvc_train_dataset_manifest(
+        project_dir,
+        dataset_dir,
+        rows=rows,
+        rejected_rows=rejected_rows,
+        summary=summary,
     )
     return dataset_dir, rows
+
+
+def _ensure_single_rvc_training_speaker(rows: Sequence[dict[str, Any]]) -> None:
+    by_speaker: dict[str, list[str]] = {}
+    for row in rows:
+        speaker_id = row.get("speaker_id") or ""
+        if not speaker_id:
+            continue
+        by_speaker.setdefault(speaker_id, []).append(row["segment_id"])
+    if len(by_speaker) <= 1:
+        return
+    details = ", ".join(
+        f"{speaker_id}({','.join(segment_ids[:5])})"
+        for speaker_id, segment_ids in sorted(by_speaker.items())
+    )
+    raise RVCCommandError(
+        "speaker_id_mismatch: train-rvc requires one speaker_id, "
+        f"but accepted training segments include multiple speakers: {details}"
+    )
 
 
 def _train_rvc_ready_for_rvc(manifest: PipelineManifest) -> bool:
     status = manifest.stage_state.get("train-rvc", {}).get("status")
     if status == "completed":
         return True
-    return status == "skipped_pretrained_voice_bank" and bool(manifest.project_config.rvc_speaker_models)
+    if status == "skipped_pretrained_voice_bank":
+        return bool(manifest.project_config.rvc_speaker_models)
+    if status == "skipped_insufficient_training_data":
+        cfg = manifest.project_config
+        return bool(cfg.rvc_allow_pre_rvc_fallback and not _rvc_downstream_required(cfg))
+    return False
 
 
 def _mix_config_metadata(manifest: PipelineManifest) -> dict[str, Any]:

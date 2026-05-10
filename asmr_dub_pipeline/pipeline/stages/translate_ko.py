@@ -44,13 +44,35 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     safety_blocked = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
+
+    def reset_downstream_state_for_retranslation(segment: Segment) -> None:
+        if segment.status in SKIP_STATUSES:
+            segment.status = "transcribed"
+        segment.script = None
+        segment.tts = None
+        segment.rvc = None
+        segment.qc = None
+        segment.mix = {}
+        segment.errors = [
+            error
+            for error in segment.errors
+            if error
+            not in {
+                "No acceptable TTS candidates for mix.",
+                "All TTS candidates failed.",
+            }
+            and not error.startswith("GPT-SoVITS synthesis failed")
+            and not error.startswith("Korean TTS preflight blocked synthesis")
+            and not error.startswith("korean-script skipped segment status")
+        ]
+
     for segment in manifest.segments:
         if segment.status in NO_SPEECH_STATUSES:
             no_speech_detected += 1
             rows.append(
                 {
                     "segment_id": segment.id,
-                    "status": "no_speech_detected",
+                    "status": segment.status,
                     "reason": f"segment status is {segment.status}",
                     "source_text": "",
                     "translation_ko": None,
@@ -83,6 +105,59 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             translation
             and LEGACY_DETERMINISTIC_NUMERIC_TRANSLATION_NOTE in translation.notes
         )
+        countdown_values = _countdown_values_for_segment(segment)
+        countdown_translation = (
+            _countdown_translation_for_segment(segment, countdown_values)
+            if countdown_values is not None
+            else None
+        )
+        if countdown_translation is not None:
+            if force_retranslate or retry_this_failed or failed_status:
+                reset_downstream_state_for_retranslation(segment)
+            segment.translation_ko = countdown_translation
+            segment.status = "transcribed"
+            segment.errors = []
+            translated += 1
+            quality_counters[COUNTDOWN_EVENT_NOTE] += 1
+            row = {
+                "batch_id": countdown_translation.batch_id,
+                "segment_id": segment.id,
+                "status": "translated",
+                "reason": COUNTDOWN_EVENT_NOTE,
+                "source_text": source_text,
+                "translation_ko": countdown_translation.model_dump(mode="json"),
+                "deterministic": True,
+            }
+            rows.append(row)
+            raw_translation_bundles.append(json.loads(json.dumps(row, ensure_ascii=False)))
+            continue
+        counting_values = _counting_values_for_segment(segment)
+        counting_translation = (
+            _counting_translation_for_segment(segment, counting_values)
+            if counting_values is not None
+            else None
+        )
+        if counting_translation is not None:
+            if force_retranslate or retry_this_failed or failed_status:
+                reset_downstream_state_for_retranslation(segment)
+            segment.translation_ko = counting_translation
+            segment.status = "transcribed"
+            segment.errors = []
+            translated += 1
+            numeric_counting_postprocessed += 1
+            quality_counters[NUMERIC_COUNTING_POSTPROCESS_NOTE] += 1
+            row = {
+                "batch_id": counting_translation.batch_id,
+                "segment_id": segment.id,
+                "status": "translated",
+                "reason": NUMERIC_COUNTING_POSTPROCESS_NOTE,
+                "source_text": source_text,
+                "translation_ko": counting_translation.model_dump(mode="json"),
+                "deterministic": True,
+            }
+            rows.append(row)
+            raw_translation_bundles.append(json.loads(json.dumps(row, ensure_ascii=False)))
+            continue
         if (
             translation
             and translation.ko_natural.strip()
@@ -118,7 +193,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                     "translation_ko": None,
                 }
             )
-        elif failed_status and not retry_this_failed:
+        elif failed_status and not retry_this_failed and not force_retranslate:
             needs_manual_review += 1
             rows.append(
                 {
@@ -132,6 +207,8 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         elif segment.source_script and segment.source_script.text.strip():
             if force_retranslate or legacy_numeric_translation or (retry_this_failed and force_retranslate_failed):
                 segment.translation_ko = None
+            if force_retranslate or retry_this_failed:
+                reset_downstream_state_for_retranslation(segment)
             translatable.append(segment)
         else:
             needs_manual_review += 1
@@ -161,6 +238,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         else 1
     )
     translation_base_urls = [cfg.gemma_text_server_url.rstrip("/")]
+    translation_auto_start = bool(cfg.gemma_text_server_auto_start)
 
     def create_translation_client(_worker_index: int = 0) -> Any:
         if backend_kind == "llama_server":
@@ -179,13 +257,13 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         for lane_index, base_url in enumerate(translation_base_urls):
             command = (
                 _gemma_text_server_command(cfg, base_url=base_url, lane_index=lane_index)
-                if cfg.gemma_text_server_auto_start
+                if translation_auto_start
                 else []
             )
             log_name = "llama_server.log"
             server_managers.append(
                 ManagedGemmaTextServer(
-                    enabled=cfg.gemma_text_server_auto_start,
+                    enabled=translation_auto_start,
                     base_url=base_url,
                     command=command,
                     log_path=project_dir / "work" / "translate_ko" / log_name,
@@ -442,7 +520,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         translations: dict[str, Any],
         translation_failures: dict[str, list[str]],
     ) -> None:
-        nonlocal last_logged_at, needs_manual_review, processed, translated
+        nonlocal last_logged_at, needs_manual_review, numeric_counting_postprocessed, processed, translated
         for segment in batch:
             translation = translations.get(segment.id)
             if translation is None:
@@ -476,10 +554,20 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 )
                 continue
             segment.translation_ko = translation
+            source_text = segment.source_script.text if segment.source_script else ""
+            raw_row = {
+                "batch_id": batch_id,
+                "segment_id": segment.id,
+                "status": "translated",
+                "source_text": source_text,
+                "translation_ko": translation.model_dump(mode="json"),
+            }
+            record_raw_translation_row(raw_row)
+            numeric_counting_postprocessed += _apply_korean_numeric_counting_postprocess([segment])
+            translation = segment.translation_ko or translation
             _clear_korean_translation_errors(segment)
             translated += 1
             processed += 1
-            source_text = segment.source_script.text if segment.source_script else ""
             rows.append(
                 {
                     "batch_id": batch_id,
@@ -489,7 +577,6 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                     "translation_ko": translation.model_dump(mode="json"),
                 }
             )
-            record_raw_translation_row(rows[-1])
             last_logged_at = _log_translate_progress(
                 processed,
                 total,
@@ -563,7 +650,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         quality_counters,
     )
     colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
-    numeric_counting_postprocessed = _apply_korean_numeric_counting_postprocess(manifest.segments)
+    numeric_counting_postprocessed += _apply_korean_numeric_counting_postprocess(manifest.segments)
     asr_backcheck_items = _apply_translation_asr_backcheck(manifest.segments, cfg)
     asr_backcheck_count = len(asr_backcheck_items)
     _refresh_translation_rows(rows, manifest.segments)
@@ -576,7 +663,8 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     )
     translated = sum(1 for row in rows if row.get("status") == "translated")
     needs_manual_review = sum(1 for row in rows if row.get("status") == "needs_manual_review")
-    no_speech_detected = sum(1 for row in rows if row.get("status") == "no_speech_detected")
+    no_speech_detected = sum(1 for row in rows if row.get("status") in NO_SPEECH_STATUSES)
+    non_speech_texture = sum(1 for row in rows if row.get("status") == "non_speech_texture")
     _write_jsonl_atomic(jsonl_path, rows)
     asr_backcheck_summary_path = project_dir / "work" / "translate_ko" / "asr_backcheck_summary.json"
     write_json_atomic(
@@ -595,6 +683,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         "translated": translated,
         "needs_manual_review": needs_manual_review,
         "no_speech_detected": no_speech_detected,
+        "non_speech_texture": non_speech_texture,
         "colloquialized": colloquialized,
         "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
         "ordinal_postprocessed": ordinal_postprocessed,
@@ -633,7 +722,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             for index, manager in enumerate(server_managers)
         ]
         server_metadata = {
-            "auto_start": cfg.gemma_text_server_auto_start,
+            "auto_start": translation_auto_start,
             "concurrency": translation_worker_count,
             "server_count": len(server_managers),
             "mode": "single_server_slots",
@@ -655,6 +744,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         translated=translated,
         needs_manual_review=needs_manual_review,
         no_speech_detected=no_speech_detected,
+        non_speech_texture=non_speech_texture,
         colloquialized=colloquialized,
         digit_pronunciation_postprocessed=digit_pronunciation_postprocessed,
         ordinal_postprocessed=ordinal_postprocessed,

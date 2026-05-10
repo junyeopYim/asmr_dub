@@ -60,7 +60,14 @@ packages = ["asmr_dub_pipeline"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not regression and not real_model'"
+markers = [
+  "contract: small default-suite tests for stable behavior and safety contracts",
+  "integration: local integration tests that use mocks or tiny generated fixtures",
+  "regression: historical or scenario-heavy regression tests excluded from the default suite",
+  "real_model: optional smoke tests that require local model weights, servers, or external runtimes",
+  "smoke: manually triggered smoke checks",
+]
 
 [tool.ruff]
 line-length = 100

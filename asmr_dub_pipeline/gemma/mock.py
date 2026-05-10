@@ -27,6 +27,34 @@ class MockGemmaBackend(GemmaBackend):
             "keep_original_texture": True,
             "risk_flags": [],
             "confidence": 0.95,
+            "voice_training": {
+                "clean_voice": True,
+                "eligible": True,
+                "reason": "",
+                "effect_tags": ["none"],
+                "same_speaker_under_effect": False,
+            },
+            "effect_events": [],
+            "audio_path": str(audio_path),
+        }
+
+    def analyze_audio_style(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "nonverbal_cues": [],
+            "spatial_style": "center",
+            "style_tags": ["soft_whisper", "close_mic"],
+            "estimated_pan": segment.estimated_pan,
+            "keep_original_texture": True,
+            "risk_flags": [],
+            "confidence": 0.95,
+            "voice_training": {
+                "clean_voice": True,
+                "eligible": True,
+                "reason": "",
+                "effect_tags": ["none"],
+                "same_speaker_under_effect": False,
+            },
+            "effect_events": [],
             "audio_path": str(audio_path),
         }
 

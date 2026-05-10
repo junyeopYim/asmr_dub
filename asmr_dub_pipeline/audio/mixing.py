@@ -6,10 +6,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import soundfile as sf
 
 from asmr_dub_pipeline.schemas import NonverbalCue, Segment
 
+from .effects import apply_segment_effects
 from .features import ensure_stereo, load_audio, resample_linear, write_audio
+
+STREAM_BLOCK_FRAMES = 65_536
 
 
 @dataclass(frozen=True)
@@ -457,9 +461,74 @@ def _quietest_slice(data: np.ndarray, frames: int, sample_rate: int) -> np.ndarr
     return np.tile(texture, (repeats, 1))[:frames].astype(np.float32)
 
 
-def _room_tone(path: str | None, sample_rate: int, frames: int, gain_db: float) -> np.ndarray:
+def _quietest_texture(data: np.ndarray, sample_rate: int) -> np.ndarray:
+    data = ensure_stereo(data).astype(np.float32, copy=False)
+    if len(data) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    window = min(len(data), max(1, int(round(0.05 * sample_rate))))
+    hop = max(1, window // 2)
+    best_start = 0
+    best_rms = float("inf")
+    mono = data.mean(axis=1)
+    for start in range(0, max(1, len(mono) - window + 1), hop):
+        chunk = mono[start : start + window]
+        rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
+        if rms < best_rms:
+            best_start = start
+            best_rms = rms
+    return data[best_start : best_start + window].copy()
+
+
+def _tile_texture(texture: np.ndarray, frames: int) -> np.ndarray:
     if frames <= 0:
         return np.zeros((0, 2), dtype=np.float32)
+    if len(texture) == 0:
+        return np.zeros((frames, 2), dtype=np.float32)
+    if len(texture) >= frames:
+        return texture[:frames].copy()
+    repeats = int(np.ceil(frames / len(texture)))
+    return np.tile(texture, (repeats, 1))[:frames].astype(np.float32)
+
+
+class _RoomToneCache:
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self._textures: dict[Path, np.ndarray | None] = {}
+
+    def tone(self, path: str | None, frames: int, gain_db: float) -> np.ndarray:
+        if frames <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if not path:
+            return np.zeros((frames, 2), dtype=np.float32)
+        source_path = Path(path)
+        if not source_path.exists():
+            return np.zeros((frames, 2), dtype=np.float32)
+        key = source_path.resolve()
+        if key not in self._textures:
+            try:
+                source = _load_for_mix(source_path, self.sample_rate)
+            except Exception:
+                self._textures[key] = None
+            else:
+                self._textures[key] = _quietest_texture(source, self.sample_rate)
+        texture = self._textures[key]
+        if texture is None:
+            return np.zeros((frames, 2), dtype=np.float32)
+        tone = _tile_texture(texture, frames) * db_to_gain(gain_db)
+        return apply_fade(tone, self.sample_rate, 12.0, 24.0)
+
+
+def _room_tone(
+    path: str | None,
+    sample_rate: int,
+    frames: int,
+    gain_db: float,
+    cache: _RoomToneCache | None = None,
+) -> np.ndarray:
+    if frames <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if cache is not None:
+        return cache.tone(path, frames, gain_db)
     if not path:
         return np.zeros((frames, 2), dtype=np.float32)
     source_path = Path(path)
@@ -477,14 +546,15 @@ def _prepare_segment_clip(
     clip: np.ndarray,
     sample_rate: int,
     plan: SegmentMixPlan,
+    room_tone_cache: _RoomToneCache | None = None,
 ) -> tuple[np.ndarray, bool]:
     clip = pan_stereo(clip, plan.pan)
     clip = apply_fade(clip, sample_rate, plan.fade_in_ms, plan.fade_out_ms)
     clip = clip * db_to_gain(plan.gain_db)
     pre_frames = int(round((plan.room_pre_pad_sec + plan.leading_pause_sec) * sample_rate))
     post_frames = int(round((plan.room_post_pad_sec + plan.trailing_pause_sec) * sample_rate))
-    pre = _room_tone(plan.room_tone_path, sample_rate, pre_frames, plan.room_gain_db)
-    post = _room_tone(plan.room_tone_path, sample_rate, post_frames, plan.room_gain_db)
+    pre = _room_tone(plan.room_tone_path, sample_rate, pre_frames, plan.room_gain_db, room_tone_cache)
+    post = _room_tone(plan.room_tone_path, sample_rate, post_frames, plan.room_gain_db, room_tone_cache)
     room_used = bool((pre.size and np.any(pre)) or (post.size and np.any(post)))
     return np.concatenate([pre, clip, post], axis=0), room_used
 
@@ -504,6 +574,93 @@ def overlay_segment(
     return base, updated_plan
 
 
+def _temp_wav_path(output_path: Path, label: str) -> Path:
+    return output_path.with_name(f".{output_path.stem}.{label}{output_path.suffix}")
+
+
+def _write_silent_float_wav(path: Path, frames: int, sample_rate: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sf.SoundFile(
+        str(path),
+        mode="w",
+        samplerate=sample_rate,
+        channels=2,
+        format="WAV",
+        subtype="FLOAT",
+    ) as handle:
+        remaining = frames
+        while remaining > 0:
+            count = min(STREAM_BLOCK_FRAMES, remaining)
+            handle.write(np.zeros((count, 2), dtype=np.float32))
+            remaining -= count
+
+
+def _stream_peak(path: Path) -> float:
+    peak = 0.0
+    with sf.SoundFile(str(path)) as source:
+        while True:
+            block = source.read(STREAM_BLOCK_FRAMES, always_2d=True, dtype="float32")
+            if len(block) == 0:
+                break
+            peak = max(peak, float(np.max(np.abs(block))) if block.size else 0.0)
+    return peak
+
+
+def _copy_scaled_audio(input_path: Path, output_path: Path, gain: float) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with sf.SoundFile(str(input_path)) as source, sf.SoundFile(
+        str(output_path),
+        mode="w",
+        samplerate=int(source.samplerate),
+        channels=2,
+        format="WAV",
+    ) as target:
+        while True:
+            block = source.read(STREAM_BLOCK_FRAMES, always_2d=True, dtype="float32")
+            if len(block) == 0:
+                break
+            target.write(ensure_stereo(block) * gain)
+
+
+def _finalize_streamed_audio(
+    temp_path: Path,
+    output_path: Path,
+    peak_limit_dbfs: float | None,
+) -> None:
+    gain = 1.0
+    if peak_limit_dbfs is not None:
+        peak = _stream_peak(temp_path)
+        peak_limit = db_to_gain(peak_limit_dbfs)
+        if peak > peak_limit > 0:
+            gain = peak_limit / peak
+    _copy_scaled_audio(temp_path, output_path, gain)
+
+
+def _overlay_prepared_clip_file(
+    stem_path: Path,
+    prepared: np.ndarray,
+    start_frame: int,
+    total_frames: int,
+) -> None:
+    start = max(0, start_frame)
+    end = min(total_frames, start + len(prepared))
+    if end <= start:
+        return
+    frames_to_write = end - start
+    cursor = 0
+    with sf.SoundFile(str(stem_path), mode="r+") as handle:
+        while cursor < frames_to_write:
+            count = min(STREAM_BLOCK_FRAMES, frames_to_write - cursor)
+            handle.seek(start + cursor)
+            base = handle.read(count, always_2d=True, dtype="float32")
+            if len(base) == 0:
+                break
+            mixed = ensure_stereo(base) + ensure_stereo(prepared[cursor : cursor + len(base)])
+            handle.seek(start + cursor)
+            handle.write(mixed)
+            cursor += len(base)
+
+
 def build_dialogue_stem(
     segments: list[Segment],
     output_path: Path,
@@ -516,45 +673,62 @@ def build_dialogue_stem(
     include_segment: Callable[[Segment], bool] | None = None,
 ) -> Path:
     frames = max(1, int(round(target_duration_sec * sample_rate)))
-    base = np.zeros((frames, 2), dtype=np.float32)
+    temp_path = _temp_wav_path(output_path, "dialogue.tmp")
+    _write_silent_float_wav(temp_path, frames, sample_rate)
+    room_tone_cache = _RoomToneCache(sample_rate)
     total = len(segments)
-    for index, segment in enumerate(segments, start=1):
-        included = (
-            include_segment(segment)
-            if include_segment is not None
-            else segment.status == "ok" and segment.qc is not None and segment.qc.recommendation == "pass"
-        )
-        if not included:
-            if progress_callback:
-                progress_callback(index, total, segment)
-            continue
-        selected = segment.rvc.output_path if segment.rvc and segment.rvc.output_path else None
-        if selected is None:
-            selected = segment.tts.selected_candidate_path if segment.tts else None
-        if not selected:
-            if progress_callback:
-                progress_callback(index, total, segment)
-            continue
-        clip = _load_for_mix(Path(selected), sample_rate)
-        plan = build_segment_mix_plan(segment, gain_offset_db=dialogue_gain_db)
-        if dialogue_fade_ms is not None:
-            plan = SegmentMixPlan(
-                **{
-                    **asdict(plan),
-                    "fade_in_ms": dialogue_fade_ms,
-                    "fade_out_ms": dialogue_fade_ms,
-                }
+    try:
+        for index, segment in enumerate(segments, start=1):
+            included = (
+                include_segment(segment)
+                if include_segment is not None
+                else segment.status == "ok" and segment.qc is not None and segment.qc.recommendation == "pass"
             )
-        base, plan = overlay_segment(base, clip, sample_rate, plan)
-        segment.mix.update(plan.as_manifest())
-        if progress_callback:
-            progress_callback(index, total, segment)
-    base = _peak_guard(base, peak_limit_dbfs)
-    write_audio(output_path, base, sample_rate)
+            if not included:
+                if progress_callback:
+                    progress_callback(index, total, segment)
+                continue
+            selected = segment.rvc.output_path if segment.rvc and segment.rvc.output_path else None
+            if selected is None:
+                selected = segment.tts.selected_candidate_path if segment.tts else None
+            if not selected:
+                if progress_callback:
+                    progress_callback(index, total, segment)
+                continue
+            clip = _load_for_mix(Path(selected), sample_rate)
+            plan = build_segment_mix_plan(segment, gain_offset_db=dialogue_gain_db)
+            if dialogue_fade_ms is not None:
+                plan = SegmentMixPlan(
+                    **{
+                        **asdict(plan),
+                        "fade_in_ms": dialogue_fade_ms,
+                        "fade_out_ms": dialogue_fade_ms,
+                    }
+                )
+            clip, effects = apply_segment_effects(clip, sample_rate, segment)
+            prepared, room_used = _prepare_segment_clip(
+                clip,
+                sample_rate,
+                plan,
+                room_tone_cache,
+            )
+            plan = SegmentMixPlan(**{**asdict(plan), "room_tone_used": room_used})
+            start = max(0, int(round(plan.overlay_start_sec * sample_rate)))
+            _overlay_prepared_clip_file(temp_path, prepared, start, frames)
+            segment.mix.update(plan.as_manifest())
+            if effects:
+                segment.mix["effects"] = effects
+            else:
+                segment.mix.pop("effects", None)
+            if progress_callback:
+                progress_callback(index, total, segment)
+        _finalize_streamed_audio(temp_path, output_path, peak_limit_dbfs)
+    finally:
+        temp_path.unlink(missing_ok=True)
     return output_path
 
 
-def mix_with_background(
+def _mix_with_background_in_memory(
     dialogue_path: Path,
     output_path: Path,
     background_path: Path | None = None,
@@ -579,3 +753,124 @@ def mix_with_background(
     mix = _peak_guard(mix, peak_limit_dbfs)
     write_audio(output_path, mix, sample_rate)
     return output_path
+
+
+def _path_matches_streaming_rate(path: Path, sample_rate: int) -> bool:
+    try:
+        info = sf.info(str(path))
+    except Exception:
+        return False
+    return int(info.samplerate) == int(sample_rate)
+
+
+def _mix_with_background_streaming(
+    dialogue_path: Path,
+    output_path: Path,
+    background_path: Path | None = None,
+    background_gain_db: float = -18.0,
+    sample_rate: int = 48_000,
+    peak_limit_dbfs: float | None = -1.0,
+) -> Path:
+    if not _path_matches_streaming_rate(dialogue_path, sample_rate):
+        return _mix_with_background_in_memory(
+            dialogue_path,
+            output_path,
+            background_path,
+            background_gain_db,
+            sample_rate,
+            peak_limit_dbfs,
+            suppress_background_speech=False,
+        )
+    if background_path and background_path.exists() and not _path_matches_streaming_rate(background_path, sample_rate):
+        return _mix_with_background_in_memory(
+            dialogue_path,
+            output_path,
+            background_path,
+            background_gain_db,
+            sample_rate,
+            peak_limit_dbfs,
+            suppress_background_speech=False,
+        )
+
+    temp_path = _temp_wav_path(output_path, "mix.tmp")
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    background_gain = db_to_gain(background_gain_db)
+    try:
+        with sf.SoundFile(str(dialogue_path)) as dialogue:
+            background = (
+                sf.SoundFile(str(background_path))
+                if background_path and background_path.exists()
+                else None
+            )
+            try:
+                with sf.SoundFile(
+                    str(temp_path),
+                    mode="w",
+                    samplerate=sample_rate,
+                    channels=2,
+                    format="WAV",
+                    subtype="FLOAT",
+                ) as target:
+                    while True:
+                        dialogue_block = dialogue.read(
+                            STREAM_BLOCK_FRAMES,
+                            always_2d=True,
+                            dtype="float32",
+                        )
+                        if len(dialogue_block) == 0:
+                            break
+                        mixed = ensure_stereo(dialogue_block).astype(np.float32, copy=True)
+                        if background is not None:
+                            background_block = background.read(
+                                len(mixed),
+                                always_2d=True,
+                                dtype="float32",
+                            )
+                            background_stereo = ensure_stereo(background_block)
+                            if len(background_stereo) < len(mixed):
+                                padded = np.zeros_like(mixed)
+                                padded[: len(background_stereo)] = background_stereo
+                                background_stereo = padded
+                            mixed += background_stereo[: len(mixed)] * background_gain
+                        target.write(mixed)
+            finally:
+                if background is not None:
+                    background.close()
+        _finalize_streamed_audio(temp_path, output_path, peak_limit_dbfs)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return output_path
+
+
+def mix_with_background(
+    dialogue_path: Path,
+    output_path: Path,
+    background_path: Path | None = None,
+    background_gain_db: float = -18.0,
+    sample_rate: int = 48_000,
+    peak_limit_dbfs: float | None = -1.0,
+    suppress_background_speech: bool = True,
+) -> Path:
+    if suppress_background_speech and background_path and background_path.exists():
+        suppressed_background = _temp_wav_path(output_path, "background.tmp")
+        try:
+            background = reduce_center_speech_bleed(_load_for_mix(background_path, sample_rate), sample_rate)
+            write_audio(suppressed_background, background, sample_rate)
+            return _mix_with_background_streaming(
+                dialogue_path,
+                output_path,
+                suppressed_background,
+                background_gain_db,
+                sample_rate,
+                peak_limit_dbfs,
+            )
+        finally:
+            suppressed_background.unlink(missing_ok=True)
+    return _mix_with_background_streaming(
+        dialogue_path,
+        output_path,
+        background_path,
+        background_gain_db,
+        sample_rate,
+        peak_limit_dbfs,
+    )

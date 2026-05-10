@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging as py_logging
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -11,13 +12,27 @@ from typing import Any
 
 import httpx
 
+from asmr_dub_pipeline.gemma.json_repair import JSONRepairError
+from asmr_dub_pipeline.gemma.parser import parse_gemma_task_response
+from asmr_dub_pipeline.gemma.prompts import audio_style_prompt, json_repair_prompt
 from asmr_dub_pipeline.schemas import KoreanTranslation, Segment
+from asmr_dub_pipeline.script.duration_rewrite import (
+    korean_tts_speech_char_count,
+    korean_tts_timing_budget,
+)
 
 
 class GemmaTextTranslationError(RuntimeError):
     pass
 
 
+class GemmaTextContextTruncationError(GemmaTextTranslationError):
+    def __init__(self, message: str, raw_response: str = "") -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
+
+
+LOGGER = py_logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", flags=re.IGNORECASE | re.DOTALL)
 _KANA_RE = re.compile(r"[\u3040-\u30ffー]")
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -28,10 +43,79 @@ _NON_SPEECH_SOURCE_RE = re.compile(r"^[\d\s,.;:!?！？、。・ー~〜…]+$")
 _NUMERIC_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 _UNSAFE_TTS_SYMBOL_RE = re.compile(r"[—–―“”‘’「」『』]")
 _ASR_REVIEW_COMPARE_DROP_RE = re.compile(r"[\s,.;:!?！？、。・ー~〜…'\"“”‘’「」『』（）()]+")
+_CONTEXT_TRUNCATION_RE = re.compile(
+    r"(?:context (?:length|window|overflow|size)|"
+    r"n_ctx|too many tokens|prompt .*too long|"
+    r"exceed(?:ed|s|ing)? .*context|"
+    r"finish_reason[=:\\s]+length|"
+    r"max_tokens|truncat)",
+    flags=re.IGNORECASE,
+)
 
 
 def _strip_fence(text: str) -> str:
     return _FENCE_RE.sub(lambda match: match.group(1), text.strip()).strip()
+
+
+def _looks_like_context_or_truncation_error(error: object) -> bool:
+    return isinstance(error, GemmaTextContextTruncationError) or bool(
+        _CONTEXT_TRUNCATION_RE.search(str(error))
+    )
+
+
+def _raise_for_context_or_truncation_error(message: str) -> None:
+    if _CONTEXT_TRUNCATION_RE.search(message):
+        raise GemmaTextContextTruncationError(message)
+    raise GemmaTextTranslationError(message)
+
+
+def _chat_completion_content(data: Mapping[str, Any], *, n_predict: int) -> str:
+    content: str | None = None
+    finish_reason = ""
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, Mapping):
+            finish_reason = str(first.get("finish_reason") or "").strip().lower()
+            message = first.get("message")
+            if isinstance(message, Mapping) and isinstance(message.get("content"), str):
+                content = message["content"]
+            elif isinstance(first.get("text"), str):
+                content = first["text"]
+    if content is None and isinstance(data.get("content"), str):
+        content = data["content"]
+    if content is None:
+        raise GemmaTextTranslationError("Gemma text server response did not include content.")
+    if finish_reason == "length":
+        raise GemmaTextContextTruncationError(
+            "Gemma text server response was truncated: "
+            f"finish_reason=length max_tokens={n_predict}",
+            raw_response=content,
+        )
+    return content
+
+
+def _log_context_truncation_retry(
+    error: Exception,
+    *,
+    batch_id: str,
+    attempt: int,
+    retries: int,
+    output_field: str,
+    segments: Sequence[Segment],
+) -> None:
+    if not _looks_like_context_or_truncation_error(error):
+        return
+    LOGGER.warning(
+        "Gemma text translation retry after possible context overflow/truncation: "
+        "batch_id=%s attempt=%d/%d output_field=%s segment_ids=%s reason=%s",
+        batch_id,
+        attempt + 1,
+        retries + 1,
+        output_field,
+        ",".join(segment.id for segment in segments),
+        str(error),
+    )
 
 
 def _normalize_asr_review_compare_text(text: str) -> str:
@@ -229,8 +313,24 @@ def _segment_prompt_item(segment: Segment) -> dict[str, Any]:
         "start": segment.start,
         "end": segment.end,
         "duration": segment.duration,
+        "korean_tts_timing": korean_tts_timing_budget(
+            segment.duration,
+            segment.source_script.text if segment.source_script else None,
+        ),
         "source_language": segment.source_script.language if segment.source_script else "ja",
         "source_text": segment.source_script.text if segment.source_script else "",
+    }
+
+
+def _context_prompt_item(segment: Segment, *, is_target: bool) -> dict[str, Any]:
+    return {
+        "segment_id": segment.id,
+        "start": segment.start,
+        "end": segment.end,
+        "duration": segment.duration,
+        "source_language": segment.source_script.language if segment.source_script else "ja",
+        "source_text": segment.source_script.text if segment.source_script else "",
+        "is_target": is_target,
     }
 
 
@@ -254,10 +354,7 @@ def _translation_prompt_payload(
     if context_segments:
         target_ids = {segment.id for segment in segments}
         payload["context"] = [
-            {
-                **_segment_prompt_item(segment),
-                "is_target": segment.id in target_ids,
-            }
+            _context_prompt_item(segment, is_target=segment.id in target_ids)
             for segment in context_segments
             if segment.source_script and segment.source_script.text.strip()
         ]
@@ -315,6 +412,14 @@ def _translation_quality_error_map(
                 errors.setdefault(segment.id, []).append(
                     f"{segment.id}: {field} contains TTS-unsafe punctuation"
                 )
+            timing_budget = korean_tts_timing_budget(segment.duration, source)
+            speech_chars = korean_tts_speech_char_count(natural)
+            max_speech_chars = int(timing_budget["max_speech_chars"])
+            if speech_chars > max_speech_chars:
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: {field} exceeds Korean TTS max speech chars "
+                    f"{speech_chars}>{max_speech_chars} for {segment.duration:.3f}s"
+                )
         if (
             (field == "ko_natural" and is_numeric_source)
             or not _NON_SPEECH_SOURCE_RE.fullmatch(source)
@@ -322,7 +427,13 @@ def _translation_quality_error_map(
             errors.setdefault(segment.id, []).append(
                 f"{segment.id}: {field} has no Hangul for Japanese source text"
             )
-        if len(source) >= 30 and len(natural) / max(len(source), 1) < 0.25:
+        natural_fits_timing = False
+        if field == "ko_natural":
+            natural_fits_timing = (
+                korean_tts_speech_char_count(natural)
+                <= int(korean_tts_timing_budget(segment.duration, source)["max_speech_chars"])
+            )
+        if len(source) >= 30 and len(natural) / max(len(source), 1) < 0.25 and not natural_fits_timing:
             errors.setdefault(segment.id, []).append(
                 f"{segment.id}: {field} is too short for the source text"
             )
@@ -337,7 +448,9 @@ def build_translate_ko_prompt(
     payload = _translation_prompt_payload(segments, batch_id, context_segments)
     return (
         "Return exactly one valid JSON array and no markdown. Translate Japanese ASMR source "
-        "text into Korean. Keep tone gentle, natural, and conversational in polite spoken "
+        "text into Korean. Translate as literally as possible while preserving Korean grammar: "
+        "keep source wording, clause order, repetitions, and implied terms unless minimal "
+        "adjustment is required for Korean or TTS timing. Keep tone gentle, natural, and conversational in polite spoken "
         "Korean suitable for ASMR TTS. Each array item must contain only "
         "segment_id and ko_natural. ko_natural must be Korean Hangul prose; do not leave "
         "Japanese kana or untranslated Japanese particles in ko_natural. Do not include "
@@ -350,9 +463,12 @@ def build_translate_ko_prompt(
         "or digit-heavy source segments, infer the intended reading from target_span and context: "
         "natural counting may use 하나, 둘, 셋; digit/code/phone-like reading may use 일, 이, "
         "삼 or 공; quantities, years, ordinals, time, and measurements should use the idiomatic "
-        "Korean form for that context. Never leave raw digits. Translate the full source text "
-        "without summarizing or dropping clauses. Preserve ASMR domain terms: translate 媚薬 as "
-        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
+        "Korean form for that context. Never leave raw digits. Fit ko_natural within each "
+        "segment's korean_tts_timing.max_speech_chars whenever possible. When the source has "
+        "too much information for the duration, semantically compress into concise natural "
+        "Korean instead of copying every clause or relying on punctuation truncation; preserve "
+        "the key intent, speaker attitude, domain terms, and ASMR tone. Preserve ASMR domain terms: translate 媚薬 as "
+        "미약, 최음제 never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -365,7 +481,9 @@ def build_literal_translate_prompt(
     payload = _translation_prompt_payload(segments, batch_id, context_segments)
     return (
         "Return exactly one valid JSON array and no markdown. First pass: translate the "
-        "Japanese ASMR source text into faithful Korean literal meaning. Each array item "
+        "Japanese ASMR source text into faithful Korean literal meaning. Translate as literally "
+        "as possible: keep source wording, clause order, repetitions, and implied terms; avoid "
+        "summarizing, embellishing, euphemizing, or paraphrasing beyond what Korean grammar requires. Each array item "
         "must contain only segment_id and ko_literal. ko_literal must be Korean Hangul prose; "
         "do not leave Japanese kana or untranslated Japanese particles. Do not polish into "
         "final TTS copy yet. Translate only the items in segments; use context only to resolve "
@@ -373,7 +491,7 @@ def build_literal_translate_prompt(
         "first for adjacent-segment context, but keep exactly one output item per input "
         "segment_id; do not merge, split, omit, duplicate, or move content between segment_ids. "
         "Preserve all clauses without summary. Preserve ASMR domain terms: translate 媚薬 as "
-        "미약, 최음제, or 흥분제, never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
+        "미약, 최음제 never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -398,9 +516,13 @@ def build_naturalize_ko_prompt(
         "Return exactly one valid JSON array and no markdown. Second pass: rewrite the "
         "literal Korean translations into natural Korean ASMR TTS dialogue. Each array item "
         "must contain only segment_id and ko_natural. ko_natural must be gentle, polite, "
-        "spoken Korean that can be read aloud naturally; split stiff written phrasing into "
-        "short breath-friendly wording when useful. Keep the meaning of ko_literal and the "
-        "source text; do not add new events, omit clauses, or leave Japanese kana. Spell "
+        "spoken Korean that can be read aloud naturally while staying as literal to "
+        "ko_literal/source_text as spoken Korean allows; split stiff written phrasing into "
+        "short breath-friendly wording when useful. Fit ko_natural within each segment's "
+        "korean_tts_timing.max_speech_chars whenever possible. If ko_literal is too dense "
+        "for the segment duration, semantically compress it into a shorter natural Korean "
+        "line while preserving the key meaning, speaker attitude, domain terms, and ASMR tone. "
+        "Do not add new events, drop the core intent, or leave Japanese kana. Spell "
         "numbers and acronyms in Hangul for TTS. For numeric-only or digit-heavy source segments, "
         "infer the intended reading from target_span and context: natural counting may use 하나, "
         "둘, 셋; digit/code/phone-like reading may use 일, 이, 삼 or 공; quantities, years, "
@@ -409,8 +531,52 @@ def build_naturalize_ko_prompt(
         "target_span.combined_source_text and context "
         "only for continuity of names, pronouns, register, and tone. Keep exactly one output item "
         "per input segment_id; do not merge, split, omit, duplicate, or move content between "
-        "segment_ids. Preserve ASMR domain terms: translate 媚薬 as 미약, 최음제, or 흥분제, "
+        "segment_ids. Preserve ASMR domain terms: translate 媚薬 as 미약, 최음제 "
         "never 변비약; translate 18禁催眠音声 as adult/십팔금 \n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_duration_rewrite_ko_prompt(
+    segment: Segment,
+    *,
+    batch_id: str,
+    current_text: str,
+    reason: str,
+    actual_duration_sec: float,
+    target_duration_sec: float,
+    target_speech_chars: int,
+    min_speech_chars: int,
+    max_speech_chars: int,
+    context_segments: Sequence[Segment] | None = None,
+) -> str:
+    payload = _translation_prompt_payload([segment], batch_id, context_segments)
+    payload["duration_rewrite"] = {
+        "reason": reason,
+        "current_ko_tts_text": current_text,
+        "current_speech_chars": korean_tts_speech_char_count(current_text),
+        "actual_tts_duration_sec": round(actual_duration_sec, 3),
+        "target_duration_sec": round(target_duration_sec, 3),
+        "target_speech_chars": target_speech_chars,
+        "acceptable_speech_chars": {
+            "min": min_speech_chars,
+            "max": max_speech_chars,
+        },
+    }
+    return (
+        "Return exactly one valid JSON array and no markdown. Rewrite the Korean ASMR TTS "
+        "line for the single target segment. Each array item must contain only segment_id "
+        "and ko_natural. Preserve the Japanese source meaning, speaker attitude, domain "
+        "terms, and ASMR tone. Do not add reassurance phrases, filler, generic padding, "
+        "new events, or unrelated words. For reason='too_short', add wording only when it "
+        "restores source meaning that the current Korean line compressed or omitted; if no "
+        "source meaning is missing, return a clearer equivalent of the current line instead "
+        "of padding. For reason='too_long', semantically compress while keeping the core "
+        "intent. Aim for duration_rewrite.target_speech_chars Korean speech characters and "
+        "stay inside duration_rewrite.acceptable_speech_chars. Count Hangul letters and "
+        "numbers only; ignore spaces and punctuation. Spell numbers and acronyms in Hangul "
+        "for TTS. Do not leave Japanese kana, untranslated CJK, raw Latin letters, raw "
+        "digits, quotes, or dashes. Keep exactly one output item for the input segment_id. "
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -434,12 +600,15 @@ def build_repair_prompt(
         f"only segment_id and {output_field}. {output_field} must be Korean Hangul prose in polite "
         "spoken conversational style with no Japanese kana, untranslated CJK, raw Latin letters, "
         "raw digits, or long dash/quote punctuation. Spell acronyms and numbers in Hangul. "
+        "When repairing ko_natural, obey each segment's korean_tts_timing.max_speech_chars; "
+        "if the source is too dense, semantically compress the line while preserving the key "
+        "intent and ASMR tone. "
         "For numeric-only or digit-heavy source segments, infer the intended reading from the "
         "original input context, choosing natural counting, digit/code reading, quantity, year, "
-        "ordinal, time, or measurement wording as appropriate. Translate the full source "
-        "text without summarizing. Preserve the input segment_id boundaries exactly; do not merge, "
+        "ordinal, time, or measurement wording as appropriate. Preserve the input segment_id "
+        "boundaries exactly; do not merge, "
         "split, omit, duplicate, or move content between segment_ids. Reject domain mistranslations: "
-        "媚薬 must not become 변비약, and 18禁 must not become content for minors. "
+        "媚薬 must not become 변비약. "
         f"Batch id: {batch_id}. Validation error: {error}{input_text}\nPrevious response:\n"
         f"{bad_response[:6000]}"
     )
@@ -598,22 +767,10 @@ class LlamaServerTranslationClient:
         }
         response = self.client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         if response.status_code >= 400:
-            raise GemmaTextTranslationError(
+            _raise_for_context_or_truncation_error(
                 f"Gemma text server error {response.status_code}: {response.text[:500]}"
             )
-        data = response.json()
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, Mapping):
-                message = first.get("message")
-                if isinstance(message, Mapping) and isinstance(message.get("content"), str):
-                    return message["content"]
-                if isinstance(first.get("text"), str):
-                    return first["text"]
-        if isinstance(data.get("content"), str):
-            return data["content"]
-        raise GemmaTextTranslationError("Gemma text server response did not include content.")
+        return _chat_completion_content(response.json(), n_predict=n_predict or self.n_predict)
 
     def _complete_with_input_audio(
         self,
@@ -650,22 +807,10 @@ class LlamaServerTranslationClient:
         }
         response = self.client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         if response.status_code >= 400:
-            raise GemmaTextTranslationError(
+            _raise_for_context_or_truncation_error(
                 f"Gemma text server error {response.status_code}: {response.text[:500]}"
             )
-        data = response.json()
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, Mapping):
-                message = first.get("message")
-                if isinstance(message, Mapping) and isinstance(message.get("content"), str):
-                    return message["content"]
-                if isinstance(first.get("text"), str):
-                    return first["text"]
-        if isinstance(data.get("content"), str):
-            return data["content"]
-        raise GemmaTextTranslationError("Gemma text server response did not include content.")
+        return _chat_completion_content(response.json(), n_predict=n_predict or self.n_predict)
 
     def _translate_once(
         self,
@@ -734,8 +879,18 @@ class LlamaServerTranslationClient:
                     continue
                 break
             except (ValueError, GemmaTextTranslationError) as exc:
+                if isinstance(exc, GemmaTextContextTruncationError) and exc.raw_response:
+                    raw_response = exc.raw_response
                 last_error = exc
                 if attempt < self.retries:
+                    _log_context_truncation_retry(
+                        exc,
+                        batch_id=batch_id,
+                        attempt=attempt,
+                        retries=self.retries,
+                        output_field=output_field,
+                        segments=segments,
+                    )
                     continue
                 break
         raise GemmaTextTranslationError(f"Gemma text translation failed: {last_error}")
@@ -803,6 +958,41 @@ class LlamaServerTranslationClient:
             return self._translate_batch_single_pass(segments, batch_id, context_segments)
         return self._translate_batch_two_pass(segments, batch_id, context_segments)
 
+    def rewrite_tts_for_duration(
+        self,
+        *,
+        segment: Segment,
+        batch_id: str,
+        current_text: str,
+        reason: str,
+        actual_duration_sec: float,
+        target_duration_sec: float,
+        target_speech_chars: int,
+        min_speech_chars: int,
+        max_speech_chars: int,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> KoreanTranslation | None:
+        translations = self._translate_once(
+            segments=[segment],
+            batch_id=batch_id,
+            prompt=build_duration_rewrite_ko_prompt(
+                segment,
+                batch_id=batch_id,
+                current_text=current_text,
+                reason=reason,
+                actual_duration_sec=actual_duration_sec,
+                target_duration_sec=target_duration_sec,
+                target_speech_chars=target_speech_chars,
+                min_speech_chars=min_speech_chars,
+                max_speech_chars=max_speech_chars,
+                context_segments=context_segments,
+            ),
+            parser=parse_translation_response,
+            output_field="ko_natural",
+            context_segments=context_segments,
+        )
+        return translations.get(segment.id)
+
     def review_asr_candidates_with_audio(
         self,
         items: Sequence[Mapping[str, Any]],
@@ -862,6 +1052,37 @@ class LlamaServerTranslationClient:
                 break
         raise GemmaTextTranslationError(f"Gemma ASR audio review failed: {last_error}")
 
+    def analyze_audio_style(self, audio_path: str | Path, segment: Segment) -> dict[str, Any]:
+        prompt = audio_style_prompt(segment)
+        raw_response = ""
+        last_error: Exception | None = None
+        n_predict = min(self.n_predict, 384)
+        for attempt in range(self.retries + 1):
+            try:
+                if not raw_response:
+                    raw_response = self._complete_with_input_audio(
+                        prompt,
+                        audio_path,
+                        n_predict=n_predict,
+                    )
+                else:
+                    raw_response = self._complete(
+                        json_repair_prompt("audio_style", raw_response, str(last_error)),
+                        n_predict=n_predict,
+                    )
+                return parse_gemma_task_response("audio_style", raw_response)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                break
+            except (ValueError, JSONRepairError, GemmaTextTranslationError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    continue
+                break
+        raise GemmaTextTranslationError(f"Gemma audio style analysis failed: {last_error}")
 
 class MockTranslationClient:
     def __init__(self, model: str = "mock") -> None:
@@ -884,6 +1105,39 @@ class MockTranslationClient:
                 batch_id=batch_id,
             )
         return result
+
+    def rewrite_tts_for_duration(
+        self,
+        *,
+        segment: Segment,
+        batch_id: str,
+        current_text: str,
+        reason: str,
+        actual_duration_sec: float,
+        target_duration_sec: float,
+        target_speech_chars: int,
+        min_speech_chars: int,
+        max_speech_chars: int,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> KoreanTranslation | None:
+        _ = (
+            segment,
+            reason,
+            actual_duration_sec,
+            target_duration_sec,
+            target_speech_chars,
+            min_speech_chars,
+            max_speech_chars,
+            context_segments,
+        )
+        return KoreanTranslation(
+            ko_literal=current_text,
+            ko_natural=current_text,
+            notes=["mock_duration_rewrite_noop"],
+            confidence=0.99,
+            model=self.model,
+            batch_id=batch_id,
+        )
 
     def review_asr_candidates_for_mock(
         self,

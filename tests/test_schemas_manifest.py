@@ -59,15 +59,19 @@ def test_project_config_requires_rvc_by_default() -> None:
     assert cfg.rvc_train_required is True
     assert cfg.rvc_train_backend == "command"
     assert cfg.rvc_train_timeout_sec == 14400.0
+    assert cfg.rvc_train_sample_rate == 48_000
     assert cfg.rvc_train_epochs == 20
     assert cfg.rvc_train_batch_size == 0
+    assert cfg.rvc_train_min_clean_sec == 600.0
+    assert cfg.rvc_train_augment_enabled is False
+    assert cfg.rvc_train_augment_min_real_sec == 300.0
     assert cfg.rvc_train_preprocess_processes == 0
     assert cfg.rvc_train_f0_workers == 0
     assert cfg.rvc_train_feature_workers == 0
-    assert cfg.rvc_train_save_every_epoch == 50
+    assert cfg.rvc_train_save_every_epoch == 5
     assert cfg.rvc_train_reuse_intermediate_cache is True
     assert cfg.rvc_concurrency == 1
-    assert cfg.source_separation_backend == "demucs"
+    assert cfg.source_separation_backend == "auto"
     assert cfg.source_separation_model == "htdemucs"
     assert cfg.qwen_tts_candidate_batch_size == 4
     assert cfg.qwen_tts_max_new_tokens == 2048

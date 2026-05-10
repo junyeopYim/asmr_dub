@@ -293,16 +293,9 @@ def _gpu_total_memory_mib(device: str) -> int | None:
 def _auto_rvc_train_batch_size(device: str) -> int:
     total_mib = _gpu_total_memory_mib(device)
     if total_mib is None:
-        return 4
-    if total_mib >= 24_000:
-        return 32
-    if total_mib >= 16_000:
-        return 22
-    if total_mib >= 12_000:
-        return 14
-    if total_mib >= 8_000:
-        return 8
-    return 2
+        return 1
+    total_gib = int(total_mib / 1024 + 0.4)
+    return max(1, total_gib // 2)
 
 
 def effective_rvc_train_batch_size(cfg: ProjectConfig) -> int:

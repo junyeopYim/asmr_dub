@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import random
+import re
 import shlex
 import shutil
 import subprocess
@@ -28,6 +31,7 @@ from asmr_dub_pipeline.rights import (
     sha256_file,
 )
 from asmr_dub_pipeline.schemas import PipelineManifest, ProjectConfig, Segment
+from asmr_dub_pipeline.script.duration_rewrite import japanese_pronunciation_count
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 FEW_SHOT_PROGRESS_LOG_SECONDS = 10.0
@@ -60,11 +64,40 @@ GSV_TRAINING_REQUIRED_MODULES = (
     "x_transformers",
 )
 GSV_TRAINING_REQUIRED_MODULE_ATTRS = {"ffmpeg": "input"}
+SKIP_TRAINING_STATUSES = {"needs_manual_review", "no_speech_detected", "non_speech_texture"}
+DEFAULT_FEW_SHOT_MIN_TOTAL_SEC = 60.0
+FEW_SHOT_TIMING_DEFICIT_BONUS = 0.45
+FEW_SHOT_TIMING_OVERREPRESENTED_PENALTY = 0.50
+FEW_SHOT_TIMING_BUCKET_TARGET_SHARES = {
+    "very_fast": 0.05,
+    "fast": 0.15,
+    "normal_fast": 0.30,
+    "normal": 0.25,
+    "slow": 0.18,
+    "very_slow": 0.07,
+    "extra_slow": 0.0,
+    "unknown": 0.0,
+}
+FEW_SHOT_TARGET_PACING_WEIGHT = 0.45
+FEW_SHOT_TARGET_PACING_FACTOR_WINDOW = 2.0
+FEW_SHOT_CLEAN_SOURCE_REJECT_PREFIXES = (
+    "background_bleed_db_above_max",
+    "side_to_mid_db_above_max",
+)
+_KOREAN_SYLLABLE_RE = re.compile(r"[가-힣]")
+
+
+def few_shot_min_total_sec(cfg: ProjectConfig) -> float:
+    configured = getattr(cfg, "gsv_few_shot_min_total_sec", None)
+    if configured is not None:
+        return float(configured)
+    return DEFAULT_FEW_SHOT_MIN_TOTAL_SEC
 
 
 @dataclass(frozen=True)
 class FewShotTrainingItem:
     segment_id: str
+    speaker_id: str
     source_audio_path: Path
     training_filename: str
     text: str
@@ -72,6 +105,15 @@ class FewShotTrainingItem:
     duration_sec: float
     quality_score: float = 0.0
     quality_issues: tuple[str, ...] = ()
+    source_chars_per_sec: float = 0.0
+    source_pronunciation_count: int = 0
+    source_sec_per_pronunciation: float | None = None
+    timing_bucket: str = "unknown"
+    target_sec_per_syllable: float | None = None
+    target_pacing_ratio: float | None = None
+    target_pacing_score: float | None = None
+    training_selection_score: float = 0.0
+    selection_penalties: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +128,17 @@ class FewShotDataset:
 class FewShotTrainingSelection:
     items: list[FewShotTrainingItem]
     diagnostics: list[dict[str, Any]]
+    candidate_speaker_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _PacingSelectionState:
+    items: tuple[FewShotTrainingItem, ...]
+    total_duration_sec: float = 0.0
+    speed_weighted_sum: float = 0.0
+    speed_sq_weighted_sum: float = 0.0
+    quality_weighted_sum: float = 0.0
+    score_weighted_sum: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -414,19 +467,49 @@ def select_training_items(
     project_dir: Path,
     manifest: PipelineManifest,
     cfg: ProjectConfig,
+    *,
+    speaker_id: str | None = None,
 ) -> list[FewShotTrainingItem]:
-    return _select_training_items_with_diagnostics(project_dir, manifest, cfg).items
+    return _select_training_items_with_diagnostics(
+        project_dir,
+        manifest,
+        cfg,
+        speaker_id=speaker_id,
+    ).items
+
+
+def select_training_speaker_ids(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+) -> list[str]:
+    return list(
+        _select_training_items_with_diagnostics(
+            project_dir,
+            manifest,
+            cfg,
+            enforce_single_speaker=False,
+        ).candidate_speaker_ids
+    )
 
 
 def _select_training_items_with_diagnostics(
     project_dir: Path,
     manifest: PipelineManifest,
     cfg: ProjectConfig,
+    *,
+    speaker_id: str | None = None,
+    enforce_single_speaker: bool = True,
 ) -> FewShotTrainingSelection:
     candidates: list[FewShotTrainingItem] = []
     diagnostics: list[dict[str, Any]] = []
     source_language = _canonical_language(cfg.source_language)
+    target_sec_per_syllable = _target_korean_sec_per_syllable(manifest, cfg)
     for segment in sorted(manifest.segments, key=lambda item: (item.start, item.id)):
+        if segment.status in SKIP_TRAINING_STATUSES:
+            continue
+        if speaker_id is not None and segment.speaker_id != speaker_id:
+            continue
         check = evaluate_voice_training_candidate(
             project_dir,
             segment,
@@ -436,28 +519,78 @@ def _select_training_items_with_diagnostics(
             require_speaker_id=True,
             source_language=source_language,
         )
+        text = segment.source_script.text.strip() if segment.source_script else ""
+        source_chars_per_sec = _source_chars_per_sec(text, segment.duration)
+        source_pronunciation_count = japanese_pronunciation_count(text)
+        source_sec_per_pronunciation = _source_sec_per_pronunciation(
+            source_pronunciation_count,
+            segment.duration,
+        )
+        timing_bucket = _few_shot_timing_bucket(source_sec_per_pronunciation)
+        target_pacing_ratio, target_pacing_score = _target_pacing_metrics(
+            source_sec_per_pronunciation,
+            target_sec_per_syllable,
+        )
+        training_selection_score, selection_penalties = _training_selection_score(
+            check.metrics.score if check.metrics else None,
+            source_chars_per_sec,
+            text,
+            cfg,
+            target_pacing_score=target_pacing_score,
+        )
         reject_reasons = [
             *check.reject_reasons,
             *_few_shot_duration_reject_reasons(segment, cfg),
+            *_few_shot_text_reject_reasons(source_chars_per_sec, cfg),
         ]
-        if reject_reasons or not check.source_audio_path or not check.metrics:
+        soft_reject_reasons = _few_shot_soft_reject_reasons(
+            reject_reasons,
+            cfg,
+            target_sec_per_syllable,
+        )
+        hard_reject_reasons = [
+            reason for reason in reject_reasons if reason not in soft_reject_reasons
+        ]
+        if hard_reject_reasons or not check.source_audio_path or not check.metrics:
             diagnostics.append(
                 _few_shot_diagnostic_row(
                     segment,
                     check,
                     cfg,
                     selected=False,
-                    reject_reasons=reject_reasons or ("missing_source_audio",),
+                    reject_reasons=hard_reject_reasons or ("missing_source_audio",),
+                    source_chars_per_sec=source_chars_per_sec,
+                    source_pronunciation_count=source_pronunciation_count,
+                    source_sec_per_pronunciation=source_sec_per_pronunciation,
+                    timing_bucket=timing_bucket,
+                    target_sec_per_syllable=target_sec_per_syllable,
+                    target_pacing_ratio=target_pacing_ratio,
+                    target_pacing_score=target_pacing_score,
+                    training_selection_score=training_selection_score,
+                    selection_penalties=selection_penalties,
                 )
             )
             continue
         source_audio_path = check.source_audio_path
-        text = segment.source_script.text.strip() if segment.source_script else ""
         language = segment.source_script.language if segment.source_script else cfg.asr_language
         training_filename = f"{segment.id}.wav"
+        if soft_reject_reasons:
+            relaxed_penalty = float(getattr(cfg, "gsv_few_shot_relaxed_clean_source_penalty", 0.15))
+            training_selection_score = max(
+                0.0,
+                float(training_selection_score or 0.0) - relaxed_penalty,
+            )
+            selection_penalties = (
+                *selection_penalties,
+                *(
+                    f"relaxed_clean_source_filter:{reason}"
+                    for reason in soft_reject_reasons
+                ),
+            )
         candidates.append(
             FewShotTrainingItem(
                 segment_id=segment.id,
+                speaker_id=segment.speaker_id or "",
                 source_audio_path=source_audio_path,
                 training_filename=training_filename,
                 text=text,
@@ -465,6 +598,15 @@ def _select_training_items_with_diagnostics(
                 duration_sec=segment.duration,
                 quality_score=check.metrics.score,
                 quality_issues=tuple(check.metrics.issues),
+                source_chars_per_sec=source_chars_per_sec,
+                source_pronunciation_count=source_pronunciation_count,
+                source_sec_per_pronunciation=source_sec_per_pronunciation,
+                timing_bucket=timing_bucket,
+                target_sec_per_syllable=target_sec_per_syllable,
+                target_pacing_ratio=target_pacing_ratio,
+                target_pacing_score=target_pacing_score,
+                training_selection_score=training_selection_score,
+                selection_penalties=selection_penalties,
             )
         )
         diagnostics.append(
@@ -474,27 +616,82 @@ def _select_training_items_with_diagnostics(
                 cfg,
                 selected=False,
                 reject_reasons=("not_selected_target_reached",),
+                source_chars_per_sec=source_chars_per_sec,
+                source_pronunciation_count=source_pronunciation_count,
+                source_sec_per_pronunciation=source_sec_per_pronunciation,
+                timing_bucket=timing_bucket,
+                target_sec_per_syllable=target_sec_per_syllable,
+                target_pacing_ratio=target_pacing_ratio,
+                target_pacing_score=target_pacing_score,
+                training_selection_score=training_selection_score,
+                selection_penalties=selection_penalties,
             )
         )
     items: list[FewShotTrainingItem] = []
-    total = 0.0
-    for item in sorted(candidates, key=lambda candidate: (-candidate.quality_score, candidate.duration_sec)):
-        items.append(item)
-        total += item.duration_sec
-        if total >= cfg.gsv_few_shot_target_sec:
-            break
-    if total < cfg.gsv_few_shot_target_sec:
+    candidates, duplicate_reasons = _dedupe_training_items(candidates)
+    items = _select_training_items_for_pacing(candidates, cfg)
+    total = sum(item.duration_sec for item in items)
+    min_total_sec = few_shot_min_total_sec(cfg)
+    candidate_speaker_ids = tuple(sorted({item.speaker_id for item in candidates if item.speaker_id}))
+    if total < min_total_sec:
         raise GPTSoVITSError(
             "Not enough source voice data for GPT-SoVITS few-shot training after clean-source filtering: "
-            f"selected {total:.2f}s, need {cfg.gsv_few_shot_target_sec:.2f}s."
+            f"selected {total:.2f}s, need at least {min_total_sec:.2f}s."
         )
+    if enforce_single_speaker:
+        _ensure_single_few_shot_speaker(items)
     selected_ids = {item.segment_id for item in items}
     normalized_diagnostics: list[dict[str, Any]] = []
     for row in diagnostics:
         if row["segment_id"] in selected_ids:
             row = {**row, "selected_for_training": True, "reject_reasons": []}
+        elif row["segment_id"] in duplicate_reasons:
+            row = {
+                **row,
+                "selected_for_training": False,
+                "reject_reasons": [duplicate_reasons[row["segment_id"]]],
+            }
         normalized_diagnostics.append(row)
-    return FewShotTrainingSelection(items=items, diagnostics=normalized_diagnostics)
+    return FewShotTrainingSelection(
+        items=items,
+        diagnostics=normalized_diagnostics,
+        candidate_speaker_ids=candidate_speaker_ids,
+    )
+
+
+def _dedupe_training_items(
+    candidates: Sequence[FewShotTrainingItem],
+) -> tuple[list[FewShotTrainingItem], dict[str, str]]:
+    kept_by_source: dict[Path, FewShotTrainingItem] = {}
+    duplicate_reasons: dict[str, str] = {}
+    for item in sorted(candidates, key=lambda candidate: (-candidate.quality_score, candidate.duration_sec, candidate.segment_id)):
+        source_key = item.source_audio_path.resolve()
+        kept = kept_by_source.get(source_key)
+        if kept is None:
+            kept_by_source[source_key] = item
+            continue
+        duplicate_reasons[item.segment_id] = f"duplicate_source_audio:{kept.segment_id}"
+    kept_ids = {item.segment_id for item in kept_by_source.values()}
+    return [item for item in candidates if item.segment_id in kept_ids], duplicate_reasons
+
+
+def _few_shot_soft_reject_reasons(
+    reject_reasons: Sequence[str],
+    cfg: ProjectConfig,
+    target_sec_per_syllable: float | None,
+) -> tuple[str, ...]:
+    if not getattr(cfg, "gsv_few_shot_relax_clean_source_for_pacing", True):
+        return ()
+    if target_sec_per_syllable is None:
+        return ()
+    soft_reasons = [
+        reason
+        for reason in reject_reasons
+        if reason.startswith(FEW_SHOT_CLEAN_SOURCE_REJECT_PREFIXES)
+    ]
+    if len(soft_reasons) != len(reject_reasons):
+        return ()
+    return tuple(soft_reasons)
 
 
 def _few_shot_duration_reject_reasons(segment: Segment, cfg: ProjectConfig) -> tuple[str, ...]:
@@ -506,6 +703,812 @@ def _few_shot_duration_reject_reasons(segment: Segment, cfg: ProjectConfig) -> t
     return tuple(reasons)
 
 
+def _source_chars_per_sec(text: str, duration_sec: float) -> float:
+    if duration_sec <= 0:
+        return 0.0
+    normalized = "".join(text.split())
+    return len(normalized) / duration_sec
+
+
+def _source_sec_per_pronunciation(
+    source_pronunciation_count: int,
+    duration_sec: float,
+) -> float | None:
+    if duration_sec <= 0 or source_pronunciation_count <= 0:
+        return None
+    return duration_sec / float(source_pronunciation_count)
+
+
+def _korean_syllable_count(text: str) -> int:
+    return len(_KOREAN_SYLLABLE_RE.findall(text or ""))
+
+
+def _median(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    ranked = sorted(values)
+    midpoint = len(ranked) // 2
+    if len(ranked) % 2:
+        return ranked[midpoint]
+    return (ranked[midpoint - 1] + ranked[midpoint]) / 2.0
+
+
+def _target_korean_sec_per_syllable(
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+) -> float | None:
+    if _canonical_language(cfg.target_language) != "ko":
+        return None
+    values: list[float] = []
+    for segment in manifest.segments:
+        script = segment.script
+        if script is None or _canonical_language(script.tts_language) != "ko":
+            continue
+        syllable_count = _korean_syllable_count(script.tts_text)
+        if syllable_count <= 0 or segment.duration <= 0:
+            continue
+        values.append(segment.duration / float(syllable_count))
+    return _median(values)
+
+
+def _target_pacing_metrics(
+    source_sec_per_pronunciation: float | None,
+    target_sec_per_syllable: float | None,
+) -> tuple[float | None, float | None]:
+    if (
+        source_sec_per_pronunciation is None
+        or target_sec_per_syllable is None
+        or source_sec_per_pronunciation <= 0
+        or target_sec_per_syllable <= 0
+    ):
+        return None, None
+    ratio = source_sec_per_pronunciation / target_sec_per_syllable
+    log_distance = abs(math.log(ratio) / math.log(FEW_SHOT_TARGET_PACING_FACTOR_WINDOW))
+    score = max(0.0, min(1.0, 1.0 - log_distance))
+    return ratio, score
+
+
+def _few_shot_timing_bucket(source_sec_per_pronunciation: float | None) -> str:
+    if source_sec_per_pronunciation is None:
+        return "unknown"
+    if source_sec_per_pronunciation < 0.16:
+        return "very_fast"
+    if source_sec_per_pronunciation < 0.20:
+        return "fast"
+    if source_sec_per_pronunciation < 0.25:
+        return "normal_fast"
+    if source_sec_per_pronunciation < 0.30:
+        return "normal"
+    if source_sec_per_pronunciation < 0.40:
+        return "slow"
+    if source_sec_per_pronunciation < 0.55:
+        return "very_slow"
+    return "extra_slow"
+
+
+def _few_shot_base_sort_key(candidate: FewShotTrainingItem) -> tuple[float, float, float, str]:
+    return (
+        -candidate.training_selection_score,
+        -candidate.quality_score,
+        candidate.duration_sec,
+        candidate.segment_id,
+    )
+
+
+def _timing_balance_adjustment(
+    candidate: FewShotTrainingItem,
+    selected_duration_by_bucket: dict[str, float],
+    selected_total_sec: float,
+) -> float:
+    target_share = FEW_SHOT_TIMING_BUCKET_TARGET_SHARES.get(candidate.timing_bucket, 0.0)
+    current_share = (
+        selected_duration_by_bucket.get(candidate.timing_bucket, 0.0) / selected_total_sec
+        if selected_total_sec > 0
+        else 0.0
+    )
+    deficit = target_share - current_share
+    target_pacing_factor = (
+        1.0 - candidate.target_pacing_score
+        if candidate.target_pacing_score is not None
+        else 1.0
+    )
+    if deficit >= 0:
+        return deficit * FEW_SHOT_TIMING_DEFICIT_BONUS * target_pacing_factor
+    return deficit * FEW_SHOT_TIMING_OVERREPRESENTED_PENALTY * target_pacing_factor
+
+
+def _timing_balanced_sort_key(
+    candidate: FewShotTrainingItem,
+    selected_duration_by_bucket: dict[str, float],
+    selected_total_sec: float,
+) -> tuple[float, float, float, float, str]:
+    balanced_score = candidate.training_selection_score + _timing_balance_adjustment(
+        candidate,
+        selected_duration_by_bucket,
+        selected_total_sec,
+    )
+    return (
+        -balanced_score,
+        -candidate.training_selection_score,
+        -candidate.quality_score,
+        candidate.duration_sec,
+        candidate.segment_id,
+    )
+
+
+def _select_timing_balanced_training_items(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+) -> list[FewShotTrainingItem]:
+    ranked = sorted(candidates, key=_few_shot_base_sort_key)
+    target_total_sec = few_shot_min_total_sec(cfg)
+    if sum(item.duration_sec for item in ranked) <= target_total_sec:
+        return ranked
+    selected: list[FewShotTrainingItem] = []
+    selected_duration_by_bucket: dict[str, float] = {}
+    selected_total_sec = 0.0
+    remaining = list(ranked)
+    while remaining and selected_total_sec < target_total_sec:
+        remaining.sort(
+            key=lambda candidate: _timing_balanced_sort_key(
+                candidate,
+                selected_duration_by_bucket,
+                selected_total_sec,
+            )
+        )
+        item = remaining.pop(0)
+        selected.append(item)
+        selected_total_sec += item.duration_sec
+        selected_duration_by_bucket[item.timing_bucket] = (
+            selected_duration_by_bucket.get(item.timing_bucket, 0.0) + item.duration_sec
+        )
+    return selected
+
+
+def _select_training_items_for_pacing(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+) -> list[FewShotTrainingItem]:
+    if not getattr(cfg, "gsv_few_shot_pacing_target_enabled", True):
+        return _select_timing_balanced_training_items(candidates, cfg)
+    if not candidates:
+        return []
+    target_sec_per_syllable = next(
+        (
+            item.target_sec_per_syllable
+            for item in candidates
+            if item.target_sec_per_syllable is not None and item.target_sec_per_syllable > 0
+        ),
+        None,
+    )
+    if target_sec_per_syllable is None:
+        return _select_timing_balanced_training_items(candidates, cfg)
+    selected = _select_target_mean_variance_training_items(
+        candidates,
+        cfg,
+        target_speed=1.0 / target_sec_per_syllable,
+    )
+    if selected:
+        return selected
+    return _select_timing_balanced_training_items(candidates, cfg)
+
+
+def _select_target_mean_variance_training_items(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+    *,
+    target_speed: float,
+) -> list[FewShotTrainingItem]:
+    viable = [item for item in candidates if _few_shot_pronunciation_per_sec(item) is not None]
+    if not viable:
+        return []
+    target_total_sec = few_shot_min_total_sec(cfg)
+    base_tolerance = float(getattr(cfg, "gsv_few_shot_pacing_target_tolerance", 0.10))
+    max_tolerance = max(
+        base_tolerance,
+        float(getattr(cfg, "gsv_few_shot_pacing_max_target_tolerance", 0.30)),
+    )
+    tolerance_steps = _pacing_tolerance_steps(base_tolerance, max_tolerance)
+    max_overage_ratio = float(getattr(cfg, "gsv_few_shot_pacing_max_duration_overage_ratio", 0.10))
+    normal_max_duration = target_total_sec + max(1.0, target_total_sec * max_overage_ratio)
+    fallback_max_duration = target_total_sec + max(item.duration_sec for item in viable)
+    for max_duration_sec in (normal_max_duration, fallback_max_duration):
+        for tolerance in tolerance_steps:
+            selected = _beam_select_target_pacing_items(
+                viable,
+                cfg,
+                target_speed=target_speed,
+                target_total_sec=target_total_sec,
+                max_duration_sec=max_duration_sec,
+                tolerance=tolerance,
+            )
+            if selected:
+                return selected
+    return []
+
+
+def _pacing_tolerance_steps(base_tolerance: float, max_tolerance: float) -> tuple[float, ...]:
+    values = [max(0.0, base_tolerance)]
+    while values[-1] + 1e-9 < max_tolerance:
+        values.append(min(max_tolerance, values[-1] * 2.0 if values[-1] > 0 else 0.05))
+    return tuple(dict.fromkeys(round(value, 6) for value in values))
+
+
+def _beam_select_target_pacing_items(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+    max_duration_sec: float,
+    tolerance: float,
+) -> list[FewShotTrainingItem]:
+    beam_size = int(getattr(cfg, "gsv_few_shot_pacing_beam_size", 768))
+    beam_size = max(32, min(4096, beam_size))
+    search_iterations = int(getattr(cfg, "gsv_few_shot_pacing_search_iterations", 12000))
+    ordered = sorted(candidates, key=lambda item: _pacing_candidate_sort_key(item, target_speed))
+    states: list[_PacingSelectionState] = [_PacingSelectionState(items=())]
+    best_state: _PacingSelectionState | None = None
+    for item in ordered:
+        additions: list[_PacingSelectionState] = []
+        for state in states:
+            next_state = _pacing_state_add(state, item)
+            if next_state.total_duration_sec <= max_duration_sec + 1e-6:
+                additions.append(next_state)
+        states = _prune_pacing_states(
+            [*states, *additions],
+            beam_size=beam_size,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+        )
+        for state in states:
+            if not _pacing_state_is_valid(
+                state,
+                target_speed=target_speed,
+                target_total_sec=target_total_sec,
+                tolerance=tolerance,
+            ):
+                continue
+            if best_state is None or _pacing_final_sort_key(
+                state,
+                target_speed=target_speed,
+                target_total_sec=target_total_sec,
+                cfg=cfg,
+            ) > _pacing_final_sort_key(
+                best_state,
+                target_speed=target_speed,
+                target_total_sec=target_total_sec,
+                cfg=cfg,
+            ):
+                best_state = state
+    if best_state:
+        return list(best_state.items)
+    if search_iterations <= 0:
+        return []
+    return _local_search_target_pacing_items(
+        ordered,
+        cfg,
+        target_speed=target_speed,
+        target_total_sec=target_total_sec,
+        max_duration_sec=max_duration_sec,
+        tolerance=tolerance,
+        iterations=search_iterations,
+    )
+
+
+def _local_search_target_pacing_items(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+    max_duration_sec: float,
+    tolerance: float,
+    iterations: int,
+) -> list[FewShotTrainingItem]:
+    if not candidates:
+        return []
+    rng = random.Random(_pacing_search_seed(candidates, cfg, target_speed, target_total_sec))
+    pool = list(candidates)
+    seeds = _pacing_local_search_seeds(pool, target_speed, target_total_sec)
+    current = _repair_pacing_selection(
+        seeds[0] if seeds else [],
+        pool,
+        rng,
+        target_total_sec=target_total_sec,
+        max_duration_sec=max_duration_sec,
+    )
+    best = _best_valid_pacing_selection(
+        seeds,
+        pool,
+        rng,
+        target_speed=target_speed,
+        target_total_sec=target_total_sec,
+        max_duration_sec=max_duration_sec,
+        tolerance=tolerance,
+        cfg=cfg,
+    )
+    for index in range(max(0, iterations)):
+        if index % 250 == 0 and seeds:
+            current = _repair_pacing_selection(
+                list(seeds[(index // 250) % len(seeds)]),
+                pool,
+                rng,
+                target_total_sec=target_total_sec,
+                max_duration_sec=max_duration_sec,
+            )
+        trial = _repair_pacing_selection(
+            _mutate_pacing_selection(current, pool, rng),
+            pool,
+            rng,
+            target_total_sec=target_total_sec,
+            max_duration_sec=max_duration_sec,
+        )
+        trial_key = _valid_pacing_selection_key(
+            trial,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+            tolerance=tolerance,
+            cfg=cfg,
+        )
+        current_key = _valid_pacing_selection_key(
+            current,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+            tolerance=tolerance,
+            cfg=cfg,
+        )
+        best_key = (
+            _valid_pacing_selection_key(
+                best,
+                target_speed=target_speed,
+                target_total_sec=target_total_sec,
+                tolerance=tolerance,
+                cfg=cfg,
+            )
+            if best is not None
+            else None
+        )
+        if trial_key is not None and (best_key is None or trial_key > best_key):
+            best = trial
+        accept_trial = trial_key is not None and (
+            current_key is None or trial_key > current_key or rng.random() < 0.02
+        )
+        if not accept_trial and current_key is None and rng.random() < 0.50:
+            accept_trial = True
+        if accept_trial:
+            current = trial
+    return best or []
+
+
+def _pacing_search_seed(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+    target_speed: float,
+    target_total_sec: float,
+) -> int:
+    payload = "|".join(item.segment_id for item in candidates)
+    payload += f"|{getattr(cfg, 'base_seed', 0)}|{target_speed:.6f}|{target_total_sec:.6f}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def _pacing_local_search_seeds(
+    pool: Sequence[FewShotTrainingItem],
+    target_speed: float,
+    target_total_sec: float,
+) -> list[list[FewShotTrainingItem]]:
+    seeds: list[list[FewShotTrainingItem]] = []
+    sorters = [
+        _few_shot_base_sort_key,
+        lambda item: (abs((_few_shot_pronunciation_per_sec(item) or target_speed) - target_speed), -item.training_selection_score),
+        lambda item: (_few_shot_pronunciation_per_sec(item) or target_speed, -item.training_selection_score),
+        lambda item: (-( _few_shot_pronunciation_per_sec(item) or target_speed), -item.training_selection_score),
+        lambda item: (-abs((_few_shot_pronunciation_per_sec(item) or target_speed) - target_speed), -item.training_selection_score),
+    ]
+    for sorter in sorters:
+        selected: list[FewShotTrainingItem] = []
+        total = 0.0
+        for item in sorted(pool, key=sorter):
+            selected.append(item)
+            total += item.duration_sec
+            if total >= target_total_sec:
+                break
+        seeds.append(selected)
+    slow = sorted(
+        [item for item in pool if (_few_shot_pronunciation_per_sec(item) or target_speed) < target_speed],
+        key=lambda item: (_few_shot_pronunciation_per_sec(item) or target_speed, -item.training_selection_score),
+    )[:8]
+    fast = sorted(
+        [item for item in pool if (_few_shot_pronunciation_per_sec(item) or target_speed) > target_speed],
+        key=lambda item: (-(_few_shot_pronunciation_per_sec(item) or target_speed), -item.training_selection_score),
+    )[:8]
+    for slow_count in range(1, min(4, len(slow)) + 1):
+        for fast_count in range(1, min(4, len(fast)) + 1):
+            seeds.append([*slow[:slow_count], *fast[:fast_count]])
+    return seeds
+
+
+def _best_valid_pacing_selection(
+    seeds: Sequence[Sequence[FewShotTrainingItem]],
+    pool: Sequence[FewShotTrainingItem],
+    rng: random.Random,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+    max_duration_sec: float,
+    tolerance: float,
+    cfg: ProjectConfig,
+) -> list[FewShotTrainingItem] | None:
+    best: list[FewShotTrainingItem] | None = None
+    best_key: tuple[float, float, float, float, float] | None = None
+    for seed in seeds:
+        selected = _repair_pacing_selection(
+            list(seed),
+            pool,
+            rng,
+            target_total_sec=target_total_sec,
+            max_duration_sec=max_duration_sec,
+        )
+        key = _valid_pacing_selection_key(
+            selected,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+            tolerance=tolerance,
+            cfg=cfg,
+        )
+        if key is not None and (best_key is None or key > best_key):
+            best = selected
+            best_key = key
+    return best
+
+
+def _valid_pacing_selection_key(
+    selected: Sequence[FewShotTrainingItem] | None,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+    tolerance: float,
+    cfg: ProjectConfig,
+) -> tuple[float, float, float, float, float] | None:
+    if selected is None:
+        return None
+    state = _pacing_state_from_items(selected)
+    if not _pacing_state_is_valid(
+        state,
+        target_speed=target_speed,
+        target_total_sec=target_total_sec,
+        tolerance=tolerance,
+    ):
+        return None
+    return _pacing_final_sort_key(
+        state,
+        target_speed=target_speed,
+        target_total_sec=target_total_sec,
+        cfg=cfg,
+    )
+
+
+def _mutate_pacing_selection(
+    selected: Sequence[FewShotTrainingItem],
+    pool: Sequence[FewShotTrainingItem],
+    rng: random.Random,
+) -> list[FewShotTrainingItem]:
+    trial = list(selected)
+    selected_ids = {item.segment_id for item in trial}
+    operation = rng.random()
+    if operation < 0.30 and len(trial) > 1:
+        trial.pop(rng.randrange(len(trial)))
+    elif operation < 0.65:
+        choices = [item for item in pool if item.segment_id not in selected_ids]
+        if choices:
+            trial.append(rng.choice(choices))
+    elif trial:
+        choices = [item for item in pool if item.segment_id not in selected_ids]
+        if choices:
+            trial[rng.randrange(len(trial))] = rng.choice(choices)
+    return _dedupe_pacing_selection(trial)
+
+
+def _repair_pacing_selection(
+    selected: Sequence[FewShotTrainingItem],
+    pool: Sequence[FewShotTrainingItem],
+    rng: random.Random,
+    *,
+    target_total_sec: float,
+    max_duration_sec: float,
+) -> list[FewShotTrainingItem]:
+    trial = _dedupe_pacing_selection(selected)
+    for _ in range(64):
+        total = sum(item.duration_sec for item in trial)
+        if total >= target_total_sec:
+            break
+        selected_ids = {item.segment_id for item in trial}
+        choices = [
+            item
+            for item in pool
+            if item.segment_id not in selected_ids
+            and total + item.duration_sec <= max_duration_sec + 1e-6
+        ]
+        if not choices:
+            choices = [item for item in pool if item.segment_id not in selected_ids]
+        if not choices:
+            break
+        trial.append(rng.choice(choices))
+    for _ in range(64):
+        total = sum(item.duration_sec for item in trial)
+        if total <= max_duration_sec + 1e-6 or len(trial) <= 1:
+            break
+        trial.pop(rng.randrange(len(trial)))
+    return _dedupe_pacing_selection(trial)
+
+
+def _dedupe_pacing_selection(
+    selected: Sequence[FewShotTrainingItem],
+) -> list[FewShotTrainingItem]:
+    seen: set[str] = set()
+    result: list[FewShotTrainingItem] = []
+    for item in selected:
+        if item.segment_id in seen:
+            continue
+        seen.add(item.segment_id)
+        result.append(item)
+    return result
+
+
+def _pacing_state_from_items(
+    items: Sequence[FewShotTrainingItem],
+) -> _PacingSelectionState:
+    state = _PacingSelectionState(items=())
+    for item in items:
+        state = _pacing_state_add(state, item)
+    return state
+
+
+def _pacing_candidate_sort_key(
+    item: FewShotTrainingItem,
+    target_speed: float,
+) -> tuple[float, float, float, float, str]:
+    speed = _few_shot_pronunciation_per_sec(item) or 0.0
+    return (
+        -abs(speed - target_speed),
+        -item.training_selection_score,
+        -item.quality_score,
+        item.duration_sec,
+        item.segment_id,
+    )
+
+
+def _pacing_state_add(
+    state: _PacingSelectionState,
+    item: FewShotTrainingItem,
+) -> _PacingSelectionState:
+    speed = _few_shot_pronunciation_per_sec(item)
+    if speed is None:
+        return state
+    duration = item.duration_sec
+    return _PacingSelectionState(
+        items=(*state.items, item),
+        total_duration_sec=state.total_duration_sec + duration,
+        speed_weighted_sum=state.speed_weighted_sum + speed * duration,
+        speed_sq_weighted_sum=state.speed_sq_weighted_sum + speed * speed * duration,
+        quality_weighted_sum=state.quality_weighted_sum + item.quality_score * duration,
+        score_weighted_sum=state.score_weighted_sum + item.training_selection_score * duration,
+    )
+
+
+def _prune_pacing_states(
+    states: Sequence[_PacingSelectionState],
+    *,
+    beam_size: int,
+    target_speed: float,
+    target_total_sec: float,
+) -> list[_PacingSelectionState]:
+    best_by_bin: dict[tuple[int, int, int], _PacingSelectionState] = {}
+    for state in states:
+        mean = _pacing_state_mean(state) or 0.0
+        key = (
+            int(round(state.total_duration_sec * 2.0)),
+            int(round((mean - target_speed) * 10.0)),
+            len(state.items),
+        )
+        current = best_by_bin.get(key)
+        if current is None or _pacing_partial_sort_key(
+            state,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+        ) > _pacing_partial_sort_key(
+            current,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+        ):
+            best_by_bin[key] = state
+    return sorted(
+        best_by_bin.values(),
+        key=lambda state: _pacing_partial_sort_key(
+            state,
+            target_speed=target_speed,
+            target_total_sec=target_total_sec,
+        ),
+        reverse=True,
+    )[:beam_size]
+
+
+def _pacing_partial_sort_key(
+    state: _PacingSelectionState,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+) -> tuple[float, float, float, float, float]:
+    mean = _pacing_state_mean(state)
+    mean_distance = abs((mean if mean is not None else target_speed) - target_speed)
+    duration_progress = min(state.total_duration_sec / max(target_total_sec, 1e-6), 1.0)
+    return (
+        duration_progress,
+        _pacing_state_variance(state),
+        _pacing_state_average_score(state),
+        -mean_distance,
+        -len(state.items),
+    )
+
+
+def _pacing_state_is_valid(
+    state: _PacingSelectionState,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+    tolerance: float,
+) -> bool:
+    mean = _pacing_state_mean(state)
+    return (
+        state.total_duration_sec + 1e-6 >= target_total_sec
+        and mean is not None
+        and abs(mean - target_speed) <= tolerance + 1e-9
+    )
+
+
+def _pacing_final_sort_key(
+    state: _PacingSelectionState,
+    *,
+    target_speed: float,
+    target_total_sec: float,
+    cfg: ProjectConfig,
+) -> tuple[float, float, float, float, float]:
+    variance_weight = float(getattr(cfg, "gsv_few_shot_pacing_variance_weight", 1.0))
+    quality_weight = float(getattr(cfg, "gsv_few_shot_pacing_quality_weight", 0.25))
+    mean = _pacing_state_mean(state) or target_speed
+    variance = _pacing_state_variance(state)
+    average_score = _pacing_state_average_score(state)
+    objective = variance * variance_weight + average_score * quality_weight
+    return (
+        objective,
+        variance,
+        average_score,
+        -abs(mean - target_speed),
+        -abs(state.total_duration_sec - target_total_sec),
+    )
+
+
+def _pacing_state_mean(state: _PacingSelectionState) -> float | None:
+    if state.total_duration_sec <= 0:
+        return None
+    return state.speed_weighted_sum / state.total_duration_sec
+
+
+def _pacing_state_variance(state: _PacingSelectionState) -> float:
+    mean = _pacing_state_mean(state)
+    if mean is None:
+        return 0.0
+    return max(0.0, state.speed_sq_weighted_sum / state.total_duration_sec - mean * mean)
+
+
+def _pacing_state_average_score(state: _PacingSelectionState) -> float:
+    if state.total_duration_sec <= 0:
+        return 0.0
+    return state.score_weighted_sum / state.total_duration_sec
+
+
+def _few_shot_pronunciation_per_sec(item: FewShotTrainingItem) -> float | None:
+    if item.source_sec_per_pronunciation is None or item.source_sec_per_pronunciation <= 0:
+        return None
+    return 1.0 / item.source_sec_per_pronunciation
+
+
+def _few_shot_text_reject_reasons(source_chars_per_sec: float, cfg: ProjectConfig) -> tuple[str, ...]:
+    max_chars_per_sec = getattr(cfg, "gsv_few_shot_max_chars_per_sec", None)
+    if max_chars_per_sec is None or max_chars_per_sec <= 0:
+        return ()
+    if source_chars_per_sec <= max_chars_per_sec:
+        return ()
+    return (
+        "source_chars_per_sec_above_max:"
+        f"{source_chars_per_sec:.3f}>{float(max_chars_per_sec):.3f}",
+    )
+
+
+_SOURCE_COUNTER_PREFIX_RE = re.compile(r"^\s*(?:[0-9０-９]+|[一二三四五六七八九十]+)[\s、,.．)]")
+_SOURCE_FRAGMENT_PREFIX_RE = re.compile(r"^\s*[。,.、]")
+_SOURCE_EFFECT_LIKE_RE = re.compile(
+    r"(ぎゅ|ギュ|じゅ|ジュ|ぷしゃ|プシャ|ピク|ぴく|ビンビン|びんびん|ざわ|ザワ|ぐちゅ|グチュ|びく|ビク)"
+)
+_SOURCE_INTENSE_STYLE_RE = re.compile(
+    r"(触手|貫通|絶頂|変態|潮|母乳|子宮|乳首|おまんこ|おちんちん|おっぱい|チンポ|"
+    r"息汁|愛液|快楽|喘ぎ|硬直|突き上げ|のけぞ|ぐちゃ|限界|泣き叫|股間|粘液|ぬめ|"
+    r"下乳|馬乗り|極太|攻め|欲しい)"
+)
+
+
+def _training_selection_score(
+    quality_score: float | None,
+    source_chars_per_sec: float,
+    source_text: str,
+    cfg: ProjectConfig,
+    *,
+    target_pacing_score: float | None = None,
+) -> tuple[float | None, tuple[str, ...]]:
+    if quality_score is None:
+        return None, ()
+    score = quality_score
+    penalties: list[str] = []
+    preferred = getattr(cfg, "gsv_few_shot_preferred_chars_per_sec", None)
+    maximum = getattr(cfg, "gsv_few_shot_max_chars_per_sec", None)
+    if preferred is not None and preferred > 0 and source_chars_per_sec > preferred:
+        if maximum is not None and maximum > preferred:
+            span = maximum - preferred
+            ratio = min(max((source_chars_per_sec - preferred) / span, 0.0), 1.0)
+        else:
+            ratio = min(max((source_chars_per_sec - preferred) / preferred, 0.0), 1.0)
+        penalty = 0.35 * ratio
+        score -= penalty
+        penalties.append(f"source_chars_per_sec_penalty:{penalty:.3f}")
+    if getattr(cfg, "gsv_few_shot_prefer_plain_text", True):
+        style_penalty, style_penalties = _source_text_style_penalty(source_text)
+        if style_penalty > 0:
+            score -= style_penalty
+            penalties.extend(style_penalties)
+    if target_pacing_score is not None:
+        weight = FEW_SHOT_TARGET_PACING_WEIGHT
+        score = score * (1.0 - weight) + target_pacing_score * weight
+    return max(0.0, min(1.0, score)), tuple(penalties)
+
+
+def _source_text_style_penalty(source_text: str) -> tuple[float, tuple[str, ...]]:
+    text = source_text.strip()
+    if not text:
+        return 0.0, ()
+    penalty = 0.0
+    penalties: list[str] = []
+    if _SOURCE_COUNTER_PREFIX_RE.search(text) or _SOURCE_FRAGMENT_PREFIX_RE.search(text):
+        penalty += 0.18
+        penalties.append("source_text_counter_or_fragment_penalty:0.180")
+    if _SOURCE_EFFECT_LIKE_RE.search(text):
+        penalty += 0.22
+        penalties.append("source_text_effect_like_penalty:0.220")
+    if _SOURCE_INTENSE_STYLE_RE.search(text):
+        penalty += 0.18
+        penalties.append("source_text_intense_style_penalty:0.180")
+    if text.count(" ") >= 2 and len(text.replace(" ", "")) / max(text.count(" ") + 1, 1) < 9:
+        penalty += 0.10
+        penalties.append("source_text_fragmented_phrase_penalty:0.100")
+    return min(penalty, 0.65), tuple(penalties)
+
+
+def _ensure_single_few_shot_speaker(items: Sequence[FewShotTrainingItem]) -> None:
+    by_speaker: dict[str, list[str]] = {}
+    for item in items:
+        by_speaker.setdefault(item.speaker_id, []).append(item.segment_id)
+    if len(by_speaker) <= 1:
+        return
+    details = ", ".join(
+        f"{speaker_id}({','.join(segment_ids[:5])})"
+        for speaker_id, segment_ids in sorted(by_speaker.items())
+    )
+    raise GPTSoVITSError(
+        "speaker_id_mismatch: GPT-SoVITS few-shot training requires one speaker_id, "
+        f"but selected segments include multiple speakers: {details}"
+    )
+
+
 def _few_shot_diagnostic_row(
     segment: Segment,
     check: VoiceTrainingCandidateCheck,
@@ -513,6 +1516,15 @@ def _few_shot_diagnostic_row(
     *,
     selected: bool,
     reject_reasons: Sequence[str],
+    source_chars_per_sec: float | None = None,
+    source_pronunciation_count: int | None = None,
+    source_sec_per_pronunciation: float | None = None,
+    timing_bucket: str | None = None,
+    target_sec_per_syllable: float | None = None,
+    target_pacing_ratio: float | None = None,
+    target_pacing_score: float | None = None,
+    training_selection_score: float | None = None,
+    selection_penalties: Sequence[str] = (),
 ) -> dict[str, Any]:
     metrics = check.metrics
     return {
@@ -523,6 +1535,28 @@ def _few_shot_diagnostic_row(
         "duration_sec": round(segment.duration, 6),
         "quality_score": round(metrics.score, 6) if metrics else None,
         "quality_issues": list(metrics.issues) if metrics else [],
+        "source_chars_per_sec": round(source_chars_per_sec, 6) if source_chars_per_sec is not None else None,
+        "source_pronunciation_count": source_pronunciation_count,
+        "source_sec_per_pronunciation": (
+            round(source_sec_per_pronunciation, 6)
+            if source_sec_per_pronunciation is not None
+            else None
+        ),
+        "timing_bucket": timing_bucket or "unknown",
+        "target_sec_per_syllable": (
+            round(target_sec_per_syllable, 6) if target_sec_per_syllable is not None else None
+        ),
+        "target_pacing_ratio": (
+            round(target_pacing_ratio, 6) if target_pacing_ratio is not None else None
+        ),
+        "target_pacing_score": (
+            round(target_pacing_score, 6) if target_pacing_score is not None else None
+        ),
+        "training_selection_score": (
+            round(training_selection_score, 6) if training_selection_score is not None else None
+        ),
+        "selection_penalties": list(selection_penalties),
+        "clean_source_metrics": check.clean_source_metrics,
         "source_language": cfg.source_language,
         "target_language": cfg.target_language,
         "cross_lingual_role": "ja_source_voice_for_ko_sovits_transfer",
@@ -546,11 +1580,20 @@ def build_training_dataset(
     project_dir: Path,
     manifest: PipelineManifest,
     cfg: ProjectConfig,
+    *,
+    speaker_id: str | None = None,
+    work_dir: Path | None = None,
 ) -> FewShotDataset:
-    wav_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "wavs")
-    list_path = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "dataset.list")
+    base_dir = _few_shot_work_dir(project_dir, work_dir)
+    wav_dir = ensure_inside_project(project_dir, base_dir / "wavs")
+    list_path = ensure_inside_project(project_dir, base_dir / "dataset.list")
     wav_dir.mkdir(parents=True, exist_ok=True)
-    selection = _select_training_items_with_diagnostics(project_dir, manifest, cfg)
+    selection = _select_training_items_with_diagnostics(
+        project_dir,
+        manifest,
+        cfg,
+        speaker_id=speaker_id,
+    )
     items = selection.items
     lines: list[str] = []
     total = 0.0
@@ -568,10 +1611,18 @@ def build_training_dataset(
     tmp.write_text("\n".join(lines) + "\n", "utf-8")
     os.replace(tmp, list_path)
     write_json_atomic(
-        _project_path(project_dir, "work", "gpt_sovits", "few_shot", "source_clip_qc.json"),
+        ensure_inside_project(project_dir, base_dir / "source_clip_qc.json"),
         {"clips": selection.diagnostics},
     )
     return FewShotDataset(items=items, wav_dir=wav_dir, list_path=list_path, total_duration_sec=total)
+
+
+def _few_shot_work_dir(project_dir: Path, work_dir: Path | None = None) -> Path:
+    if work_dir is None:
+        return _project_path(project_dir, "work", "gpt_sovits", "few_shot")
+    path = Path(work_dir).expanduser()
+    resolved = path.resolve() if path.is_absolute() else (project_dir / path).resolve()
+    return ensure_inside_project(project_dir, resolved)
 
 
 def _fingerprint_payload(
@@ -587,6 +1638,7 @@ def _fingerprint_payload(
         "segments": [
             {
                 "id": item.segment_id,
+                "speaker_id": item.speaker_id,
                 "source_audio_path": str(item.source_audio_path),
                 "source_audio_sha256": sha256_file(item.source_audio_path),
                 "text": item.text,
@@ -594,6 +1646,31 @@ def _fingerprint_payload(
                 "duration_sec": round(item.duration_sec, 6),
                 "quality_score": round(item.quality_score, 6),
                 "quality_issues": list(item.quality_issues),
+                "source_chars_per_sec": round(item.source_chars_per_sec, 6),
+                "source_pronunciation_count": item.source_pronunciation_count,
+                "source_sec_per_pronunciation": (
+                    round(item.source_sec_per_pronunciation, 6)
+                    if item.source_sec_per_pronunciation is not None
+                    else None
+                ),
+                "timing_bucket": item.timing_bucket,
+                "target_sec_per_syllable": (
+                    round(item.target_sec_per_syllable, 6)
+                    if item.target_sec_per_syllable is not None
+                    else None
+                ),
+                "target_pacing_ratio": (
+                    round(item.target_pacing_ratio, 6)
+                    if item.target_pacing_ratio is not None
+                    else None
+                ),
+                "target_pacing_score": (
+                    round(item.target_pacing_score, 6)
+                    if item.target_pacing_score is not None
+                    else None
+                ),
+                "training_selection_score": round(item.training_selection_score, 6),
+                "selection_penalties": list(item.selection_penalties),
             }
             for item in dataset.items
         ],
@@ -705,12 +1782,13 @@ def _training_configs(
     cfg: ProjectConfig,
     dataset: FewShotDataset,
     install: GPTSoVITSInstall,
+    work_dir: Path | None = None,
 ) -> tuple[dict[str, Any], Path, Path, Path, Path]:
-    base_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot")
-    configs_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "configs")
-    weights_gpt_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "weights", "gpt")
-    weights_sovits_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "weights", "sovits")
-    logs_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot", "logs")
+    base_dir = _few_shot_work_dir(project_dir, work_dir)
+    configs_dir = ensure_inside_project(project_dir, base_dir / "configs")
+    weights_gpt_dir = ensure_inside_project(project_dir, base_dir / "weights" / "gpt")
+    weights_sovits_dir = ensure_inside_project(project_dir, base_dir / "weights" / "sovits")
+    logs_dir = ensure_inside_project(project_dir, base_dir / "logs")
     for path in (configs_dir, weights_gpt_dir, weights_sovits_dir, logs_dir):
         path.mkdir(parents=True, exist_ok=True)
     exp_name = f"{project_dir.name}_few_shot"
@@ -1031,23 +2109,32 @@ def train_few_shot(
     manifest: PipelineManifest,
     cfg: ProjectConfig,
     *,
+    speaker_id: str | None = None,
+    work_dir: Path | None = None,
     force: bool | None = None,
     command: Sequence[str] | str | None = None,
     runner: CommandRunner = subprocess.run,
     progress_callback: FewShotProgressCallback | None = None,
 ) -> FewShotTrainingResult:
     project_dir = project_dir.expanduser().resolve()
-    dataset = build_training_dataset(project_dir, manifest, cfg)
+    base_dir = _few_shot_work_dir(project_dir, work_dir)
+    dataset = build_training_dataset(
+        project_dir,
+        manifest,
+        cfg,
+        speaker_id=speaker_id,
+        work_dir=base_dir,
+    )
     install = discover_install(cfg, command=command)
     fingerprint_config, s1_config_path, s2_config_path, weights_gpt_dir, weights_sovits_dir = _training_configs(
         project_dir,
         cfg,
         dataset,
         install,
+        base_dir,
     )
     payload = _fingerprint_payload(manifest, cfg, dataset, install, fingerprint_config)
     fingerprint = _fingerprint(payload)
-    base_dir = _project_path(project_dir, "work", "gpt_sovits", "few_shot")
     metadata_path = base_dir / "training_manifest.json"
     log_path = base_dir / "logs" / "train.log"
     should_force = cfg.gsv_few_shot_force if force is None else force
@@ -1175,6 +2262,7 @@ def result_metadata(result: FewShotTrainingResult, fingerprint_payload: dict[str
         "fingerprint": result.fingerprint,
         "fingerprint_payload": fingerprint_payload,
         "selected_duration_sec": result.dataset.total_duration_sec,
+        "selected_speaker_id": result.dataset.items[0].speaker_id if result.dataset.items else None,
         "selected_segment_ids": [item.segment_id for item in result.dataset.items],
         "dataset_list_path": str(result.dataset.list_path),
         "dataset_wav_dir": str(result.dataset.wav_dir),

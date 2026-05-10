@@ -1,20 +1,122 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import soundfile as sf
 
 from asmr_dub_pipeline.schemas import Segment
 
-from .features import ensure_stereo, load_audio, to_mono, write_audio
+from . import ffmpeg
+from .features import AudioProcessingError, ensure_stereo, to_mono, write_audio
 
 
-def _write_slice(data: np.ndarray, sample_rate: int, start: float, end: float, output_path: Path) -> Path:
+def _validate_block(data: np.ndarray, path: Path) -> None:
+    if data.size and not np.isfinite(data).all():
+        raise AudioProcessingError(f"Audio contains NaN or infinity: {path}")
+
+
+def _read_slice_from_handle(audio: sf.SoundFile, path: Path, start: float, end: float) -> tuple[np.ndarray, int]:
+    if audio.frames <= 0:
+        raise AudioProcessingError(f"Audio file is empty: {path}")
+    sample_rate = int(audio.samplerate)
     start_idx = max(0, int(round(start * sample_rate)))
-    end_idx = min(len(data), int(round(end * sample_rate)))
-    write_audio(output_path, data[start_idx:end_idx], sample_rate)
+    requested_end_idx = max(start_idx, int(round(end * sample_rate)))
+    end_idx = min(int(audio.frames), requested_end_idx)
+    frames = max(0, end_idx - start_idx)
+    fallback_start = start_idx / sample_rate
+    fallback_end = requested_end_idx / sample_rate
+    try:
+        audio.seek(start_idx)
+        data = audio.read(frames, always_2d=True, dtype="float32")
+    except Exception as exc:
+        data, sample_rate = _read_slice_with_ffmpeg(
+            path,
+            fallback_start,
+            fallback_end,
+            sample_rate=sample_rate,
+            channels=max(1, int(audio.channels)),
+            cause=exc,
+        )
+    else:
+        if requested_end_idx > start_idx and len(data) == 0:
+            data, sample_rate = _read_slice_with_ffmpeg(
+                path,
+                fallback_start,
+                fallback_end,
+                sample_rate=sample_rate,
+                channels=max(1, int(audio.channels)),
+                cause=AudioProcessingError(f"SoundFile returned an empty slice: {path}"),
+            )
+    _validate_block(data, path)
+    return data, sample_rate
+
+
+def _read_slice_with_ffmpeg(
+    path: Path,
+    start: float,
+    end: float,
+    *,
+    sample_rate: int,
+    channels: int,
+    cause: Exception,
+) -> tuple[np.ndarray, int]:
+    duration = max(0.0, end - start)
+    if duration <= 0.0:
+        return np.zeros((0, channels), dtype=np.float32), sample_rate
+    cmd = [
+        ffmpeg.require_binary("ffmpeg"),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start:.6f}",
+        "-i",
+        str(path),
+        "-t",
+        f"{duration:.6f}",
+        "-vn",
+        "-ac",
+        str(channels),
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AudioProcessingError(
+            f"Audio seek failed and ffmpeg fallback could not read slice {start:.3f}-{end:.3f}: {path}"
+        ) from exc
+    raw = np.frombuffer(result.stdout, dtype="<f4")
+    usable = (raw.size // channels) * channels
+    if usable != raw.size:
+        raw = raw[:usable]
+    data = raw.reshape((-1, channels)).astype(np.float32, copy=False)
+    _validate_block(data, path)
+    if data.size == 0 and duration > 0.0:
+        raise AudioProcessingError(
+            f"Audio seek failed and ffmpeg fallback returned an empty slice {start:.3f}-{end:.3f}: {path}"
+        ) from cause
+    return data, sample_rate
+
+
+def _read_slice(path: Path, start: float, end: float) -> tuple[np.ndarray, int]:
+    with sf.SoundFile(str(path)) as audio:
+        return _read_slice_from_handle(audio, path, start, end)
+
+
+def _write_slice_from_file(path: Path, start: float, end: float, output_path: Path) -> Path:
+    data, sample_rate = _read_slice(path, start, end)
+    write_audio(output_path, data, sample_rate)
     return output_path
 
 
@@ -43,22 +145,108 @@ def write_segment_audio_clips(
     project_dir: Path,
     progress_callback: Callable[[int, int, Segment], None] | None = None,
 ) -> list[Segment]:
-    data, sr = load_audio(gemma_audio_path)
-    mix_data, mix_sr = load_audio(mix_audio_path)
+    total = len(segments)
+    with sf.SoundFile(str(gemma_audio_path)) as gemma_audio, sf.SoundFile(str(mix_audio_path)) as mix_audio:
+        for idx, segment in enumerate(segments, start=1):
+            gemma_clip = project_dir / "work" / "segments" / "audio" / f"{segment.id}_gemma.wav"
+            mix_clip = project_dir / "work" / "segments" / "audio" / f"{segment.id}_mix.wav"
+            gemma_slice, gemma_sr = _read_slice_from_handle(
+                gemma_audio,
+                gemma_audio_path,
+                segment.start,
+                segment.end,
+            )
+            write_audio(gemma_clip, gemma_slice, gemma_sr)
+            mix_slice, mix_sr = _read_slice_from_handle(
+                mix_audio,
+                mix_audio_path,
+                segment.start,
+                segment.end,
+            )
+            write_audio(mix_clip, mix_slice, mix_sr)
+            segment.audio_for_gemma = str(gemma_clip)
+            segment.audio_for_mix = str(mix_clip)
+            segment.estimated_pan = round(_estimate_pan(mix_slice), 3)
+            if progress_callback:
+                progress_callback(idx, total, segment)
+    return segments
+
+
+def _read_slice_from_parts(
+    parts: Sequence[dict[str, Any]],
+    path_key: str,
+    start: float,
+    end: float,
+) -> tuple[np.ndarray, int]:
+    chunks: list[np.ndarray] = []
+    sample_rate: int | None = None
+    for part in parts:
+        part_start = float(part["start_sec"])
+        part_end = float(part["end_sec"])
+        overlap_start = max(start, part_start)
+        overlap_end = min(end, part_end)
+        if overlap_end <= overlap_start:
+            continue
+        local_start = overlap_start - part_start
+        local_end = overlap_end - part_start
+        data, sr = _read_slice(Path(str(part[path_key])), local_start, local_end)
+        if sample_rate is None:
+            sample_rate = sr
+        elif sample_rate != sr:
+            raise AudioProcessingError("Part audio slices must share the same sample rate.")
+        chunks.append(data)
+    if not chunks or sample_rate is None:
+        raise AudioProcessingError(f"No part audio covers segment range {start:.3f}-{end:.3f}.")
+    return np.concatenate(chunks, axis=0), sample_rate
+
+
+def write_segment_audio_clips_from_parts(
+    segments: list[Segment],
+    parts: Sequence[dict[str, Any]],
+    project_dir: Path,
+    progress_callback: Callable[[int, int, Segment], None] | None = None,
+) -> list[Segment]:
     total = len(segments)
     for idx, segment in enumerate(segments, start=1):
         gemma_clip = project_dir / "work" / "segments" / "audio" / f"{segment.id}_gemma.wav"
         mix_clip = project_dir / "work" / "segments" / "audio" / f"{segment.id}_mix.wav"
-        _write_slice(data, sr, segment.start, segment.end, gemma_clip)
-        _write_slice(mix_data, mix_sr, segment.start, segment.end, mix_clip)
-        mix_start = max(0, int(round(segment.start * mix_sr)))
-        mix_end = min(len(mix_data), int(round(segment.end * mix_sr)))
+        gemma_slice, gemma_sr = _read_slice_from_parts(
+            parts,
+            "vocals_mono_path",
+            segment.start,
+            segment.end,
+        )
+        mix_slice, mix_sr = _read_slice_from_parts(
+            parts,
+            "vocals_path",
+            segment.start,
+            segment.end,
+        )
+        write_audio(gemma_clip, gemma_slice, gemma_sr)
+        write_audio(mix_clip, mix_slice, mix_sr)
         segment.audio_for_gemma = str(gemma_clip)
         segment.audio_for_mix = str(mix_clip)
-        segment.estimated_pan = round(_estimate_pan(mix_data[mix_start:mix_end]), 3)
+        segment.estimated_pan = round(_estimate_pan(mix_slice), 3)
         if progress_callback:
             progress_callback(idx, total, segment)
     return segments
+
+
+def _active_frames(path: Path, frame_len: int, threshold: float) -> tuple[list[bool], int, int]:
+    active_frames: list[bool] = []
+    with sf.SoundFile(str(path)) as audio:
+        if audio.frames <= 0:
+            raise AudioProcessingError(f"Audio file is empty: {path}")
+        sample_rate = int(audio.samplerate)
+        while True:
+            chunk = audio.read(frame_len, always_2d=True, dtype="float32")
+            if len(chunk) == 0:
+                break
+            _validate_block(chunk, path)
+            mono = to_mono(chunk)
+            rms = float(np.sqrt(np.mean(np.square(mono)))) if len(mono) else 0.0
+            active_frames.append(rms > threshold)
+        return active_frames, sample_rate, int(audio.frames)
 
 
 def energy_segments(
@@ -71,15 +259,11 @@ def energy_segments(
     min_silence_sec: float = 0.30,
     progress_callback: Callable[[int, int, Segment], None] | None = None,
 ) -> list[Segment]:
-    data, sr = load_audio(gemma_audio_path)
-    mono = to_mono(data)
-    frame_len = max(1, int(sr * 0.05))
     threshold = 10 ** (silence_db / 20.0)
-    active_frames = []
-    for start in range(0, len(mono), frame_len):
-        chunk = mono[start : start + frame_len]
-        rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
-        active_frames.append(rms > threshold)
+    with sf.SoundFile(str(gemma_audio_path)) as info:
+        sr = int(info.samplerate)
+    frame_len = max(1, int(sr * 0.05))
+    active_frames, sr, total_frames = _active_frames(gemma_audio_path, frame_len, threshold)
     segments: list[tuple[float, float]] = []
     active_start: int | None = None
     last_active: int | None = None
@@ -91,15 +275,20 @@ def energy_segments(
             last_active = idx
         elif active_start is not None and last_active is not None and idx - last_active >= gap_frames:
             start_sec = active_start * frame_len / sr
-            end_sec = min(len(mono) / sr, (last_active + 1) * frame_len / sr)
+            end_sec = min(total_frames / sr, (last_active + 1) * frame_len / sr)
             if end_sec - start_sec >= min_segment_sec:
                 segments.append((start_sec, end_sec))
             active_start = None
             last_active = None
     if active_start is not None and last_active is not None:
-        segments.append((active_start * frame_len / sr, min(len(mono) / sr, (last_active + 1) * frame_len / sr)))
+        segments.append(
+            (
+                active_start * frame_len / sr,
+                min(total_frames / sr, (last_active + 1) * frame_len / sr),
+            )
+        )
     if not segments:
-        segments = [(0.0, len(mono) / sr)]
+        segments = [(0.0, total_frames / sr)]
     split: list[tuple[float, float]] = []
     for start, end in segments:
         cursor = start
@@ -108,17 +297,15 @@ def energy_segments(
             cursor += max_segment_sec
         if end - cursor > 0.01:
             split.append((cursor, end))
-    mix_data, mix_sr = load_audio(mix_audio_path)
     out: list[Segment] = []
     total = len(split)
     for idx, (start, end) in enumerate(split, start=1):
         seg_id = f"seg_{idx:04d}"
         gemma_clip = project_dir / "work" / "segments" / "audio" / f"{seg_id}_gemma.wav"
         mix_clip = project_dir / "work" / "segments" / "audio" / f"{seg_id}_mix.wav"
-        _write_slice(data, sr, start, end, gemma_clip)
-        _write_slice(mix_data, mix_sr, start, end, mix_clip)
-        mix_start = max(0, int(round(start * mix_sr)))
-        mix_end = min(len(mix_data), int(round(end * mix_sr)))
+        _write_slice_from_file(gemma_audio_path, start, end, gemma_clip)
+        mix_slice, mix_sr = _read_slice(mix_audio_path, start, end)
+        write_audio(mix_clip, mix_slice, mix_sr)
         status = "raw" if end - start >= min_segment_sec else "needs_manual_review"
         segment = Segment(
             id=seg_id,
@@ -127,7 +314,7 @@ def energy_segments(
             duration=round(end - start, 3),
             audio_for_gemma=str(gemma_clip),
             audio_for_mix=str(mix_clip),
-            estimated_pan=round(_estimate_pan(mix_data[mix_start:mix_end]), 3),
+            estimated_pan=round(_estimate_pan(mix_slice), 3),
             keep_original_texture=True,
             status=status,
         )

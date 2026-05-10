@@ -9,6 +9,5 @@ SCRIPT_SYSTEM_PROMPT = (
     "pause timing in nonverbal_cues.pause_sec, never as bracketed TTS text. Include "
     "retry_policy so downstream QC can request "
     "shortening for overlong TTS or variation with a new seed for repetition or "
-    "omission. Use only user-authorized references; do not imitate a real person "
-    "without consent."
+    "omission."
 )

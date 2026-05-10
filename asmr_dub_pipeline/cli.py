@@ -22,12 +22,15 @@ from .orchestrator import run_pipeline
 from .pipeline.manifest_io import manifest_path
 from .pipeline.steps import (
     analyze_step,
+    audio_style_step,
     export_step,
     extract_step,
     gsv_few_shot_step,
     init_project,
     inspect_input,
+    korean_script_step,
     mix_step,
+    prepare_source_voice_refs_step,
     qc_step,
     regenerate_needs_step,
     rvc_step,
@@ -62,35 +65,57 @@ FULL_REAL_QUALITY_PRESET = {
     "asr_preset": "whisper",
     "asr_batched_inference": True,
     "asr_batch_size": 16,
+    "asr_word_timestamps": True,
     "asr_diagnostics_enabled": True,
     "asr_resegment_max_sec": 14.0,
+    "asr_qwen_repair_fallback_enabled": True,
     "asr_review_enabled": True,
     "asr_review_generate_candidates": True,
+    "source_separation_backend": "auto",
     "asr_translation_backcheck_enabled": True,
-    "candidate_count": 3,
+    "candidate_count": 5,
     "duration_tolerance": 0.25,
     "gemma_llama_cpp_ctx_size": 16384,
     "gemma_llama_cpp_n_predict": 2048,
     "gemma_text_batch_size": 1,
-    "gemma_text_context_radius": 8,
-    "gemma_text_concurrency": 4,
-    "gemma_text_n_predict": 2048,
+    "gemma_text_context_radius": 10,
+    "gemma_text_concurrency": 1,
+    "gemma_text_n_predict": 1536,
     "gemma_text_retries": 2,
-    "gemma_text_span_size": 12,
-    "gemma_text_span_max_sec": 90.0,
-    "gemma_text_span_max_gap_sec": 3.0,
+    "gemma_text_span_size": 10,
+    "gemma_text_span_max_sec": 75.0,
+    "gemma_text_span_max_gap_sec": 5.0,
     "gemma_text_timeout_sec": 900.0,
     "gemma_text_server_startup_timeout_sec": 900.0,
     "gsv_timeout_sec": 240.0,
     "gsv_retries": 3,
-    "gsv_concurrency": 3,
-    "gsv_few_shot_target_sec": 180.0,
+    "gsv_concurrency": 6,
+    "gsv_few_shot_min_total_sec": 60.0,
     "gsv_few_shot_min_clip_sec": 2.0,
     "gsv_few_shot_max_clip_sec": 8.0,
-    "gsv_few_shot_min_quality_score": 0.35,
+    "gsv_few_shot_min_quality_score": 0.30,
+    "gsv_few_shot_clean_source_filter": True,
+    "gsv_few_shot_max_background_bleed_db": -21.0,
+    "gsv_few_shot_max_side_to_mid_db": -6.0,
+    "gsv_few_shot_preferred_chars_per_sec": 4.5,
+    "gsv_few_shot_max_chars_per_sec": 5.2,
+    "gsv_few_shot_prefer_plain_text": True,
+    "gsv_ref_mode": "segment",
+    "gsv_ref_min_sec": 3.0,
+    "gsv_ref_max_sec": 10.0,
     "gsv_ref_min_quality_score": 0.40,
     "gsv_tts_max_speed_factor": 1.20,
-    "gsv_tts_min_speed_factor": 0.75,
+    "gsv_tts_min_speed_factor": 0.90,
+    "gsv_max_attempts_per_candidate": 3,
+    "gsv_duration_rewrite_backend": "none",
+    "gsv_duration_rewrite_max_attempts": 1,
+    "gsv_duration_rewrite_pre_candidate_count": None,
+    "gsv_timefit_max_tempo": 1.18,
+    "gsv_timefit_max_stretch": 1.08,
+    "gsv_timefit_micro_max_sec": 2.0,
+    "gsv_timefit_micro_max_tempo": 1.30,
+    "gsv_timefit_long_min_sec": 7.0,
+    "gsv_timefit_long_max_stretch": 1.15,
     "gsv_top_k": 8,
     "gsv_top_p": 0.9,
     "gsv_temperature": 0.7,
@@ -107,13 +132,19 @@ FULL_REAL_QUALITY_PRESET = {
     "rvc_backend": "command",
     "rvc_train_required": True,
     "rvc_train_backend": "command",
+    "rvc_train_sample_rate": 48_000,
     "rvc_train_epochs": 20,
     "rvc_train_batch_size": 0,
+    "rvc_train_preferred_chars_per_sec": 4.5,
+    "rvc_train_max_chars_per_sec": 5.2,
+    "rvc_train_min_clean_sec": 600.0,
+    "rvc_train_augment_enabled": False,
+    "rvc_train_augment_min_real_sec": 300.0,
     "rvc_train_timeout_sec": 43200.0,
     "rvc_train_preprocess_processes": 0,
     "rvc_train_f0_workers": 0,
     "rvc_train_feature_workers": 0,
-    "rvc_train_save_every_epoch": 50,
+    "rvc_train_save_every_epoch": 5,
     "rvc_train_reuse_intermediate_cache": True,
     "rvc_concurrency": 4,
     "rvc_batch_infer": True,
@@ -135,6 +166,15 @@ app = typer.Typer(
 def _handle_error(exc: Exception) -> None:
     console.print(f"[red]{exc}[/red]")
     raise typer.Exit(code=1) from exc
+
+
+def _parse_only_segment_ids(value: str | None) -> set[str] | None:
+    if value is None:
+        return None
+    segment_ids = {part for part in re.split(r"[\s,]+", value.strip()) if part}
+    if not segment_ids:
+        raise ValueError("--only-segments must include at least one segment id.")
+    return segment_ids
 
 
 def _safe_run_name(input_path: Path, *, merge_parts: bool = False) -> str:
@@ -230,7 +270,7 @@ def _apply_personal_voice_bank_defaults(project_dir: Path) -> None:
         {
             "speaker_assignment_backend": "pyannote",
             "diarization_auto_download": True,
-            "diarization_embedding_match_threshold": 0.78,
+            "diarization_embedding_match_threshold": 0.75,
         }
     )
     for field_name, candidates in {
@@ -484,6 +524,22 @@ def analyze(
     console.print("Analysis complete.")
 
 
+@app.command(name="audio-style")
+def audio_style_cmd(
+    project: Path = typer.Option(..., "--project", "-p"),
+    gemma_backend: str = typer.Option("mock", "--gemma-backend", help="mock|hf|http|llama_cpp|llama_server_audio"),
+    model_id: str = typer.Option("google/gemma-4-E4B-it", "--model-id"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    force: bool = typer.Option(False, "--force", help="Re-run audio style analysis even when segment results already exist."),
+) -> None:
+    """Analyze source audio style metadata for translated lanes."""
+    try:
+        audio_style_step(project.expanduser().resolve(), gemma_backend, model_id, confirm_rights=confirm_rights, force=force)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print("Audio style analysis complete.")
+
+
 @app.command()
 def transcribe(
     project: Path = typer.Option(..., "--project", "-p"),
@@ -523,6 +579,11 @@ def transcribe(
         "--asr-batch-size",
         help="Batch size for faster-whisper batched inference.",
     ),
+    asr_repair: bool | None = typer.Option(
+        None,
+        "--asr-repair/--no-asr-repair",
+        help="Enable or disable ASR repair retranscription passes for suspicious chunks.",
+    ),
     asr_review: bool = typer.Option(
         False,
         "--asr-review",
@@ -544,6 +605,7 @@ def transcribe(
             asr_compute_type=asr_compute_type,
             asr_batched_inference=asr_batched,
             asr_batch_size=asr_batch_size,
+            asr_repair_enabled=asr_repair,
         )
     except Exception as exc:
         _handle_error(exc)
@@ -596,6 +658,19 @@ def translate_ko_cmd(
     console.print("Korean translation complete.")
 
 
+@app.command(name="korean-script")
+def korean_script_cmd(
+    project: Path = typer.Option(..., "--project", "-p"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+) -> None:
+    """Build Korean TTS script metadata from completed translate-ko output."""
+    try:
+        korean_script_step(project.expanduser().resolve(), confirm_rights=confirm_rights)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print("Korean script complete.")
+
+
 @app.command(name="script")
 def script_cmd(
     project: Path = typer.Option(..., "--project", "-p"),
@@ -630,6 +705,21 @@ def synth(
         "--gsv-server-command",
         help="Shell-style command used when --auto-gsv-server needs to start api_v2.",
     ),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Retry segments already marked failed when script metadata exists.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Discard existing synthesized TTS metadata and regenerate selected segments.",
+    ),
+    only_segments: str | None = typer.Option(
+        None,
+        "--only-segments",
+        help="Comma- or whitespace-separated segment IDs to synthesize, e.g. seg_0001,seg_0020.",
+    ),
 ) -> None:
     """Generate TTS candidates per segment."""
     try:
@@ -644,6 +734,9 @@ def synth(
             use_trained_gpt=use_trained_gpt,
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
+            retry_failed=retry_failed,
+            force=force,
+            only_segment_ids=_parse_only_segment_ids(only_segments),
         )
     except RightsError as exc:
         _handle_error(exc)
@@ -881,6 +974,26 @@ def train_rvc(
     console.print(f"RVC training complete: {manifest.artifacts.get('rvc_train_manifest')}")
 
 
+@app.command(name="prepare-refs")
+def prepare_refs(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+) -> None:
+    """Prepare source-derived GPT-SoVITS reference clips."""
+    try:
+        manifest = prepare_source_voice_refs_step(
+            project.expanduser().resolve(),
+            refs_path=refs,
+            confirm_rights=confirm_rights,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Source voice refs complete: {manifest.artifacts.get('source_voice_refs')}")
+
+
 @app.command()
 def rvc(
     project: Path = typer.Option(..., "--project", "-p"),
@@ -1026,6 +1139,12 @@ def train_gsv(
 def source_speakers(
     project: Path = typer.Option(..., "--project", "-p"),
     backend: str = typer.Option("pyannote", "--backend", help="pyannote|mock"),
+    jobs: int = typer.Option(
+        4,
+        "--jobs",
+        min=1,
+        help="Parallel track diarization workers for folder inputs. Use 1 to disable parallel part diarization.",
+    ),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
 ) -> None:
     """Assign project-local speaker IDs from source diarization."""
@@ -1034,6 +1153,7 @@ def source_speakers(
             project.expanduser().resolve(),
             backend_kind=backend,
             confirm_rights=confirm_rights,
+            jobs=jobs,
         )
     except RightsError as exc:
         _handle_error(exc)

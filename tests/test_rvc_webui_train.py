@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +138,28 @@ def test_cache_manifest_match_and_complete_outputs(tmp_path: Path) -> None:
     assert webui_train._feature_outputs_complete(exp_dir, "v2") is True
 
 
+def test_write_filelist_creates_missing_mute_training_assets(tmp_path: Path) -> None:
+    rvc_root = tmp_path / "rvc"
+    exp_dir = rvc_root / "logs" / "speaker"
+    _write_preprocess_outputs(exp_dir, ("seg_0001",))
+    _write_f0_outputs(exp_dir)
+    _write_feature_outputs(exp_dir, "v2")
+
+    webui_train._write_filelist(rvc_root, exp_dir, "48k", "v2", if_f0=True)
+
+    mute_root = rvc_root / "logs" / "mute"
+    mute_wav = mute_root / "0_gt_wavs" / "mute48k.wav"
+    with wave.open(str(mute_wav), "rb") as wav:
+        assert wav.getframerate() == 48_000
+        assert wav.getnchannels() == 1
+        assert wav.getnframes() > 0
+    assert np.load(mute_root / "3_feature768" / "mute.npy").shape[1] == 768
+    assert np.load(mute_root / "2a_f0" / "mute.wav.npy").ndim == 1
+    assert np.load(mute_root / "2b-f0nsf" / "mute.wav.npy").ndim == 1
+    filelist = (exp_dir / "filelist.txt").read_text("utf-8")
+    assert str(mute_wav) in filelist
+
+
 def test_train_index_caps_large_feature_sets(monkeypatch, tmp_path: Path) -> None:
     exp_dir = tmp_path / "logs" / "speaker"
     feature_dir = exp_dir / "3_feature768"
@@ -186,7 +209,7 @@ def test_main_partitions_f0_and_feature_workers(monkeypatch, tmp_path: Path) -> 
     dataset.mkdir()
     (dataset / "seg_0001.wav").write_bytes(b"wav")
     (rvc_root / "configs" / "v2").mkdir(parents=True)
-    (rvc_root / "configs" / "v2" / "48k.json").write_text("{}", "utf-8")
+    (rvc_root / "configs" / "v2" / "40k.json").write_text("{}", "utf-8")
     exported.write_bytes(b"model")
 
     run_parallel_commands: list[list[list[str]]] = []
@@ -248,5 +271,5 @@ def test_main_partitions_f0_and_feature_workers(monkeypatch, tmp_path: Path) -> 
     assert [[command[2], command[3]] for command in run_parallel_commands[0]] == [["3", "0"], ["3", "1"], ["3", "2"]]
     assert [[command[3], command[4]] for command in run_parallel_commands[1]] == [["2", "0"], ["2", "1"]]
     assert "-se" in train_commands[0]
-    assert train_commands[0][train_commands[0].index("-se") + 1] == "50"
+    assert train_commands[0][train_commands[0].index("-se") + 1] == "5"
     assert output_model.read_bytes() == b"model"

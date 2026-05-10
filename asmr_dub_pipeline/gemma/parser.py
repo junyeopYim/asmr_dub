@@ -29,7 +29,8 @@ def _candidate_texts(payload: Mapping[str, Any]) -> Iterable[str]:
 def parse_gemma_task_response(task: TaskName, raw: Any) -> dict[str, Any]:
     """Parse and validate a Gemma task response against the task schema."""
     if isinstance(raw, str):
-        payload = loads_json_dict(raw, required_keys=TASK_REQUIRED_KEYS[task])
+        required_keys = None if task == "audio_style" else TASK_REQUIRED_KEYS[task]
+        payload = loads_json_dict(raw, required_keys=required_keys)
         try:
             return validate_gemma_task_response(task, payload)
         except ValidationError as exc:

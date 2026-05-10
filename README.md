@@ -409,4 +409,11 @@ The mixer uses `mix_loudness_strategy: peak_guard_only` with `mix_peak_limit_dbf
 pytest -q
 ```
 
-Tests use mock backends and tiny generated WAV files. They do not require real Gemma, GPT-SoVITS, RVC, GPU, model downloads, or network access.
+The default test suite skips bulky historical regressions and real-model smoke checks. Tests use mock backends and tiny generated WAV files, and do not require real Gemma, GPT-SoVITS, RVC, GPU, model downloads, or network access.
+
+Run the heavier suites explicitly when changing nearby behavior:
+
+```bash
+pytest -q -m regression
+pytest -q -m real_model
+```

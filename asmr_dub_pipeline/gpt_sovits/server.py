@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -49,6 +50,12 @@ GSV_SERVER_REQUIRED_MODULES = (
     "opencc",
     "wordsegment",
     "x_transformers",
+)
+GSV_KOREAN_PREFIX_GUARD = 'lang not in {"all_ko", "ko", "kr", "korean"}'
+GSV_TEXT_PREPROCESSOR_PREFIX_RE = re.compile(
+    r"^(?P<indent>[ \t]*)if text\[0\] not in splits and len\(get_first\(text\)\) < 4:\n"
+    r"(?P<body_indent>[ \t]*)text = \"。\" \+ text if lang != \"en\" else \"\.\"",
+    re.MULTILINE,
 )
 
 
@@ -217,6 +224,39 @@ def _infer_gsv_cwd(command: Sequence[str]) -> Path | None:
     return None
 
 
+def _gsv_install_dir(command: Sequence[str], cwd: Path | None) -> Path | None:
+    return _infer_gsv_cwd(command) or cwd
+
+
+def _patch_gsv_korean_text_preprocessor(install_dir: Path | None) -> bool:
+    if install_dir is None:
+        return False
+    path = install_dir / "GPT_SoVITS" / "TTS_infer_pack" / "TextPreprocessor.py"
+    if not path.exists():
+        return False
+    text = path.read_text("utf-8")
+    if GSV_KOREAN_PREFIX_GUARD in text:
+        return False
+    match = GSV_TEXT_PREPROCESSOR_PREFIX_RE.search(text)
+    if match is None:
+        if "len(get_first(text)) < 4" in text and 'text = "。"' in text:
+            raise GPTSoVITSError(
+                "GPT-SoVITS TextPreprocessor short-prefix heuristic changed; "
+                f"cannot apply Korean guard automatically: {path}"
+            )
+        return False
+    replacement = (
+        f"{match.group('indent')}if {GSV_KOREAN_PREFIX_GUARD} "
+        "and text[0] not in splits and len(get_first(text)) < 4:\n"
+        f"{match.group('body_indent')}text = \"。\" + text if lang != \"en\" else \".\""
+    )
+    path.write_text(
+        text[: match.start()] + replacement + text[match.end() :],
+        "utf-8",
+    )
+    return True
+
+
 def _normalize_command(command: Sequence[str] | str | None, base_url: str) -> list[str]:
     host, port = _host_port(base_url)
 
@@ -346,6 +386,7 @@ class ManagedGPTSoVITSServer:
     def start(self) -> ManagedGPTSoVITSServer:
         if not self.enabled:
             return self
+        _patch_gsv_korean_text_preprocessor(_gsv_install_dir(self.command, self.cwd))
         if is_http_ready(self.base_url):
             self.reused_existing = True
             return self

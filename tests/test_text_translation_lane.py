@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging as py_logging
 from collections import Counter
 from pathlib import Path
+from threading import Event, Lock
 
 import httpx
 import numpy as np
@@ -11,18 +13,20 @@ import pytest
 
 from asmr_dub_pipeline import cli as cli_module
 from asmr_dub_pipeline import orchestrator
-from asmr_dub_pipeline.asr.base import ASRChunk, map_chunks_to_segments
+from asmr_dub_pipeline.asr.base import ASRChunk, ASRWord, map_chunks_to_segments
 from asmr_dub_pipeline.audio.features import duration_sec, write_audio
 from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.gemma.text_translate import (
     LlamaServerTranslationClient,
+    build_translate_ko_prompt,
     parse_asr_review_response,
     parse_translation_response,
 )
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
 from asmr_dub_pipeline.pipeline.steps import (
+    audio_style_step,
     extract_step,
     korean_script_step,
     prepare_source_voice_refs_step,
@@ -38,14 +42,24 @@ from asmr_dub_pipeline.schemas import (
     QCMetadata,
     RVCMetadata,
     Segment,
+    SourceInfo,
     SourceScript,
     TTSCandidate,
     TTSMetadata,
+)
+from asmr_dub_pipeline.script.countdown import source_countdown_values
+from asmr_dub_pipeline.script.duration_rewrite import (
+    estimate_tts_duration,
+    japanese_pronunciation_count,
+    korean_tts_speech_char_count,
+    korean_tts_timing_budget,
 )
 from asmr_dub_pipeline.script.korean_colloquial import (
     COLLOQUIAL_REWRITE_NOTE,
     colloquialize_korean_text,
 )
+
+pytestmark = pytest.mark.regression
 
 
 def sample_segment(
@@ -131,6 +145,371 @@ def test_asr_resegment_groups_short_adjacent_chunks_for_tts(tmp_project_dir: Pat
     assert segments[0].source_script.text == "お疲れ様でした 初めまして"
     assert segments[1].source_script is not None
     assert segments[1].source_script.text == "ゆっくり聞いてください"
+
+
+def test_asr_resegment_absorbs_trailing_micro_group_for_tts(tmp_project_dir: Path) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(
+                start=0.0,
+                end=3.2,
+                text="すっごく濡れて やらしい音しちゃってる",
+                language="ja",
+                confidence=0.95,
+            ),
+            ASRChunk(
+                start=3.25,
+                end=3.45,
+                text="でも、こんなにゴリゴリになっちゃってるし",
+                language="ja",
+                confidence=0.89,
+            ),
+            ASRChunk(start=5.0, end=7.4, text="待ってー", language="ja", confidence=0.9),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=8.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+    )
+
+    assert [segment.duration for segment in segments] == [3.45, 2.4]
+    assert segments[0].source_script is not None
+    assert segments[0].source_script.text == (
+        "すっごく濡れて やらしい音しちゃってる "
+        "でも、こんなにゴリゴリになっちゃってるし"
+    )
+
+
+def test_asr_resegment_absorbs_nearby_micro_group_beyond_normal_gap(
+    tmp_project_dir: Path,
+) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(start=0.0, end=3.2, text="ちゃんと聞いて", language="ja", confidence=0.95),
+            ASRChunk(start=4.45, end=4.87, text="いい?", language="ja", confidence=0.96),
+            ASRChunk(start=6.08, end=9.0, text="準備していくからね", language="ja", confidence=0.9),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=10.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+    )
+
+    assert [segment.duration for segment in segments] == [3.2, 4.55]
+    assert segments[1].source_script is not None
+    assert segments[1].source_script.text == "いい? 準備していくからね"
+
+
+def test_asr_sparse_edge_speech_moves_to_neighbor_and_silence_becomes_texture(
+    tmp_project_dir: Path,
+) -> None:
+    sr = 16_000
+    tone = np.full(int(sr * 0.45), 0.08, dtype=np.float32)
+    silence = np.zeros(int(sr * 11.55), dtype=np.float32)
+    sparse_clip = tmp_project_dir / "seg_0002_gemma.wav"
+    write_audio(sparse_clip, np.concatenate([tone, silence])[:, None], sr)
+    previous_clip = tmp_project_dir / "seg_0001_gemma.wav"
+    write_audio(previous_clip, np.full((int(sr * 2.0), 1), 0.08, dtype=np.float32), sr)
+    project_audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    segments = [
+        Segment(
+            id="seg_0001",
+            start=0.0,
+            end=2.0,
+            duration=2.0,
+            audio_for_gemma=str(previous_clip),
+            audio_for_mix=str(previous_clip),
+            source_script=SourceScript(
+                text="前の言葉",
+                language="ja",
+                backend="faster_whisper",
+                start=0.0,
+                end=2.0,
+                confidence=0.95,
+            ),
+        ),
+        Segment(
+            id="seg_0002",
+            start=2.2,
+            end=14.2,
+            duration=12.0,
+            audio_for_gemma=str(sparse_clip),
+            audio_for_mix=str(sparse_clip),
+            source_script=SourceScript(
+                text="鉛筆 バス",
+                language="ja",
+                backend="faster_whisper",
+                start=2.2,
+                end=14.2,
+                confidence=0.95,
+            ),
+        ),
+    ]
+
+    split = pipeline_steps._split_sparse_edge_segments_by_audio(
+        segments,
+        project_dir=tmp_project_dir,
+        cfg=ProjectConfig(),
+        merge_gap_sec=0.5,
+    )
+
+    assert [segment.id for segment in split] == ["seg_0001", "seg_0002"]
+    assert split[0].source_script is not None
+    assert split[0].source_script.text == "前の言葉 鉛筆 バス"
+    assert split[0].end == pytest.approx(2.95, abs=0.08)
+    assert split[1].status == "non_speech_texture"
+    assert split[1].source_script is not None
+    assert split[1].source_script.text == "…"
+    assert split[1].start == pytest.approx(split[0].end)
+    assert split[1].end == pytest.approx(14.2)
+    assert split[1].audio_for_gemma == str(project_audio_dir / "seg_0002_gemma.wav")
+
+
+def test_asr_resegment_preserves_countdown_wall_clock_span(tmp_project_dir: Path) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(
+                start=863.298,
+                end=864.338,
+                text="4 3",
+                language="ja",
+                confidence=0.8,
+                words=[
+                    ASRWord(start=863.298, end=863.798, text="4", confidence=0.9),
+                    ASRWord(start=863.9, end=864.338, text="3", confidence=0.88),
+                ],
+            ),
+            ASRChunk(
+                start=865.615,
+                end=866.655,
+                text="2 1",
+                language="ja",
+                confidence=0.8,
+                words=[
+                    ASRWord(start=865.615, end=866.08, text="2", confidence=0.91),
+                    ASRWord(start=866.17, end=866.655, text="1", confidence=0.87),
+                ],
+            ),
+            ASRChunk(
+                start=868.606,
+                end=869.128,
+                text="0",
+                language="ja",
+                confidence=0.8,
+                words=[ASRWord(start=868.606, end=869.128, text="0", confidence=0.92)],
+            ),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=900.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        countdown_merge_enabled=True,
+        countdown_merge_gap_sec=2.5,
+        countdown_merge_max_span_sec=14.0,
+    )
+
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.start == pytest.approx(863.298)
+    assert segment.end == pytest.approx(869.128)
+    assert segment.duration == pytest.approx(5.83)
+    assert segment.source_script is not None
+    assert segment.source_script.text == "4 3 2 1 0"
+    assert segment.analysis["countdown_event"]["values"] == [4, 3, 2, 1, 0]
+    assert segment.analysis["countdown_event"]["source_chunk_texts"] == ["4 3", "2 1", "0"]
+    assert segment.analysis["countdown_event"]["token_timeline"] == [
+        {
+            "value": 4,
+            "source_text": "4",
+            "korean_token": "넷",
+            "start": 863.298,
+            "end": 863.798,
+            "confidence": 0.9,
+        },
+        {
+            "value": 3,
+            "source_text": "3",
+            "korean_token": "셋",
+            "start": 863.9,
+            "end": 864.338,
+            "confidence": 0.88,
+        },
+        {
+            "value": 2,
+            "source_text": "2",
+            "korean_token": "둘",
+            "start": 865.615,
+            "end": 866.08,
+            "confidence": 0.91,
+        },
+        {
+            "value": 1,
+            "source_text": "1",
+            "korean_token": "하나",
+            "start": 866.17,
+            "end": 866.655,
+            "confidence": 0.87,
+        },
+        {
+            "value": 0,
+            "source_text": "0",
+            "korean_token": "영",
+            "start": 868.606,
+            "end": 869.128,
+            "confidence": 0.92,
+        },
+    ]
+
+
+def test_source_countdown_values_accepts_spoken_japanese_number_readings() -> None:
+    assert source_countdown_values("じゅうさん なな ろく ゼロ") == [13, 7, 6, 0]
+    assert source_countdown_values("ジュウイチ ナナ ロク") == [11, 7, 6]
+
+
+def test_asr_resegment_derives_countdown_timeline_from_chunk_spans_when_words_missing(
+    tmp_project_dir: Path,
+) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(start=863.298, end=864.338, text="4 3", language="ja", confidence=0.8),
+            ASRChunk(start=865.615, end=866.655, text="2 1", language="ja", confidence=0.8),
+            ASRChunk(start=868.606, end=869.128, text="0", language="ja", confidence=0.8),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=900.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        countdown_merge_enabled=True,
+        countdown_merge_gap_sec=2.5,
+        countdown_merge_max_span_sec=14.0,
+    )
+
+    timeline = segments[0].analysis["countdown_event"]["token_timeline"]
+    assert [item["value"] for item in timeline] == [4, 3, 2, 1, 0]
+    assert [item["korean_token"] for item in timeline] == ["넷", "셋", "둘", "하나", "영"]
+    assert [item["start"] for item in timeline] == pytest.approx(
+        [863.298, 863.818, 865.615, 866.135, 868.606],
+        abs=0.001,
+    )
+    assert [item["end"] for item in timeline] == pytest.approx(
+        [863.818, 864.338, 866.135, 866.655, 869.128],
+        abs=0.001,
+    )
+
+
+def test_asr_resegment_marks_embedded_countdown_with_equal_slot_timeline(
+    tmp_project_dir: Path,
+) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(
+                start=1293.84,
+                end=1308.67,
+                text="じゃあ5 4 3 2 1 ゼロ スーッと",
+                language="ja",
+                confidence=0.98,
+            ),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=1400.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        countdown_merge_enabled=True,
+        countdown_merge_gap_sec=2.5,
+        countdown_merge_max_span_sec=20.0,
+    )
+
+    event = segments[0].analysis["countdown_event"]
+    timeline = event["token_timeline"]
+    assert event["values"] == [5, 4, 3, 2, 1, 0]
+    assert event["source_chunk_texts"] == ["じゃあ5 4 3 2 1 ゼロ スーッと"]
+    assert [item["value"] for item in timeline] == [5, 4, 3, 2, 1, 0]
+    assert [item["source_text"] for item in timeline] == ["5", "4", "3", "2", "1", "ゼロ"]
+    assert timeline[0]["start"] == pytest.approx(1293.84, abs=0.001)
+    assert timeline[-1]["end"] == pytest.approx(1308.67, abs=0.001)
+
+
+def test_asr_resegment_tightens_sparse_chunk_timing_from_word_spans(
+    tmp_project_dir: Path,
+) -> None:
+    segments = pipeline_steps._segments_from_asr_chunks(
+        [
+            ASRChunk(
+                start=220.0,
+                end=235.0,
+                text="今の姿勢のまま",
+                language="ja",
+                confidence=0.97,
+                words=[
+                    ASRWord(start=226.2, end=226.7, text="今の", confidence=0.96),
+                    ASRWord(start=226.8, end=227.4, text="姿勢", confidence=0.96),
+                    ASRWord(start=227.5, end=228.0, text="のまま", confidence=0.96),
+                ],
+            ),
+        ],
+        project_dir=tmp_project_dir,
+        backend="faster_whisper",
+        fallback_language="ja",
+        audio_duration_sec=300.0,
+        min_segment_sec=3.0,
+        merge_gap_sec=1.0,
+        max_segment_sec=14.0,
+        sparse_chunk_max_sec=30.0,
+        sparse_chunk_min_chars_per_sec=1.0,
+    )
+
+    assert len(segments) == 1
+    assert segments[0].start == pytest.approx(225.8, abs=0.001)
+    assert segments[0].end == pytest.approx(228.4, abs=0.001)
+    assert segments[0].source_script is not None
+    assert segments[0].source_script.start == pytest.approx(225.8, abs=0.001)
+    assert segments[0].source_script.end == pytest.approx(228.4, abs=0.001)
+
+
+def test_segment_stage_records_countdown_timeline_summary(tmp_project_dir: Path) -> None:
+    cfg = ProjectConfig(project_name="test")
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    segment = sample_segment("seg_0001", start=0.0, end=3.0)
+    segment.status = "transcribed"
+    segment.source_script = SourceScript(
+        text="3 2 1",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=3.0,
+    )
+    segment.analysis["countdown_event"] = {
+        "kind": "descending_countdown",
+        "values": [3, 2, 1],
+        "korean_text": "셋, 둘, 하나",
+        "korean_tokens": ["셋", "둘", "하나"],
+        "preserve_wall_clock_span": True,
+    }
+    manifest = PipelineManifest(project_config=cfg, segments=[segment])
+    manifest.stage_state["transcribe"] = {
+        "status": "completed",
+        "asr_word_timestamps": True,
+    }
+    save_manifest(tmp_project_dir, manifest)
+
+    finalized = segment_step(tmp_project_dir, confirm_rights=True)
+
+    segment_state = finalized.stage_state["segment"]
+    assert segment_state["countdown_event_count"] == 1
+    assert segment_state["countdown_token_timeline_count"] == 0
+    assert segment_state["countdown_token_timeline_missing"] == 1
+    assert segment_state["countdown_token_timeline_missing_ids"] == ["seg_0001"]
+    assert any("countdown token timeline missing" in warning for warning in finalized.warnings)
 
 
 def test_asr_resegment_drops_sparse_hallucinated_long_chunks(tmp_project_dir: Path) -> None:
@@ -255,6 +634,102 @@ def test_transcribe_marks_empty_real_asr_as_no_speech(
     assert summary["no_speech_detected"] == 1
     assert summary["needs_manual_review"] == 0
     assert manifest.stage_state["transcribe"]["no_speech_detected"] == 1
+
+
+def test_transcribe_marks_vocal_texture_as_non_speech(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    manifest = load_manifest(tmp_project_dir)
+    manifest.artifacts["source_vocals_mono_16k"] = manifest.artifacts["gemma_mono_16k"]
+    manifest.artifacts["source_vocals_48k"] = manifest.artifacts["original_stereo_48k"]
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=True,
+            asr_review_enabled=True,
+            source_separation_backend="none",
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class TextureASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=3.0,
+                    text="ぃぃぃぃ",
+                    language="ja",
+                    confidence=0.98,
+                )
+            ]
+
+        def transcribe_with_options(
+            self,
+            _audio_path: Path,
+            _segments: list[Segment],
+            **_kwargs: object,
+        ) -> list[ASRChunk]:
+            raise AssertionError("non-speech texture should not consume repair/review candidates")
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: TextureASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper")
+
+    segment = manifest.segments[0]
+    assert segment.status == "non_speech_texture"
+    assert segment.keep_original_texture is True
+    assert segment.errors == ["asr_non_speech_texture"]
+    assert segment.analysis["asr_quality_gate"] == {
+        "decision": "texture",
+        "reasons": ["asr_non_speech_texture"],
+        "tts_blocked": True,
+    }
+    rows = [
+        json.loads(line)
+        for line in Path(manifest.artifacts["source_segments"]).read_text("utf-8").splitlines()
+    ]
+    assert rows[0]["status"] == "non_speech_texture"
+    summary = json.loads(Path(manifest.artifacts["asr_diagnostics_summary"]).read_text("utf-8"))
+    assert summary["non_speech_texture"] == 1
+    assert summary["no_speech_detected"] == 1
+    assert summary["needs_manual_review"] == 0
+
+
+def test_sparse_single_character_source_script_is_texture_not_manual_review() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="声",
+        language="ja",
+        backend="faster_whisper",
+        start=120.0,
+        end=133.0,
+        confidence=0.98,
+    )
+
+    assert pipeline_steps._source_script_non_speech_texture_reason(source_script) == "asr_non_speech_texture"
+    assert pipeline_steps._source_script_asr_review_reasons(source_script, cfg) == []
+
+
+def test_countdown_words_are_not_treated_as_texture() -> None:
+    source_script = SourceScript(
+        text="ゼロ",
+        language="ja",
+        backend="faster_whisper",
+        start=120.0,
+        end=133.0,
+        confidence=0.98,
+    )
+
+    assert pipeline_steps._source_script_non_speech_texture_reason(source_script) is None
 
 
 def test_transcribe_records_asr_quality_gate_for_suspicious_text(
@@ -492,6 +967,90 @@ def test_transcribe_asr_audio_review_passes_clip_to_client(
     assert summary["items"][0]["audio_clip"]["path"] == str(review_calls[0][1])
 
 
+def test_asr_audio_review_continues_after_invalid_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(
+        project_name=tmp_project_dir.name,
+        asr_review_enabled=True,
+        asr_review_backend="llama_server_audio",
+        asr_review_audio_padding_sec=0.05,
+        gemma_text_server_auto_start=False,
+    )
+    chunks = [
+        ASRChunk(
+            start=0.0,
+            end=0.4,
+            text="もっと大きな手帳が来る",
+            language="ja",
+            confidence=0.99,
+        ),
+        ASRChunk(
+            start=0.5,
+            end=0.9,
+            text="もっと大きな手帳が来る",
+            language="ja",
+            confidence=0.99,
+        ),
+    ]
+    review_calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def review_asr_candidates_with_audio(
+            self,
+            items: list[dict[str, object]],
+            batch_id: str,
+            audio_path: Path,
+        ) -> dict[str, dict[str, object]]:
+            assert audio_path.exists()
+            chunk_id = str(items[0]["chunk_id"])
+            review_calls.append(chunk_id)
+            if chunk_id == "chunk_0001":
+                raise RuntimeError(
+                    "Gemma ASR audio review failed: "
+                    "chunk_0001: decision manual_review requires selected_candidate_id original"
+                )
+            return {
+                chunk_id: {
+                    "chunk_id": chunk_id,
+                    "decision": "replace",
+                    "selected_candidate_id": "domain_replacement",
+                    "confidence": 0.99,
+                    "reason": "audio supports 絶頂.",
+                    "risk_terms": ["手帳"],
+                }
+            }
+
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    reviewed_chunks, summary = pipeline_steps._review_asr_chunks_with_model(
+        chunks,
+        backend=object(),
+        project_dir=tmp_project_dir,
+        review_audio_path=tiny_wav_path,
+        audio_duration_sec=1.0,
+        cfg=cfg,
+    )
+
+    assert review_calls == ["chunk_0001", "chunk_0002"]
+    assert summary["attempted"] == 2
+    assert summary["failed"] == 1
+    assert summary["manual_review"] == 1
+    assert summary["replaced"] == 1
+    assert "1 ASR review item(s) failed" in summary["error"]
+    assert summary["items"][0]["decision"] == "manual_review"
+    assert summary["items"][0]["selected_candidate_id"] == "original"
+    assert summary["items"][0]["accepted"] is False
+    assert "decision manual_review requires selected_candidate_id original" in summary["items"][0]["reason"]
+    assert reviewed_chunks[0].text == "もっと大きな手帳が来る"
+    assert reviewed_chunks[1].text == "もっと大きな絶頂が来る"
+
+
 def test_asr_review_generates_retranscribe_candidates(
     tiny_wav_path: Path,
     tmp_project_dir: Path,
@@ -554,6 +1113,60 @@ def test_asr_prompt_leak_filter_rejects_video_outro_text() -> None:
     )
 
     assert leaked is True
+
+
+def test_asr_prompt_leak_filter_rejects_prompt_term_list() -> None:
+    cfg = ProjectConfig(
+        project_name="test-project",
+        asr_initial_prompt=(
+            "Japanese ASMR domain terms: 快感 快感蓄積 快感増幅 快感の波 "
+            "気持ちいい レーザー 子宮 悪夢ノイド"
+        ),
+    )
+
+    assert (
+        pipeline_steps._asr_candidate_looks_prompt_leaked(
+            "気持ちいい レーザー 子宮 悪夢ノイド",
+            cfg,
+        )
+        is True
+    )
+    assert (
+        pipeline_steps._asr_candidate_looks_prompt_leaked(
+            "すごく気持ちいいね 体がぽかぽかしてきた",
+            cfg,
+        )
+        is False
+    )
+
+
+def test_asr_prompt_leak_filter_rejects_qwen_context_text() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    text = cfg.asr.correction_profile.qwen_context
+
+    assert pipeline_steps._asr_candidate_looks_prompt_leaked(text, cfg) is True
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text=text,
+            language="ja",
+            backend="qwen_asr",
+            start=1370.915,
+            end=1384.353,
+        ),
+        cfg,
+    ) == ["asr_prompt_or_hallucination_leak"]
+
+
+def test_asr_prompt_leak_filter_rejects_compacted_qwen_context_fragment() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+
+    assert (
+        pipeline_steps._asr_candidate_looks_prompt_leaked(
+            "Japanesewhisperingdialogueintimateadultoverdomainassumptions",
+            cfg,
+        )
+        is True
+    )
 
 
 def test_asr_prompt_leak_filter_allows_dialogue_thanks_followed_by_story_text() -> None:
@@ -995,6 +1608,83 @@ def test_asr_repair_replaces_suspicious_chunk_with_no_vad_candidate(
     assert backend.calls[0][1]["hotwords"] is None
 
 
+def test_asr_repair_uses_plain_transcribe_backend_when_option_overrides_are_unavailable(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((16_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+    sliced_paths: list[Path] = []
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        assert input_path == repair_audio
+        assert start == pytest.approx(9.0)
+        assert end == pytest.approx(16.0)
+        assert sample_rate == 16_000
+        assert channels == 1
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        sliced_paths.append(output_path)
+        return output_path
+
+    class PlainBackend:
+        name = "qwen_asr"
+
+        def __init__(self) -> None:
+            self.calls: list[Path] = []
+
+        def transcribe(self, audio_path: Path, segments: list[Segment]) -> list[ASRChunk]:
+            self.calls.append(audio_path)
+            assert segments == []
+            return [
+                ASRChunk(
+                    start=1.0,
+                    end=5.0,
+                    text="ゾクゾクしますね",
+                    language="ja",
+                    confidence=None,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    backend = PlainBackend()
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [
+            ASRChunk(
+                start=10.0,
+                end=15.0,
+                text="付属しますね",
+                language="ja",
+                confidence=0.83,
+            )
+        ],
+        backend=backend,
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=30.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+    )
+
+    assert summary["attempted"] == 1
+    assert summary["skipped"] == 0
+    assert summary["repaired"] == 1
+    assert summary["items"][0]["accepted_candidate_id"] == "plain_transcribe"
+    assert repaired[0].text == "ゾクゾクしますね"
+    assert repaired[0].start == pytest.approx(10.0)
+    assert repaired[0].end == pytest.approx(14.0)
+    assert sliced_paths
+    assert len(backend.calls) == 1
+
+
 def test_asr_repair_tries_next_candidate_when_first_candidate_prompt_leaks(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1075,6 +1765,263 @@ def test_asr_repair_tries_next_candidate_when_first_candidate_prompt_leaks(
     assert repaired[0].text == "ゾクゾクしますね"
 
 
+def test_asr_repair_skips_qwen_fallback_when_local_candidate_is_accepted(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((24_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, start, end, sample_rate, channels
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class FakeBackend:
+        name = "faster_whisper"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments, kwargs
+            self.calls += 1
+            return [
+                ASRChunk(
+                    start=1.0,
+                    end=2.0,
+                    text="ゾクゾクしますね",
+                    language="ja",
+                    confidence=0.89,
+                )
+            ]
+
+    class FakeQwenFallback:
+        name = "qwen_asr"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe(self, audio_path: Path, segments: list[Segment]) -> list[ASRChunk]:
+            _ = audio_path, segments
+            self.calls += 1
+            return [
+                ASRChunk(
+                    start=1.0,
+                    end=2.0,
+                    text="ゾクゾクして止まりません",
+                    language="ja",
+                    confidence=None,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    backend = FakeBackend()
+    qwen_fallback = FakeQwenFallback()
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [
+            ASRChunk(
+                start=4.0,
+                end=5.0,
+                text="付属しますね",
+                language="ja",
+                confidence=0.90,
+            )
+        ],
+        backend=backend,
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=8.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+        qwen_fallback_backend=qwen_fallback,
+    )
+
+    assert qwen_fallback.calls == 0
+    assert summary["items"][0]["accepted_candidate_id"] == "no_vad_clean"
+    assert repaired[0].text == "ゾクゾクしますね"
+
+
+def test_asr_repair_rejects_qwen_fallback_that_remains_suspicious(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((24_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, start, end, sample_rate, channels
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class EmptyLocalBackend:
+        name = "faster_whisper"
+
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments, kwargs
+            return []
+
+    class SuspiciousQwenFallback:
+        name = "qwen_asr"
+
+        def transcribe(self, audio_path: Path, segments: list[Segment]) -> list[ASRChunk]:
+            _ = audio_path, segments
+            return [
+                ASRChunk(
+                    start=1.0,
+                    end=4.0,
+                    text="悪夢し続けます",
+                    language="ja",
+                    confidence=None,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    original = ASRChunk(start=4.0, end=8.0, text="悪夢していいですよ", language="ja", confidence=0.82)
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [original],
+        backend=EmptyLocalBackend(),
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=12.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+        qwen_fallback_backend=SuspiciousQwenFallback(),
+    )
+
+    assert repaired == [original]
+    assert summary["repaired"] == 0
+    assert summary["items"][0]["accepted"] is False
+    assert summary["items"][0]["attempts"][-1]["candidate_id"] == "qwen_asr_fallback"
+    assert summary["items"][0]["attempts"][-1]["reason"] == "qwen_fallback_still_suspicious"
+
+
+def test_asr_repair_rejects_local_candidate_that_still_needs_review(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_audio = tmp_project_dir / "work" / "audio" / "gemma_mono_16k.wav"
+    samples = np.zeros((24_000, 1), dtype=np.float32)
+    write_audio(repair_audio, samples, 16_000)
+
+    def fake_slice_audio(
+        input_path: Path,
+        start: float,
+        end: float,
+        output_path: Path,
+        *,
+        sample_rate: int | None = None,
+        channels: int | None = None,
+    ) -> Path:
+        _ = input_path, start, end, sample_rate, channels
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"repair clip")
+        return output_path
+
+    class SuspiciousLocalBackend:
+        name = "faster_whisper"
+
+        def transcribe_with_options(
+            self,
+            audio_path: Path,
+            segments: list[Segment],
+            **kwargs: object,
+        ) -> list[ASRChunk]:
+            _ = audio_path, segments, kwargs
+            return [
+                ASRChunk(
+                    start=1.0,
+                    end=4.0,
+                    text="悪夢し続けます",
+                    language="ja",
+                    confidence=0.95,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps.ffmpeg, "slice_audio", fake_slice_audio)
+    original = ASRChunk(start=4.0, end=8.0, text="悪夢していいですよ", language="ja", confidence=0.82)
+    repaired, summary = pipeline_steps._repair_asr_chunks(
+        [original],
+        backend=SuspiciousLocalBackend(),
+        project_dir=tmp_project_dir,
+        repair_audio_path=repair_audio,
+        audio_duration_sec=12.0,
+        cfg=ProjectConfig(project_name=tmp_project_dir.name),
+    )
+
+    assert repaired == [original]
+    assert summary["repaired"] == 0
+    assert summary["items"][0]["accepted"] is False
+    assert summary["items"][0]["attempts"][0]["reason"] == (
+        "candidate_review_blocked:asr_suspicious_pattern:悪夢し"
+    )
+
+
+def test_asr_review_rejects_selected_candidate_that_still_needs_review(tmp_project_dir: Path) -> None:
+    cfg = ProjectConfig(
+        project_name=tmp_project_dir.name,
+        asr_review_enabled=True,
+        asr_review_backend="mock",
+        asr_review_generate_candidates=False,
+        asr_review_suspicious_text_patterns=["もちなとい", "悪夢し"],
+        asr_review_candidate_replacements={"もちなとい": "悪夢し続けます"},
+    )
+    chunks = [
+        ASRChunk(
+            start=0.0,
+            end=4.0,
+            text="もちなとい",
+            language="ja",
+            confidence=0.96,
+        )
+    ]
+
+    reviewed, summary = pipeline_steps._review_asr_chunks_with_model(
+        chunks,
+        backend=object(),
+        project_dir=tmp_project_dir,
+        review_audio_path=tmp_project_dir / "missing.wav",
+        audio_duration_sec=5.0,
+        cfg=cfg,
+    )
+
+    assert reviewed[0].text == "もちなとい"
+    assert summary["replaced"] == 0
+    assert summary["manual_review"] == 1
+    assert summary["items"][0]["accepted"] is False
+    assert summary["items"][0]["blocked_review_reasons"] == [
+        "asr_suspicious_pattern:悪夢し"
+    ]
+
+
 def test_asr_repair_splits_long_suspicious_group_before_retranscribe(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1144,6 +2091,28 @@ def test_asr_repair_splits_long_suspicious_group_before_retranscribe(
     assert summary["attempted"] == 4
     assert len(slices) == 4
     assert all(end - start <= cfg.asr_resegment_max_sec + cfg.asr_repair_padding_sec * 2 for start, end in slices)
+
+
+def test_asr_repair_splits_very_long_sparse_chunk_with_short_text() -> None:
+    chunk = ASRChunk(
+        start=100.0,
+        end=940.0,
+        text="ほら見て ほら見てってば",
+        language="ja",
+        confidence=0.97,
+    )
+
+    repair_chunks = pipeline_steps._split_asr_chunks_for_repair(
+        [chunk],
+        audio_duration_sec=1000.0,
+        max_chunk_sec=20.0,
+    )
+
+    assert len(repair_chunks) > 1
+    assert repair_chunks[0].start == pytest.approx(100.0)
+    assert repair_chunks[-1].end == pytest.approx(940.0)
+    assert " ".join(part.text for part in repair_chunks).replace(" ", "") == chunk.text.replace(" ", "")
+    assert max(part.end - part.start for part in repair_chunks) < chunk.end - chunk.start
 
 
 def test_asr_repair_rejects_prompt_leaked_candidate(
@@ -1262,6 +2231,209 @@ def test_asr_repair_rejects_generic_hallucination_candidate(
     assert repaired == [original]
 
 
+def test_asr_repair_rejects_degenerate_repetition_candidate() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    original = ASRChunk(start=10.0, end=23.0, text="アクメの全", language="ja", confidence=0.86)
+    candidate = ASRChunk(
+        start=10.0,
+        end=10.6,
+        text="ビ" + "ー" * 120,
+        language="ja",
+        confidence=0.99,
+    )
+
+    accepted, _score, reason = pipeline_steps._asr_repair_candidate_score(
+        original,
+        [candidate],
+        cfg=cfg,
+        prompt_leaked=False,
+    )
+
+    assert accepted is False
+    assert reason == "degenerate_repetition"
+
+
+def test_asr_repair_rejects_numeric_runaway_candidate() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    original = ASRChunk(
+        start=8249.82,
+        end=8263.58,
+        text="27、28、29、30、31、32、33、34、35、36、37、38、39、40、41、42、43、44、45、46、47、48、49、50",
+        language="ja",
+        confidence=0.90,
+    )
+    candidate = ASRChunk(
+        start=8249.82,
+        end=8263.58,
+        text="15,14,13,14,15,16,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,56,57,58,59,60,61,62,62,63,63,64,67,68,79,80,81,81,82,82",
+        language="ja",
+        confidence=0.96,
+    )
+
+    accepted, _score, reason = pipeline_steps._asr_repair_candidate_score(
+        original,
+        [candidate],
+        cfg=cfg,
+        prompt_leaked=False,
+    )
+
+    assert accepted is False
+    assert reason == "numeric_runaway"
+
+
+def test_asr_review_flags_degenerate_repetition_and_numeric_runaway() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="ビ" + "ー" * 120,
+            language="ja",
+            backend="faster_whisper",
+            start=7866.22,
+            end=7866.8,
+            confidence=0.99,
+        ),
+        cfg,
+    ) == ["asr_degenerate_repetition"]
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="15,14,13,14,15,16,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,56,57,58,59,60,61,62,62,63,63,64,67,68,79,80,81,81,82,82",
+            language="ja",
+            backend="faster_whisper",
+            start=8263.58,
+            end=8277.34,
+            confidence=0.92,
+        ),
+        cfg,
+    ) == ["asr_numeric_runaway"]
+
+
+def test_asr_review_flags_short_repeated_countdown_runaway() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+
+    reasons = pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="自動連続悪夢まであと15 15 15 15 15 15",
+            language="ja",
+            backend="qwen_asr",
+            start=120.0,
+            end=126.0,
+            confidence=0.92,
+        ),
+        cfg,
+    )
+
+    assert "asr_numeric_runaway" in reasons
+
+
+def test_asr_review_keeps_interleaved_countdown_as_warning_not_manual_review() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="10 さあ 9 頑張りましょうね 8 体制を整えて 7 反応するんです 5 ほら 1 0 射精します",
+        language="ja",
+        backend="faster_whisper",
+        start=8121.02,
+        end=8137.96,
+        confidence=0.92,
+    )
+
+    assert pipeline_steps._source_script_asr_review_reasons(source_script, cfg) == []
+    assert (
+        pipeline_steps._source_script_countdown_unverified_reason(source_script)
+        == "asr_countdown_unverified"
+    )
+
+
+def test_asr_review_treats_dominant_moan_repetition_as_texture() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="イクイクイク" + "オ" * 80,
+        language="ja",
+        backend="faster_whisper",
+        start=3045.23,
+        end=3055.23,
+        confidence=0.91,
+    )
+
+    assert (
+        pipeline_steps._source_script_non_speech_texture_reason(source_script)
+        == "asr_non_speech_texture"
+    )
+    assert pipeline_steps._source_script_asr_review_reasons(source_script, cfg) == []
+
+
+def test_asr_review_downgrades_plausible_sparse_speech_to_warning() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="今の姿勢のまま",
+        language="ja",
+        backend="faster_whisper",
+        start=9168.787,
+        end=9183.54,
+        confidence=0.94,
+    )
+
+    assert pipeline_steps._source_script_asr_review_reasons(source_script, cfg) == []
+    assert (
+        pipeline_steps._source_script_sparse_speech_unverified_reason(source_script, cfg)
+        == "asr_sparse_speech_unverified"
+    )
+
+
+def test_asr_review_keeps_random_sparse_word_list_blocked() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="雨 桜 東 ドラム",
+        language="ja",
+        backend="faster_whisper",
+        start=516.17,
+        end=534.106,
+        confidence=0.94,
+    )
+
+    assert pipeline_steps._source_script_asr_review_reasons(source_script, cfg) == [
+        "asr_sparse_text_density"
+    ]
+    assert pipeline_steps._source_script_sparse_speech_unverified_reason(source_script, cfg) is None
+
+
+def test_asr_review_downgrades_long_numeric_sequence_to_warning() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="296 295 294",
+        language="ja",
+        backend="faster_whisper",
+        start=797.07,
+        end=811.593,
+        confidence=0.93,
+    )
+
+    assert pipeline_steps._source_script_asr_review_reasons(source_script, cfg) == []
+    assert (
+        pipeline_steps._source_script_numeric_sequence_unverified_reason(source_script)
+        == "asr_numeric_sequence_unverified"
+    )
+
+
+def test_asr_repair_rejection_is_suppressed_for_warning_only_source() -> None:
+    cfg = ProjectConfig(project_name="test-project")
+    source_script = SourceScript(
+        text="可愛らしい反応です",
+        language="ja",
+        backend="faster_whisper",
+        start=1128.73,
+        end=1144.615,
+        confidence=0.95,
+    )
+
+    assert pipeline_steps._filter_asr_repair_review_reasons(
+        source_script,
+        cfg,
+        review_reasons=[],
+        repair_review_reasons=["asr_repair_rejected:prompt_or_hallucination_leak"],
+    ) == []
+
+
 def test_asr_text_replacements_normalize_known_domain_mishears() -> None:
     chunks, replaced = pipeline_steps._apply_asr_text_replacements_to_chunks(
         [
@@ -1286,6 +2458,106 @@ def test_asr_text_replacements_normalize_known_domain_mishears() -> None:
     assert replaced == 1
     assert chunks[0].text == "あっという間に絶頂が来ちゃう"
     assert chunks[1].text == "媚薬を塗り込んで"
+
+
+def test_asr_text_replacements_include_observed_rj01410718_residuals() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=4773.383,
+                end=4777.203,
+                text="これが 深い女の悪夢",
+                language="ja",
+                confidence=0.98,
+            ),
+            ASRChunk(
+                start=5251.733,
+                end=5255.473,
+                text="君が望んだ悪夢を受け入れていきたいよね",
+                language="ja",
+                confidence=0.96,
+            ),
+            ASRChunk(
+                start=5473.833,
+                end=5486.033,
+                text="0 ほら りくんといく 私の手にもで 脈動が伝わってるよ",
+                language="ja",
+                confidence=0.93,
+            ),
+            ASRChunk(
+                start=3576.265,
+                end=3587.595,
+                text="すぐやりたがる 陰難 陣法の苦戦女子なのに",
+                language="ja",
+                confidence=0.96,
+            ),
+            ASRChunk(
+                start=1202.604,
+                end=1207.064,
+                text="紙をまとめるためのネットが",
+                language="ja",
+                confidence=0.95,
+            ),
+            ASRChunk(
+                start=197.885,
+                end=208.82,
+                text="きやちょっと違うの",
+                language="ja",
+                confidence=0.95,
+            ),
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 6
+    assert [chunk.text for chunk in chunks] == [
+        "これが 深い女のアクメ",
+        "君が望んだアクメを受け入れていきたいよね",
+        "0 ほら びくんとイく 私の手にも 脈動が伝わってるよ",
+        "すぐやりたがる 淫乱 チンポの苦戦女子なのに",
+        "髪をまとめるためのネットが",
+        "いやちょっと違うの",
+    ]
+
+
+def test_observed_akume_residual_replacements_still_keep_true_nightmare_context() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="怖い女の悪夢を見て眠れない",
+                language="ja",
+                confidence=0.96,
+            )
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 0
+    assert chunks[0].text == "怖い女の悪夢を見て眠れない"
+
+
+def test_asr_review_flags_observed_unresolved_rj01410718_fragments() -> None:
+    cfg = ProjectConfig()
+
+    reasons = pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="天群と心臓の鼓動に合わせて 吸って 吸うできる ごすーっとかぶさって読む",
+            language="ja",
+            backend="faster_whisper",
+            start=0.0,
+            end=12.0,
+            confidence=0.96,
+        ),
+        cfg,
+    )
+
+    assert reasons == ["asr_suspicious_pattern:天群,吸うできる,ごすーっとかぶさって読む"]
 
 
 def test_asr_text_replacements_include_observed_midcheck_mishears() -> None:
@@ -1551,6 +2823,119 @@ def test_asr_text_replacements_include_observed_real_run_mishears() -> None:
     assert chunks[9].text == "こんなに膣内に出されたら 先っぽ ゴリゴリするの クリをすこすこして カリの横の溝 私のフェラ顔を見て 愛撫する"
 
 
+def test_contextual_asr_replacements_normalize_generic_akume_denma_and_countdown_residuals() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="私ももっと君の悪目顔見たいな",
+                language="ja",
+                confidence=0.93,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="すごい音でしょ電話の音 電話を挟むようにすると",
+                language="ja",
+                confidence=0.91,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=10.0,
+                text="ん…電話邪魔…",
+                language="ja",
+                confidence=0.82,
+            ),
+            ASRChunk(
+                start=10.0,
+                end=14.0,
+                text="13 12 11 12",
+                language="ja",
+                confidence=0.9,
+            ),
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 4
+    assert summary["total_replacements"] == 5
+    assert [chunk.text for chunk in chunks] == [
+        "私ももっと君のアクメ顔見たいな",
+        "すごい音でしょ電マの音 電マを挟むようにすると",
+        "ん…電マ邪魔…",
+        "13 12 11 10",
+    ]
+
+
+def test_countdown_replacements_repair_missing_number_and_duplicate_tail() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=8.0,
+                text="10 9 8 7 6 4 3 2 1",
+                language="ja",
+                confidence=0.9,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=16.0,
+                text="10 9 8 7 6 5 4 3 2 1 1 1",
+                language="ja",
+                confidence=0.9,
+            ),
+            ASRChunk(
+                start=16.0,
+                end=20.0,
+                text="1 0 1 0 0 0",
+                language="ja",
+                confidence=0.9,
+            ),
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 2
+    assert [chunk.text for chunk in chunks] == [
+        "10 9 8 7 6 5 4 3 2 1",
+        "10 9 8 7 6 5 4 3 2 1",
+        "1 0 1 0 0 0",
+    ]
+
+
+def test_contextual_denma_replacement_keeps_true_phone_context() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="電話に出ると着信音がまだ鳴っていた",
+                language="ja",
+                confidence=0.95,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="電話の電波が弱いみたい",
+                language="ja",
+                confidence=0.95,
+            )
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 0
+    assert chunks[0].text == "電話に出ると着信音がまだ鳴っていた"
+    assert chunks[1].text == "電話の電波が弱いみたい"
+
+
 def test_asr_review_patterns_do_not_flag_repaired_fellatio_term() -> None:
     cfg = ProjectConfig()
 
@@ -1669,6 +3054,462 @@ def test_asr_text_replacements_handle_cascaded_yaml_order() -> None:
     assert chunks[1].text == "媚薬スプレー投与"
 
 
+def test_contextual_asr_replacements_fix_observed_akume_mishears() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="本物の男性器ではありえない メスの快感を生み出し、激しく悪夢させるために作られた形",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="外観いいです いいですイーチ 悪夢していいですよ",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 2
+    assert summary["total_replacements"] == 2
+    assert chunks[0].text == "本物の男性器ではありえない メスの快感を生み出し、激しくアクメさせるために作られた形"
+    assert chunks[1].text == "外観いいです いいですイーチ アクメしていいですよ"
+
+
+def test_contextual_asr_replacements_fix_machine_experiment_akume_mishears() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="悪夢の現象範囲を確認 自動連続悪夢まで",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="暴走した悪夢回路は淡々と あなたを悪夢させる 機械と融合しようとしている",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=12.0,
+                text="ゼロ 悪夢します 減速悪夢計測 悪夢の前兆3分 自動連続悪夢になる",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 3
+    assert summary["total_replacements"] == 8
+    assert chunks[0].text == "アクメの現象範囲を確認 自動連続アクメまで"
+    assert chunks[1].text == "暴走したアクメ回路は淡々と あなたをアクメさせる 機械と融合しようとしている"
+    assert chunks[2].text == "ゼロ アクメします 減速アクメ計測 アクメの前兆3分 自動連続アクメになる"
+
+
+def test_contextual_asr_replacements_fix_broader_akume_homophones() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="波のように 強く 弱く 何度も打ち寄せる 体中が震えそうな悪夢",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="ああ、だらしない顔で悪目声漏らしながら体そらしちゃって",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=12.0,
+                text="腰や背筋が悪夢の直前に来るゾワゾワした独特の感覚",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=12.0,
+                end=16.0,
+                text="悪夢寸前のあの感覚が一瞬で広がって",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 4
+    assert summary["total_replacements"] == 4
+    assert chunks[0].text == "波のように 強く 弱く 何度も打ち寄せる 体中が震えそうなアクメ"
+    assert chunks[1].text == "ああ、だらしない顔でアクメ声漏らしながら体そらしちゃって"
+    assert chunks[2].text == "腰や背筋がアクメの直前に来るゾワゾワした独特の感覚"
+    assert chunks[3].text == "アクメ寸前のあの感覚が一瞬で広がって"
+
+
+def test_contextual_asr_replacements_fix_observed_sparse_akume_and_kaikan_residuals() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=5.0,
+                text="そうならないようにいっぱい悪夢しようね",
+                language="ja",
+                confidence=0.97,
+            ),
+            ASRChunk(
+                start=5.0,
+                end=9.0,
+                text="いつまで悪夢してるのよ 早く戻ってきてよね",
+                language="ja",
+                confidence=0.97,
+            ),
+            ASRChunk(
+                start=9.0,
+                end=14.0,
+                text="開館で人の言葉も飛んじゃいましたね",
+                language="ja",
+                confidence=0.95,
+            ),
+            ASRChunk(
+                start=14.0,
+                end=19.0,
+                text="怖い悪夢してるみたいで眠れない",
+                language="ja",
+                confidence=0.95,
+            ),
+            ASRChunk(
+                start=19.0,
+                end=24.0,
+                text="市民会館で人の話を聞いた",
+                language="ja",
+                confidence=0.95,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 3
+    assert [chunk.text for chunk in chunks] == [
+        "そうならないようにいっぱいアクメしようね",
+        "いつまでアクメしてるのよ 早く戻ってきてよね",
+        "快感で人の言葉も飛んじゃいましたね",
+        "怖い悪夢してるみたいで眠れない",
+        "市民会館で人の話を聞いた",
+    ]
+
+
+def test_asr_text_replacements_fix_recent_kaikan_de_mishear() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="すごい絶頂の波 外観で真っ白な頭が電気のようにパチパチ",
+                language="ja",
+                confidence=0.92,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="外観の電流に頭が白くなってスパークする",
+                language="ja",
+                confidence=0.91,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=16.0,
+                text="次の外観が待ちきれなくなる",
+                language="ja",
+                confidence=0.95,
+            ),
+            ASRChunk(
+                start=16.0,
+                end=22.0,
+                text="外観という名の首輪がはめられている",
+                language="ja",
+                confidence=0.94,
+            ),
+            ASRChunk(
+                start=22.0,
+                end=28.0,
+                text="あんたと比べるとまだまだ可愛い悪夢",
+                language="ja",
+                confidence=0.95,
+            ),
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 5
+    assert summary["total_replacements"] == 5
+    assert chunks[0].text == "すごい絶頂の波 快感で真っ白な頭が電気のようにパチパチ"
+    assert chunks[1].text == "快感の電流に頭が白くなってスパークする"
+    assert chunks[2].text == "次の快感が待ちきれなくなる"
+    assert chunks[3].text == "快感という名の首輪がはめられている"
+    assert chunks[4].text == "あんたと比べるとまだまだ可愛いアクメ"
+    assert cfg.asr_review_candidate_replacements["外観の電流"] == "快感の電流"
+    assert cfg.asr_review_candidate_replacements["次の外観"] == "次の快感"
+    assert cfg.asr_review_candidate_replacements["外観という名"] == "快感という名"
+    assert cfg.asr_review_candidate_replacements["可愛い悪夢"] == "可愛いアクメ"
+
+
+def test_contextual_asr_replacements_fix_generic_kaikan_and_keep_true_hall_context() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="こんな会館知りたくない うーんやめないで",
+                language="ja",
+                confidence=0.91,
+            ),
+            ASRChunk(
+                start=4.0,
+                end=8.0,
+                text="耳の奥 脳みそ 君が開館",
+                language="ja",
+                confidence=0.91,
+            ),
+            ASRChunk(
+                start=8.0,
+                end=12.0,
+                text="市民会館のホールでイベントを見た",
+                language="ja",
+                confidence=0.95,
+            ),
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 2
+    assert [chunk.text for chunk in chunks] == [
+        "こんな快感知りたくない うーんやめないで",
+        "耳の奥 脳みそ 君が快感",
+        "市民会館のホールでイベントを見た",
+    ]
+    assert pipeline_steps._source_script_asr_review_reasons(
+        SourceScript(
+            text="市民会館のホールでイベントを見た",
+            language="ja",
+            backend="faster_whisper",
+            start=8.0,
+            end=12.0,
+            confidence=0.95,
+        ),
+        cfg,
+    ) == []
+
+
+def test_contextual_asr_replacements_fix_observed_akume_compounds() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=5.0,
+                text="ほらほら出るよ ゼロ 行く 出てる 受精悪夢する",
+                language="ja",
+                confidence=0.91,
+            ),
+            ASRChunk(
+                start=5.0,
+                end=10.0,
+                text="出た 行く 出産悪夢する 再現なく快感が湧き続ける",
+                language="ja",
+                confidence=0.91,
+            ),
+            ASRChunk(
+                start=10.0,
+                end=14.0,
+                text="怖い夢を見たあと 強烈な悪夢する夜だった",
+                language="ja",
+                confidence=0.95,
+            ),
+        ],
+        cfg.asr_text_replacements,
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 2
+    assert [chunk.text for chunk in chunks] == [
+        "ほらほら出るよ ゼロ 行く 出てる 受精アクメする",
+        "出た 行く 出産アクメする 再現なく快感が湧き続ける",
+        "怖い夢を見たあと 強烈な悪夢する夜だった",
+    ]
+
+
+def test_contextual_asr_replacements_keep_true_nightmare_context() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="怖い悪夢の前兆で眠れない",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 0
+    assert summary["total_replacements"] == 0
+    assert chunks[0].text == "怖い悪夢の前兆で眠れない"
+
+
+def test_contextual_asr_replacements_keep_true_nightmare_context_with_machine_words() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="機械の音がする怖い夢を見たあと 悪夢まで眠れない",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 0
+    assert summary["total_replacements"] == 0
+    assert chunks[0].text == "機械の音がする怖い夢を見たあと 悪夢まで眠れない"
+
+
+def test_contextual_asr_replacements_keep_true_nightmare_context_with_generic_homophones() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="怖い夢を見たあと 悪目声と悪夢の直前のことを思い出して眠れない",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 0
+    assert summary["total_replacements"] == 0
+    assert chunks[0].text == "怖い夢を見たあと 悪目声と悪夢の直前のことを思い出して眠れない"
+
+
+def test_contextual_asr_replacements_keep_true_nightmare_face_context() -> None:
+    cfg = ProjectConfig()
+    chunks, summary = pipeline_steps._apply_asr_text_replacements_to_chunks_with_summary(
+        [
+            ASRChunk(
+                start=0.0,
+                end=4.0,
+                text="怖い夢を見たあと 悪目顔のことを思い出して眠れない",
+                language="ja",
+                confidence=0.92,
+            ),
+        ],
+        {},
+        contextual_replacements=cfg.asr_review_candidate_replacements,
+    )
+
+    assert summary["chunks_changed"] == 0
+    assert summary["total_replacements"] == 0
+    assert chunks[0].text == "怖い夢を見たあと 悪目顔のことを思い出して眠れない"
+
+
+def test_asr_review_item_keeps_true_nightmare_context_out_of_akume_candidates() -> None:
+    cfg = ProjectConfig()
+    chunks = [
+        ASRChunk(
+            start=0.0,
+            end=4.0,
+            text="怖い悪夢の前兆で眠れない",
+            language="ja",
+            confidence=0.92,
+        )
+    ]
+
+    assert pipeline_steps._asr_review_item(chunks, 0, cfg=cfg) is None
+
+
+def test_asr_review_item_still_suggests_akume_in_domain_context() -> None:
+    cfg = ProjectConfig()
+    chunks = [
+        ASRChunk(
+            start=0.0,
+            end=4.0,
+            text="快感で激しく悪夢させるために作られた形",
+            language="ja",
+            confidence=0.92,
+        )
+    ]
+
+    item = pipeline_steps._asr_review_item(chunks, 0, cfg=cfg)
+
+    assert item is not None
+    assert "悪夢させ" in item["suspicious_patterns"]
+    assert {"candidate_id": "domain_replacement", "text": "快感で激しくアクメさせるために作られた形"} in item["candidates"]
+
+
+def test_asr_final_filter_drops_prompt_term_list_leaks() -> None:
+    cfg = ProjectConfig()
+    kept, dropped = pipeline_steps._filter_final_asr_chunks_for_hallucinations(
+        [
+            ASRChunk(
+                start=45.11,
+                end=64.46,
+                text="おまんこ おちんぽ 女体化 採集マシーン エネルギー不足 睾丸 フェラチオ スキーン腺",
+                language="ja",
+                confidence=0.93,
+            ),
+            ASRChunk(
+                start=65.0,
+                end=68.0,
+                text="少し近づきますね",
+                language="ja",
+                confidence=0.96,
+            ),
+        ],
+        cfg=cfg,
+    )
+
+    assert [chunk.text for chunk in kept] == ["少し近づきますね"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"] == "prompt_term_list_leak"
+    assert dropped[0]["text"] == "おまんこ おちんぽ 女体化 採集マシーン エネルギー不足 睾丸 フェラチオ スキーン腺"
+    assert dropped[0]["duration"] == pytest.approx(19.35)
+
+
 def test_transcribe_writes_unified_asr_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
     tiny_wav_path: Path,
@@ -1717,7 +3558,413 @@ def test_transcribe_writes_unified_asr_diagnostics(
     assert summary["raw_asr_chunk_count"] == 1
     assert summary["final_asr_chunk_count"] == 1
     assert summary["text_replacements"]["total_replacements"] == 1
+    assert diagnostics["source_separation_fallback"]["recommended"] is False
+    assert diagnostics["source_separation_fallback"]["reason"] == "raw_asr_quality_within_threshold"
+    assert diagnostics["source_separation_fallback"]["reasons"] == []
+    assert diagnostics["source_separation_fallback"]["metrics"]["manual_review_threshold"] == 3
+    assert summary["recommend_source_separation_fallback"] is False
     assert manifest.artifacts["asr_input_diagnostics"]
+
+
+def test_asr_high_risk_report_classifies_segments_for_automation() -> None:
+    cfg = ProjectConfig()
+    auto_segment = sample_segment("seg_0001", start=0.0, end=2.0)
+    auto_segment.status = "transcribed"
+    auto_segment.source_script = SourceScript(
+        text="少し近づきますね",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=2.0,
+        confidence=0.96,
+    )
+    countdown_segment = sample_segment("seg_0002", start=2.0, end=7.0)
+    countdown_segment.status = "transcribed"
+    countdown_segment.source_script = SourceScript(
+        text="4 3 2 1 0",
+        language="ja",
+        backend="faster_whisper",
+        start=2.0,
+        end=7.0,
+        confidence=0.91,
+    )
+    countdown_segment.analysis["countdown_event"] = {
+        "kind": "descending_countdown",
+        "values": [4, 3, 2, 1, 0],
+        "token_timeline": [{}, {}, {}, {}, {}],
+    }
+    texture_segment = sample_segment("seg_0003", start=7.0, end=10.0)
+    texture_segment.status = "non_speech_texture"
+    texture_segment.keep_original_texture = True
+    texture_segment.errors = ["asr_non_speech_texture"]
+    texture_segment.source_script = SourceScript(
+        text="ん……",
+        language="ja",
+        backend="faster_whisper",
+        start=7.0,
+        end=10.0,
+        confidence=0.8,
+    )
+    review_segment = sample_segment("seg_0004", start=10.0, end=14.0)
+    review_segment.status = "needs_manual_review"
+    review_segment.errors = ["asr_suspicious_pattern:(?:悪夢|悪目|明け目|アカメ)顔"]
+    review_segment.source_script = SourceScript(
+        text="悪目顔",
+        language="ja",
+        backend="faster_whisper",
+        start=10.0,
+        end=14.0,
+        confidence=0.93,
+    )
+    manifest = PipelineManifest(
+        project_config=cfg,
+        segments=[auto_segment, countdown_segment, texture_segment, review_segment],
+    )
+
+    report = pipeline_steps._build_asr_high_risk_report(
+        manifest,
+        cfg=cfg,
+        replacements_summary={
+            "items": [
+                {
+                    "chunk_id": "chunk_0004",
+                    "start": 10.0,
+                    "end": 14.0,
+                    "original_text": "悪目顔",
+                    "replaced_text": "アクメ顔",
+                    "hits": [{"source": "悪目", "target": "アクメ", "count": 1}],
+                }
+            ]
+        },
+        repair_summary={"attempted": 1, "repaired": 0},
+        asr_review_summary={"attempted": 1, "manual_review": 1},
+        filtered_summary=[],
+    )
+
+    summary = report["summary"]
+    assert summary["segment_count"] == 4
+    assert summary["auto_accept"] == 1
+    assert summary["countdown_verified"] == 1
+    assert summary["texture"] == 1
+    assert summary["needs_review"] == 1
+    assert summary["severe"] == 1
+    assert summary["automated_dubbing_ready"] is False
+    assert summary["blocking_reasons"] == ["needs_manual_review"]
+    decisions = {item["segment_id"]: item["decision"] for item in report["items"]}
+    assert decisions == {
+        "seg_0002": "countdown_verified",
+        "seg_0003": "texture",
+        "seg_0004": "needs_review",
+    }
+    review_item = next(item for item in report["items"] if item["segment_id"] == "seg_0004")
+    assert review_item["replacement_hits"][0]["source"] == "悪目"
+
+
+def test_asr_high_risk_report_warns_for_unverified_sparse_and_numeric_sequences() -> None:
+    cfg = ProjectConfig()
+    sparse_segment = sample_segment("seg_0001", start=0.0, end=15.0)
+    sparse_segment.status = "transcribed"
+    sparse_segment.analysis["asr_sparse_speech_unverified"] = {
+        "reason": "asr_sparse_speech_unverified",
+    }
+    sparse_segment.source_script = SourceScript(
+        text="今の姿勢のまま",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=15.0,
+        confidence=0.94,
+    )
+    numeric_segment = sample_segment("seg_0002", start=15.0, end=30.0)
+    numeric_segment.status = "transcribed"
+    numeric_segment.analysis["asr_numeric_sequence_unverified"] = {
+        "reason": "asr_numeric_sequence_unverified",
+    }
+    numeric_segment.source_script = SourceScript(
+        text="296 295 294",
+        language="ja",
+        backend="faster_whisper",
+        start=15.0,
+        end=30.0,
+        confidence=0.93,
+    )
+    manifest = PipelineManifest(project_config=cfg, segments=[sparse_segment, numeric_segment])
+
+    report = pipeline_steps._build_asr_high_risk_report(
+        manifest,
+        cfg=cfg,
+        replacements_summary={"items": []},
+        repair_summary={},
+        asr_review_summary={},
+        filtered_summary=[],
+    )
+
+    summary = report["summary"]
+    assert summary["severe"] == 0
+    assert summary["warning"] == 2
+    assert summary["automated_dubbing_ready"] is True
+    assert summary["blocking_reasons"] == []
+    decisions = {item["segment_id"]: item["decision"] for item in report["items"]}
+    assert decisions == {
+        "seg_0001": "sparse_speech_unverified",
+        "seg_0002": "numeric_sequence_unverified",
+    }
+
+
+def test_transcribe_writes_asr_high_risk_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_review_enabled=False,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, _audio_path: Path, _segments: list[Segment]) -> list[ASRChunk]:
+            return [
+                ASRChunk(
+                    start=0.0,
+                    end=2.0,
+                    text="悪目顔",
+                    language="ja",
+                    confidence=0.72,
+                )
+            ]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(tmp_project_dir, asr_backend="faster_whisper", confirm_rights=True)
+
+    report_path = Path(manifest.artifacts["asr_high_risk_report"])
+    report = json.loads(report_path.read_text("utf-8"))
+    assert report["summary"]["automated_dubbing_ready"] is False
+    assert report["summary"]["needs_review"] == 1
+    assert report["items"][0]["decision"] == "needs_review"
+    assert report["items"][0]["severity"] == "severe"
+    postprocess_path = Path(manifest.artifacts["asr_postprocess_review"])
+    postprocess = json.loads(postprocess_path.read_text("utf-8"))
+    assert postprocess["summary"]["segment_count"] == 1
+    assert postprocess["summary"]["item_count"] == 1
+    assert postprocess["summary"]["manual_review"] == 1
+    assert postprocess["items"][0]["action"] == "manual_review"
+    assert manifest.stage_state["transcribe"]["asr_auto_dub_ready"] is False
+    assert manifest.stage_state["transcribe"]["asr_high_risk_severe"] == 1
+    assert manifest.stage_state["transcribe"]["asr_postprocess_review_items"] == 1
+    assert manifest.stage_state["transcribe"]["asr_postprocess_manual_review"] == 1
+
+
+def test_asr_source_separation_fallback_recommends_demucs_for_poor_raw_signal() -> None:
+    cfg = ProjectConfig(source_separation_backend="none")
+    segments: list[Segment] = []
+    for index in range(100):
+        segment = sample_segment(
+            f"seg_{index:04d}",
+            start=float(index),
+            end=float(index + 1),
+        )
+        segment.status = "transcribed"
+        segments.append(segment)
+    for segment in segments[:3]:
+        segment.status = "needs_manual_review"
+        segment.errors = ["asr_sparse_text_density"]
+    segments[0].errors.append("asr_repair_rejected:prompt_or_hallucination_leak")
+    manifest = PipelineManifest(project_config=cfg, segments=segments)
+
+    recommendation = pipeline_steps._source_separation_fallback_recommendation(
+        manifest,
+        cfg=cfg,
+        input_diagnostics={"selected": {"source": "gemma_mono_16k"}},
+        repair_summary={"attempted": 24, "repaired": 4},
+        asr_review_summary={"attempted": 16, "failed": 1},
+    )
+
+    assert recommendation["recommended"] is True
+    assert recommendation["recommended_backend"] == "demucs"
+    assert recommendation["reasons"] == ["manual_review_rate"]
+    assert recommendation["metrics"]["needs_manual_review"] == 3
+    assert recommendation["metrics"]["manual_review_rate"] == pytest.approx(0.03)
+
+
+def test_asr_source_separation_fallback_ignores_noisy_low_rate_raw_signal() -> None:
+    cfg = ProjectConfig(source_separation_backend="none")
+    segments: list[Segment] = []
+    for index in range(1265):
+        segment = sample_segment(
+            f"seg_{index:04d}",
+            start=float(index),
+            end=float(index + 1),
+        )
+        segment.status = "transcribed"
+        segments.append(segment)
+    for segment in segments[:25]:
+        segment.status = "needs_manual_review"
+        segment.errors = ["asr_suspicious_pattern:悪夢まで"]
+    manifest = PipelineManifest(project_config=cfg, segments=segments)
+
+    recommendation = pipeline_steps._source_separation_fallback_recommendation(
+        manifest,
+        cfg=cfg,
+        input_diagnostics={"selected": {"source": "gemma_mono_16k"}},
+        repair_summary={"attempted": 41, "repaired": 41},
+        asr_review_summary={"attempted": 31, "failed": 0},
+    )
+
+    assert recommendation["recommended"] is False
+    assert recommendation["recommended_backend"] is None
+    assert recommendation["reason"] == "raw_asr_quality_within_threshold"
+    assert recommendation["reasons"] == []
+    assert recommendation["metrics"]["manual_review_rate"] == pytest.approx(0.019763)
+
+
+def test_asr_source_separation_fallback_uses_per_file_manual_review_threshold() -> None:
+    cfg = ProjectConfig(source_separation_backend="none")
+    segments: list[Segment] = []
+    for index in range(500):
+        segment = sample_segment(
+            f"seg_{index:04d}",
+            start=float(index),
+            end=float(index + 1),
+        )
+        segment.status = "transcribed"
+        segments.append(segment)
+    for segment in segments[400:403]:
+        segment.status = "needs_manual_review"
+        segment.errors = ["asr_sparse_text_density"]
+    manifest = PipelineManifest(
+        project_config=cfg,
+        source_info=SourceInfo(
+            path="folder",
+            duration_sec=500.0,
+            raw={
+                "folder_input": {
+                    "asr_parts": [
+                        {
+                            "part_index": 1,
+                            "stem": "clean",
+                            "path": "clean.wav",
+                            "start_sec": 0.0,
+                            "end_sec": 400.0,
+                        },
+                        {
+                            "part_index": 2,
+                            "stem": "bad",
+                            "path": "bad.wav",
+                            "start_sec": 400.0,
+                            "end_sec": 500.0,
+                        },
+                    ]
+                }
+            },
+        ),
+        segments=segments,
+    )
+
+    recommendation = pipeline_steps._source_separation_fallback_recommendation(
+        manifest,
+        cfg=cfg,
+        input_diagnostics={"selected": {"source": "gemma_mono_16k"}},
+        repair_summary={},
+        asr_review_summary={},
+    )
+
+    assert recommendation["recommended"] is True
+    assert recommendation["recommended_backend"] == "demucs"
+    assert recommendation["reasons"] == ["manual_review_rate"]
+    assert recommendation["metrics"]["manual_review_rate"] == pytest.approx(0.006)
+    assert recommendation["metrics"]["manual_review_threshold"] == 10
+    assert recommendation["metrics"]["manual_review_file_trigger_count"] == 1
+    file_metrics = recommendation["metrics"]["manual_review_file_metrics"]
+    assert file_metrics[0]["recommended"] is False
+    assert file_metrics[0]["manual_review_threshold"] == 8
+    assert file_metrics[1]["recommended"] is True
+    assert file_metrics[1]["part_index"] == 2
+    assert file_metrics[1]["segment_count"] == 100
+    assert file_metrics[1]["needs_manual_review"] == 3
+    assert file_metrics[1]["manual_review_threshold"] == 3
+
+
+def test_asr_source_separation_fallback_requires_minimum_manual_review_count_per_file() -> None:
+    cfg = ProjectConfig(source_separation_backend="none")
+    segments: list[Segment] = []
+    for index in range(100):
+        segment = sample_segment(
+            f"seg_{index:04d}",
+            start=float(index),
+            end=float(index + 1),
+        )
+        segment.status = "transcribed"
+        segments.append(segment)
+    for segment in segments[:2]:
+        segment.status = "needs_manual_review"
+        segment.errors = ["asr_sparse_text_density"]
+    manifest = PipelineManifest(
+        project_config=cfg,
+        source_info=SourceInfo(
+            path="folder",
+            duration_sec=100.0,
+            raw={
+                "folder_input": {
+                    "asr_parts": [
+                        {
+                            "part_index": 1,
+                            "stem": "borderline",
+                            "path": "borderline.wav",
+                            "start_sec": 0.0,
+                            "end_sec": 100.0,
+                        }
+                    ]
+                }
+            },
+        ),
+        segments=segments,
+    )
+
+    recommendation = pipeline_steps._source_separation_fallback_recommendation(
+        manifest,
+        cfg=cfg,
+        input_diagnostics={"selected": {"source": "gemma_mono_16k"}},
+        repair_summary={},
+        asr_review_summary={},
+    )
+
+    assert recommendation["recommended"] is False
+    assert recommendation["recommended_backend"] is None
+    assert recommendation["reason"] == "raw_asr_quality_within_threshold"
+    assert recommendation["metrics"]["manual_review_rate"] == pytest.approx(0.02)
+    assert recommendation["metrics"]["manual_review_threshold"] == 3
+    assert recommendation["metrics"]["manual_review_file_metrics"][0]["manual_review_threshold"] == 3
+    assert recommendation["metrics"]["manual_review_file_metrics"][0]["recommended"] is False
+
+
+def test_asr_source_separation_fallback_skips_after_demucs_input() -> None:
+    cfg = ProjectConfig(source_separation_backend="demucs")
+    segment = sample_segment("seg_0001")
+    segment.status = "needs_manual_review"
+    segment.errors = ["asr_sparse_text_density"]
+    manifest = PipelineManifest(project_config=cfg, segments=[segment])
+
+    recommendation = pipeline_steps._source_separation_fallback_recommendation(
+        manifest,
+        cfg=cfg,
+        input_diagnostics={"selected": {"source": "source_vocals_mono_16k"}},
+        repair_summary={"attempted": 40, "repaired": 0},
+        asr_review_summary={},
+    )
+
+    assert recommendation["recommended"] is False
+    assert recommendation["reason"] == "source_separation_already_used"
+    assert recommendation["recommended_backend"] is None
 
 
 def test_rejected_asr_repair_marks_overlapping_text_for_manual_review() -> None:
@@ -1827,13 +4074,16 @@ def test_source_script_and_korean_translation_schema_round_trip() -> None:
 
 def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None:
     assert ProjectConfig().gemma_text_batch_size == 12
-    assert ProjectConfig().gemma_text_context_radius == 4
-    assert ProjectConfig().gemma_text_span_size == 4
-    assert ProjectConfig().gemma_text_span_max_sec == pytest.approx(18.0)
-    assert ProjectConfig().gemma_text_span_max_gap_sec == pytest.approx(1.2)
+    assert ProjectConfig().gemma_llama_cpp_ctx_size == 16384
+    assert ProjectConfig().gemma_text_context_radius == 10
+    assert ProjectConfig().gemma_text_span_size == 10
+    assert ProjectConfig().gemma_text_span_max_sec == pytest.approx(75.0)
+    assert ProjectConfig().gemma_text_span_max_gap_sec == pytest.approx(5.0)
+    assert ProjectConfig().gemma_text_n_predict == 1536
     assert ProjectConfig().gemma_text_two_pass is True
-    assert ProjectConfig().gemma_text_concurrency == 4
-    assert ProjectConfig().gsv_concurrency == 3
+    assert ProjectConfig().gemma_text_concurrency == 1
+    assert ProjectConfig().gemma_audio_style_concurrency == 2
+    assert ProjectConfig().gsv_concurrency == 6
     assert ProjectConfig().source_language == "ja"
     assert ProjectConfig().target_language == "ko"
     assert ProjectConfig(target_language="kr").target_language == "ko"
@@ -1841,6 +4091,7 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().asr_resegment_min_sec == pytest.approx(3.0)
     assert ProjectConfig().asr_resegment_max_sec == pytest.approx(20.0)
     assert ProjectConfig().asr_resegment_merge_gap_sec == pytest.approx(1.0)
+    assert ProjectConfig().asr_countdown_merge_max_span_sec == pytest.approx(60.0)
     assert ProjectConfig().asr_word_timestamps is False
     assert ProjectConfig().asr_hallucination_silence_threshold is None
     assert ProjectConfig().asr_sparse_chunk_max_sec == pytest.approx(30.0)
@@ -1858,15 +4109,16 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf" in ProjectConfig().gemma_llama_cpp_audio_model_path
     assert "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf" in ProjectConfig().gemma_llama_cpp_audio_mmproj_path
     assert "女体化" in ProjectConfig().asr_hotwords
-    assert "性感帯" in ProjectConfig().asr_hotwords
     assert "採集マシーン" in ProjectConfig().asr_hotwords
-    assert "発情" in ProjectConfig().asr_hotwords
-    assert "尿意" in ProjectConfig().asr_hotwords
-    assert "オナニー" in ProjectConfig().asr_hotwords
-    assert "18禁" in ProjectConfig().asr_hotwords
-    assert "投与" in ProjectConfig().asr_hotwords
-    assert "耳奥" in ProjectConfig().asr_hotwords
-    assert "ピストン" in ProjectConfig().asr_hotwords
+    assert "電マ" in ProjectConfig().asr_hotwords
+    assert "亀頭" in ProjectConfig().asr_hotwords
+    assert "スキーン腺" in ProjectConfig().asr_hotwords
+    assert "陰核基部" in ProjectConfig().asr_hotwords
+    assert "ポルチオ" in ProjectConfig().asr_hotwords
+    assert "オナニー" not in ProjectConfig().asr_hotwords
+    assert "ゆっくり" not in ProjectConfig().asr_hotwords
+    assert "気持ちいい" not in ProjectConfig().asr_hotwords
+    assert "快感" not in ProjectConfig().asr_hotwords
     assert ProjectConfig().asr_text_replacements["釣りが来ちゃう"] == "絶頂が来ちゃう"
     assert ProjectConfig().asr_text_replacements["女体科"] == "女体化"
     assert ProjectConfig().asr_text_replacements["生還体"] == "性感帯"
@@ -1876,8 +4128,9 @@ def test_project_config_defaults_translate_ko_uses_single_server_slots() -> None
     assert ProjectConfig().asr_text_replacements["手帳が来る"] == "絶頂が来る"
     assert ProjectConfig().asr_text_replacements["ピスタン"] == "ピストン"
     assert ProjectConfig().asr_text_replacements["ウニアクナで触手"] == "耳奥まで触手"
-    assert ProjectConfig().source_separation_backend == "demucs"
+    assert ProjectConfig().source_separation_backend == "auto"
     assert ProjectConfig().source_separation_model == "htdemucs"
+    assert cli_module.FULL_REAL_QUALITY_PRESET["source_separation_backend"] == "auto"
     assert ProjectConfig().gsv_trim_edge_silence is True
     assert ProjectConfig().gsv_ref_min_sec == pytest.approx(3.0)
     assert ProjectConfig().gsv_ref_max_sec == pytest.approx(10.0)
@@ -1970,6 +4223,153 @@ def test_source_voice_ref_selection_extends_short_candidate_to_duration_window(
         ["seg_short", "seg_valid"]
     ]
     assert selected[0].duration == pytest.approx(5.0)
+
+
+def test_source_voice_ref_selection_prefers_plain_prompt_over_intense_longer_prompt(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(project_name=tmp_project_dir.name),
+        segments=[
+            Segment(
+                id="seg_intense",
+                start=0.0,
+                end=5.5,
+                duration=5.5,
+                audio_for_gemma="work/segments/audio/seg_intense_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_intense_mix.wav",
+                source_script=SourceScript(
+                    text="ところでピチッと電気が走るような感触も足に感じる タイツ触手が動き始めたようだね。",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=5.5,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=6.0,
+                end=10.0,
+                duration=4.0,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="今日は少しだけ静かに話しますね。",
+                    language="ja",
+                    backend="mock",
+                    start=6.0,
+                    end=10.0,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
+def test_source_voice_ref_selection_avoids_short_explicit_prompt_when_plain_prompt_exists(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(project_name=tmp_project_dir.name),
+        segments=[
+            Segment(
+                id="seg_explicit",
+                start=0.0,
+                end=5.0,
+                duration=5.0,
+                audio_for_gemma="work/segments/audio/seg_explicit_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_explicit_mix.wav",
+                source_script=SourceScript(
+                    text="もう、ほら、ビンビンだよ。",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=5.0,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=6.0,
+                end=10.0,
+                duration=4.0,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="今日は少しだけ静かに話しますね。",
+                    language="ja",
+                    backend="mock",
+                    start=6.0,
+                    end=10.0,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
+def test_source_voice_ref_selection_avoids_twitch_effect_prompt_when_plain_prompt_exists(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(project_name=tmp_project_dir.name),
+        segments=[
+            Segment(
+                id="seg_effect",
+                start=0.0,
+                end=5.0,
+                duration=5.0,
+                audio_for_gemma="work/segments/audio/seg_effect_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_effect_mix.wav",
+                source_script=SourceScript(
+                    text="あらピクピクケアレンしちゃった",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=5.0,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=6.0,
+                end=10.0,
+                duration=4.0,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="ありがとうございます。じゃああちらでお会計お願いします。",
+                    language="ja",
+                    backend="mock",
+                    start=6.0,
+                    end=10.0,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
 
 
 def test_prepare_source_voice_refs_writes_combined_short_reference_span(
@@ -2417,6 +4817,56 @@ def test_numeric_counting_postprocess_normalizes_counting_runs() -> None:
     assert segments[4].translation_ko is not None
     assert segments[4].translation_ko.ko_natural == "팔십"
     assert "numeric_counting_postprocess" in segments[0].translation_ko.notes
+
+
+def test_translate_ko_stores_repaired_numeric_counting_translation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    segment = sample_segment("seg_0001", start=0.0, end=5.0)
+    segment.source_script = SourceScript(
+        text="21 22 23 24 25",
+        language="ja",
+        confidence=0.99,
+        backend="mock",
+        start=0.0,
+        end=5.0,
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["transcribe"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    class TruncatedCountingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            return {
+                item.id: KoreanTranslation(
+                    ko_literal="21 22 23 24 25",
+                    ko_natural="스물하나 스물둘 스물셋",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for item in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", TruncatedCountingClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
+
+    expected = "스물하나, 스물둘, 스물셋, 스물넷, 스물다섯"
+    rows = [
+        json.loads(line)
+        for line in Path(tmp_project_dir / "work" / "translate_ko" / "translation_bundles.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["translation_ko"]["ko_natural"] == expected
 
 
 def test_korean_ordinal_postprocess_repairs_second_ordinal_mistranslation() -> None:
@@ -2958,6 +5408,62 @@ def test_translate_ko_force_retranslate_ignores_resumed_translations(
     assert manifest.stage_state["translate-ko"]["force_retranslate"] is True
 
 
+def test_translate_ko_force_retranslate_resets_downstream_failed_segments(
+    monkeypatch,
+    tiny_wav_path: Path,
+    tmp_project_dir: Path,
+) -> None:
+    extract_step(tiny_wav_path, tmp_project_dir, confirm_rights=True)
+    segment_step(tmp_project_dir)
+    transcribe_step(tmp_project_dir, asr_backend="mock")
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    segment.status = "failed"
+    segment.errors = ["All TTS candidates failed."]
+    segment.translation_ko = KoreanTranslation(
+        ko_literal="오래된 직역",
+        ko_natural="오래된 번역",
+        model="old",
+        batch_id="old_batch",
+    )
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            calls.extend(segment.id for segment in segments)
+            return {
+                segment.id: KoreanTranslation(
+                    ko_literal="새 직역",
+                    ko_natural="새 번역",
+                    notes=[],
+                    confidence=0.9,
+                    model="fake",
+                    batch_id=batch_id,
+                )
+                for segment in segments
+            }
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FakeClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", force_retranslate=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    assert calls == ["seg_0001"]
+    assert segment.status == "transcribed"
+    assert segment.errors == []
+    assert segment.translation_ko is not None
+    assert segment.translation_ko.ko_natural == "새 번역"
+
+
 def test_korean_draft_mix_allows_timing_only_qc_regeneration() -> None:
     segment = sample_segment()
     segment.status = "needs_regeneration"
@@ -3204,6 +5710,100 @@ def test_llama_server_translation_client_reviews_asr_candidates_with_audio(tmp_p
     assert "audio_clip_path" not in content[0]["text"]
     assert content[1]["type"] == "input_audio"
     assert content[1]["input_audio"]["format"] == "wav"
+    assert base64.b64decode(content[1]["input_audio"]["data"]) == audio_path.read_bytes()
+
+
+def test_llama_server_translation_client_analyzes_audio_style(tmp_path: Path) -> None:
+    requests: list[dict[str, object]] = []
+    audio_path = tmp_path / "seg_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+    segment = sample_segment("seg_0001")
+    response = {
+        "nonverbal_cues": [],
+        "spatial_style": "center",
+        "style_tags": ["echo"],
+        "estimated_pan": 0.0,
+        "keep_original_texture": True,
+        "risk_flags": [],
+        "confidence": 0.92,
+        "voice_training": {
+            "clean_voice": False,
+            "eligible": False,
+            "reason": "echo on same speaker",
+            "effect_tags": ["echo"],
+            "same_speaker_under_effect": True,
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]},
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=0,
+        n_predict=512,
+    )
+
+    result = client.analyze_audio_style(audio_path, segment)
+
+    assert result["voice_training"]["effect_tags"] == ["echo"]
+    assert requests[0]["max_tokens"] == 384
+    content = requests[0]["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "Analyze only the audible style" in content[0]["text"]
+    assert "Context:" not in content[0]["text"]
+    assert content[1]["type"] == "input_audio"
+    assert base64.b64decode(content[1]["input_audio"]["data"]) == audio_path.read_bytes()
+
+
+def test_llama_server_translation_client_normalizes_audio_style_without_repair(
+    tmp_path: Path,
+) -> None:
+    requests: list[dict[str, object]] = []
+    audio_path = tmp_path / "seg_0001.wav"
+    audio_path.write_bytes(b"RIFFmock-wav-data")
+    segment = sample_segment("seg_0001", start=0.0, end=1.0)
+    response = {
+        "spatial_style": "rich",
+        "estimated_pan": "0.2",
+        "keep_original_texture": "true",
+        "confidence": "high",
+        "voice_training": {"effect_tags": ["echo"]},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]},
+        )
+
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=384,
+    )
+
+    result = client.analyze_audio_style(audio_path, segment)
+
+    assert len(requests) == 1
+    assert result["spatial_style"] == "center"
+    assert result["confidence"] == pytest.approx(0.9)
+    assert result["voice_training"]["effect_tags"] == ["echo"]
+    assert result["estimated_pan"] == pytest.approx(0.2)
+    assert result["keep_original_texture"] is True
+    content = requests[0]["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert "JSON shape:" in content[0]["text"]
     assert base64.b64decode(content[1]["input_audio"]["data"]) == audio_path.read_bytes()
 
 
@@ -3464,8 +6064,10 @@ def test_llama_server_translation_client_uses_literal_then_natural_pass() -> Non
     first_prompt = requests[0]["messages"][0]["content"]
     second_prompt = requests[1]["messages"][0]["content"]
     assert "First pass" in first_prompt
+    assert "Translate as literally as possible" in first_prompt
     assert "Second pass" in second_prompt
     assert "ko_literal" in second_prompt
+    assert "staying as literal to ko_literal/source_text" in second_prompt
     assert "target_span" in first_prompt
     assert "combined_source_text" in first_prompt
 
@@ -3574,6 +6176,71 @@ def test_llama_server_translation_client_repairs_numeric_raw_digits() -> None:
     assert "context" in repair_prompt
 
 
+def test_llama_server_translation_client_warns_when_retrying_truncated_response(caplog) -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": '[{"segment_id":"seg_0001","ko_natural":"잘린 응답"',
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                [{"segment_id": "seg_0001", "ko_natural": "안녕하세요."}],
+                                ensure_ascii=False,
+                            )
+                        },
+                    }
+                ]
+            },
+        )
+
+    segment = sample_segment()
+    segment.source_script = SourceScript(
+        text="こんばんは。",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=0.0,
+        end=1.0,
+    )
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=128,
+        two_pass=False,
+    )
+
+    with caplog.at_level(py_logging.WARNING, logger="asmr_dub_pipeline.gemma.text_translate"):
+        translations = client.translate_batch([segment], "batch_0001")
+
+    assert translations["seg_0001"].ko_natural == "안녕하세요."
+    assert len(requests) == 2
+    assert any(
+        "Gemma text translation retry after possible context overflow/truncation" in record.message
+        for record in caplog.records
+    )
+
+
 def test_llama_server_translation_client_repairs_tts_unsafe_korean_punctuation() -> None:
     requests: list[dict[str, object]] = []
     responses = [
@@ -3615,6 +6282,104 @@ def test_llama_server_translation_client_repairs_tts_unsafe_korean_punctuation()
     assert translations["seg_0001"].ko_natural == "지금은요..."
     assert len(requests) == 3
     assert "TTS-unsafe punctuation" in requests[2]["messages"][0]["content"]
+
+
+def test_translate_ko_prompt_includes_korean_tts_timing_budget() -> None:
+    segment = sample_segment(end=4.04)
+    segment.source_script = SourceScript(
+        text="ここは今の世界とは違う、平行世界です。",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=0.0,
+        end=4.04,
+    )
+
+    prompt = build_translate_ko_prompt([segment], "batch_0001")
+    budget = korean_tts_timing_budget(segment.duration, segment.source_script.text)
+
+    assert "korean_tts_timing" in prompt
+    assert "Translate as literally as possible" in prompt
+    assert "semantically compress" in prompt
+    assert japanese_pronunciation_count(segment.source_script.text) == 25
+    assert budget["budget_basis"] == "source_japanese_pronunciation"
+    assert budget["source_japanese_pronunciation_count"] == 25
+    assert f'"target_speech_chars": {budget["target_speech_chars"]}' in prompt
+    assert f'"max_speech_chars": {budget["max_speech_chars"]}' in prompt
+
+
+def test_translate_ko_prompt_omits_timing_budget_from_neighbor_context() -> None:
+    target = sample_segment("seg_0001", start=0.0, end=4.04)
+    neighbor = sample_segment("seg_0002", start=4.04, end=8.0)
+    target.source_script = SourceScript(
+        text="ここは今の世界とは違う、平行世界です。",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=target.start,
+        end=target.end,
+    )
+    neighbor.source_script = SourceScript(
+        text="隣の文脈です。",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=neighbor.start,
+        end=neighbor.end,
+    )
+
+    prompt = build_translate_ko_prompt([target], "batch_0001", [target, neighbor])
+    payload = json.loads(prompt.split("Input:\n", 1)[1])
+
+    assert "korean_tts_timing" in payload["segments"][0]
+    context_by_id = {item["segment_id"]: item for item in payload["context"]}
+    assert "korean_tts_timing" not in context_by_id["seg_0001"]
+    assert "korean_tts_timing" not in context_by_id["seg_0002"]
+
+
+def test_llama_server_translation_client_repairs_over_timing_budget_korean() -> None:
+    requests: list[dict[str, object]] = []
+    responses = [
+        [{"segment_id": "seg_0001", "ko_literal": "여기예요."}],
+        [{"segment_id": "seg_0001", "ko_natural": "여기는 지금의 세계와는 다른, 평행세계예요."}],
+        [{"segment_id": "seg_0001", "ko_natural": "여기예요."}],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps(responses[len(requests) - 1], ensure_ascii=False)}}
+                ]
+            },
+        )
+
+    segment = sample_segment(end=4.04)
+    segment.source_script = SourceScript(
+        text="ここです。",
+        language="ja",
+        confidence=0.9,
+        backend="mock",
+        start=0.0,
+        end=4.04,
+    )
+    client = LlamaServerTranslationClient(
+        "http://gemma.local",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        model="gemma4",
+        retries=1,
+        n_predict=128,
+    )
+
+    translations = client.translate_batch([segment], "batch_0001")
+
+    assert translations["seg_0001"].ko_natural == "여기예요."
+    assert len(requests) == 3
+    repair_prompt = requests[2]["messages"][0]["content"]
+    assert "korean_tts_timing" in repair_prompt
+    assert "exceeds Korean TTS max speech chars" in repair_prompt
 
 
 def test_llama_server_translation_client_keeps_valid_items_from_mixed_batch() -> None:
@@ -3815,6 +6580,98 @@ def test_translate_ko_skips_manual_review_segments_even_with_source_text(
     ]
 
 
+def test_translate_ko_deterministically_repairs_manual_review_countdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    segment = sample_segment(start=0.0, end=8.0)
+    segment.status = "needs_manual_review"
+    segment.errors.append("previous countdown translation failed")
+    segment.source_script = SourceScript(
+        text="10 9 8 7 6 5 4 3 2 1 0",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=8.0,
+        confidence=0.95,
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["transcribe"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    class FailingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            raise AssertionError(f"countdown should not reach model batch {batch_id}")
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FailingClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    translated = manifest.segments[0]
+    assert translated.status == "transcribed"
+    assert translated.errors == []
+    assert translated.translation_ko is not None
+    assert translated.translation_ko.ko_natural == "열, 아홉, 여덟, 일곱, 여섯, 다섯, 넷, 셋, 둘, 하나, 영"
+    assert translated.translation_ko.notes == ["deterministic_countdown_event"]
+    assert translated.analysis["countdown_event"]["values"] == [10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+    assert manifest.stage_state["translate-ko"]["translated"] == 1
+    assert manifest.stage_state["translate-ko"]["span_count"] == 0
+
+
+def test_translate_ko_deterministically_repairs_manual_review_counting_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    segment = sample_segment(start=0.0, end=8.0)
+    segment.status = "needs_manual_review"
+    segment.errors.append("previous numeric translation failed")
+    segment.source_script = SourceScript(
+        text="1、2、3、4、5、",
+        language="ja",
+        backend="faster_whisper",
+        start=0.0,
+        end=8.0,
+        confidence=0.95,
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["transcribe"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    class FailingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate_batch(
+            self,
+            segments: list[Segment],
+            batch_id: str,
+        ) -> dict[str, KoreanTranslation]:
+            raise AssertionError(f"numeric counting should not reach model batch {batch_id}")
+
+    monkeypatch.setattr(pipeline_steps, "MockTranslationClient", FailingClient)
+
+    translate_ko_step(tmp_project_dir, gemma_text_backend="mock", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    translated = manifest.segments[0]
+    assert translated.status == "transcribed"
+    assert translated.errors == []
+    assert translated.translation_ko is not None
+    assert translated.translation_ko.ko_natural == "하나, 둘, 셋, 넷, 다섯"
+    assert translated.translation_ko.notes == ["numeric_counting_postprocess"]
+    assert manifest.stage_state["translate-ko"]["translated"] == 1
+    assert manifest.stage_state["translate-ko"]["numeric_counting_postprocessed"] == 1
+    assert manifest.stage_state["translate-ko"]["span_count"] == 0
+
+
 def test_translate_ko_repairs_raw_digits_and_records_diagnostics(
     monkeypatch,
     tiny_wav_path: Path,
@@ -3927,6 +6784,137 @@ def test_translate_ko_severe_domain_smell_does_not_reach_korean_script(
     diagnostics = json.loads(Path(manifest.artifacts["translation_diagnostics"]).read_text("utf-8"))
     assert diagnostics["quality_counters"]["domain_mistranslation"] == 1
     assert diagnostics["final_translation_bundles"][0]["status"] == "needs_manual_review"
+
+
+def test_korean_script_records_duration_budget_pressure(
+    tmp_project_dir: Path,
+) -> None:
+    text = "여기는 지금의 세계와는 다른, 평행세계예요."
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=4.04,
+        duration=4.04,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        status="transcribed",
+        source_script=SourceScript(
+            text="ここは今の世界とは違う、平行世界です。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=4.04,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal=text,
+            ko_natural=text,
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    scripted = manifest.segments[0]
+    assert scripted.script is not None
+    timing = scripted.analysis["korean_tts_timing"]
+    budget = korean_tts_timing_budget(segment.duration, segment.source_script.text)
+    assert timing["source_japanese_pronunciation_count"] == 25
+    assert timing["speech_chars"] == korean_tts_speech_char_count(text)
+    assert timing["max_speech_chars"] == budget["max_speech_chars"]
+    assert timing["over_budget"] is False
+    assert scripted.script.expected_tts_duration_sec == pytest.approx(
+        estimate_tts_duration(text, "ko")
+    )
+    assert "korean_tts_timing_over_budget" not in scripted.script.risk_flags
+
+
+def test_korean_script_adapts_stiff_translation_into_spoken_tts(
+    tmp_project_dir: Path,
+) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=3.0,
+        duration=3.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        status="transcribed",
+        source_script=SourceScript(
+            text="私は大丈夫です。これは良いものです。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=3.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="저는 괜찮습니다. 이것은 좋은 것입니다.",
+            ko_natural="저는 괜찮습니다. 이것은 좋은 것입니다.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    scripted = manifest.segments[0]
+    assert scripted.script is not None
+    assert scripted.script.tts_text == "전 괜찮아요. 이건 좋은 거예요."
+    assert scripted.analysis["korean_tts_adaptation"]["tts_text_before"] == (
+        "저는 괜찮습니다. 이것은 좋은 것입니다."
+    )
+    assert scripted.analysis["korean_tts_adaptation"]["reasons"] == [
+        "korean_colloquial_postprocess"
+    ]
+
+
+def test_korean_script_defers_dense_micro_segment_to_structure_policy(
+    tmp_project_dir: Path,
+) -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=0.25,
+        duration=0.25,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        status="transcribed",
+        source_script=SourceScript(
+            text="でも、こんなに硬くなってしまっているし",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=0.25,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="게다가, 이렇게 딱딱해져 버렸고 말이에요.",
+            ko_natural="게다가, 이렇게 딱딱해져 버렸고 말이에요.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    deferred = manifest.segments[0]
+    assert deferred.status == "needs_manual_review"
+    assert deferred.script is None
+    assert deferred.analysis["korean_tts_micro_segment_policy"]["action"] == (
+        "merge_or_absorb_required"
+    )
+    assert any("Micro segment too dense for standalone Korean TTS" in error for error in deferred.errors)
 
 
 def test_translate_ko_diagnostics_record_split_and_single_retry_failure(
@@ -4051,6 +7039,564 @@ def test_korean_script_skips_existing_manual_review_translation(tmp_project_dir:
     manifest = load_manifest(tmp_project_dir)
     assert manifest.segments[0].status == "needs_manual_review"
     assert manifest.segments[0].script is None
+
+
+def test_audio_style_effect_tags_flow_into_korean_script(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    gemma_audio = audio_dir / "seg_0001_gemma.wav"
+    mix_audio = audio_dir / "seg_0001_mix.wav"
+    write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(gemma_audio),
+        audio_for_mix=str(mix_audio),
+        status="transcribed",
+        source_script=SourceScript(
+            text="声に反響と機械的な加工があります",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="목소리에 반향과 기계적인 처리가 있어요.",
+            ko_natural="목소리에 반향과 기계적인 처리가 있어요.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["segment"] = {"status": "completed"}
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    class FakeGemmaBackend:
+        def analyze_audio_style(self, audio_path: Path, segment: Segment, _context: dict[str, object]) -> dict[str, object]:
+            assert audio_path == gemma_audio
+            return {
+                "nonverbal_cues": [],
+                "spatial_style": "left_close",
+                "style_tags": ["sleepy", "robot", "echo"],
+                "emotion": "sleepy",
+                "pace": "very_slow",
+                "volume": "whisper",
+                "estimated_pan": 0.0,
+                "keep_original_texture": True,
+                "risk_flags": [],
+                "confidence": 0.91,
+                "voice_training": {
+                    "clean_voice": False,
+                    "eligible": False,
+                    "reason": "same speaker has robotic echo processing",
+                    "effect_tags": ["robot", "echo"],
+                    "same_speaker_under_effect": True,
+                },
+            }
+
+    monkeypatch.setattr(pipeline_steps, "create_gemma_backend", lambda *_args, **_kwargs: FakeGemmaBackend())
+
+    audio_style_step(tmp_project_dir, "mock", confirm_rights=True)
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    scripted = manifest.segments[0]
+    assert manifest.stage_state["audio-style"]["tagged_segments"] == 1
+    assert scripted.analysis["voice_training"]["effect_tags"] == ["robot", "echo"]
+    assert scripted.script is not None
+    assert scripted.script.emotion == "sleepy"
+    assert scripted.script.pace == "very_slow"
+    assert scripted.script.volume == "whisper"
+    assert scripted.script.spatial_style == "left_close"
+    assert scripted.script.ref_style == "sleepy"
+    assert "sleepy" in scripted.script.style_tags
+    assert "robot" in scripted.script.style_tags
+    assert "echo" in scripted.script.style_tags
+
+
+def test_audio_style_none_tag_marks_segments_without_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    gemma_audio = audio_dir / "seg_0001_gemma.wav"
+    mix_audio = audio_dir / "seg_0001_mix.wav"
+    write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(gemma_audio),
+        audio_for_mix=str(mix_audio),
+        status="transcribed",
+        source_script=SourceScript(
+            text="普通の囁きです",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="평범한 속삭임이에요.",
+            ko_natural="평범한 속삭임이에요.",
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["segment"] = {"status": "completed"}
+    manifest.stage_state["translate-ko"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    class FakeGemmaBackend:
+        def analyze_audio_style(self, audio_path: Path, segment: Segment, _context: dict[str, object]) -> dict[str, object]:
+            assert audio_path == gemma_audio
+            return {
+                "nonverbal_cues": [],
+                "spatial_style": "center",
+                "style_tags": [],
+                "estimated_pan": 0.0,
+                "keep_original_texture": True,
+                "risk_flags": [],
+                "confidence": 0.86,
+                "effect_events": [],
+                "voice_training": {
+                    "clean_voice": True,
+                    "eligible": True,
+                    "reason": "no audible voice effect",
+                    "effect_tags": [],
+                    "same_speaker_under_effect": False,
+                },
+            }
+
+    monkeypatch.setattr(pipeline_steps, "create_gemma_backend", lambda *_args, **_kwargs: FakeGemmaBackend())
+
+    audio_style_step(tmp_project_dir, "mock", confirm_rights=True)
+    korean_script_step(tmp_project_dir, confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    scripted = manifest.segments[0]
+    assert manifest.stage_state["audio-style"]["tagged_segments"] == 0
+    assert scripted.analysis["voice_training"]["effect_tags"] == ["none"]
+    assert scripted.analysis["audio_style"]["effect_tags"] == ["none"]
+    assert scripted.analysis["audio_style"]["effect_events"] == []
+    assert scripted.script is not None
+    assert "none" in scripted.script.style_tags
+
+
+def test_audio_style_llama_server_audio_reuses_managed_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    gemma_audio = audio_dir / "seg_0001_gemma.wav"
+    mix_audio = audio_dir / "seg_0001_mix.wav"
+    write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(gemma_audio),
+        audio_for_mix=str(mix_audio),
+        status="transcribed",
+        source_script=SourceScript(
+            text="声に反響があります",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=1.0,
+        ),
+    )
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_server_auto_start=True,
+            gemma_text_server_url="http://127.0.0.1:18080",
+        ),
+        segments=[segment],
+    )
+    manifest.stage_state["segment"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(manifest.project_config, tmp_project_dir / "pipeline.yaml")
+    events: list[tuple[str, object]] = []
+
+    class FakeServer:
+        def __init__(self, **kwargs: object) -> None:
+            events.append(("server_init", kwargs))
+            self.started = False
+            self.reused_existing = False
+            self.base_url = str(kwargs["base_url"])
+
+        def start(self) -> None:
+            events.append(("server_start", self.base_url))
+            self.started = True
+
+        def stop(self) -> None:
+            events.append(("server_stop", self.base_url))
+
+    class FakeClient:
+        def __init__(self, base_url: str, **kwargs: object) -> None:
+            events.append(("client_init", {"base_url": base_url, **kwargs}))
+
+        def analyze_audio_style(self, audio_path: Path, segment: Segment) -> dict[str, object]:
+            events.append(("analyze_audio_style", {"audio_path": audio_path, "segment_id": segment.id}))
+            return {
+                "nonverbal_cues": [],
+                "spatial_style": "center",
+                "style_tags": ["echo"],
+                "estimated_pan": 0.0,
+                "keep_original_texture": True,
+                "risk_flags": [],
+                "confidence": 0.9,
+                "voice_training": {
+                    "clean_voice": False,
+                    "eligible": False,
+                    "reason": "echo on same speaker",
+                    "effect_tags": ["echo"],
+                    "same_speaker_under_effect": True,
+                },
+            }
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", FakeServer)
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+    monkeypatch.setattr(pipeline_steps, "_gemma_text_server_command", lambda *args, **kwargs: ["llama-server"])
+    monkeypatch.setattr(
+        pipeline_steps,
+        "create_gemma_backend",
+        lambda *_args, **_kwargs: pytest.fail("llama_server_audio should not use per-segment CLI backend"),
+    )
+
+    audio_style_step(tmp_project_dir, "llama_server_audio", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["audio-style"]["server"]["base_url"] == "http://127.0.0.1:18080"
+    assert manifest.stage_state["audio-style"]["server"]["server_count"] == 1
+    assert manifest.segments[0].analysis["voice_training"]["effect_tags"] == ["echo"]
+    assert ("server_start", "http://127.0.0.1:18080") in events
+    assert ("server_stop", "http://127.0.0.1:18080") in events
+    assert any(event[0] == "analyze_audio_style" for event in events)
+
+
+def test_audio_style_llama_server_audio_keeps_adjacent_segments_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    segments: list[Segment] = []
+    for index, (start, end) in enumerate([(0.0, 1.0), (1.1, 2.1)], start=1):
+        segment_id = f"seg_{index:04d}"
+        gemma_audio = audio_dir / f"{segment_id}_gemma.wav"
+        mix_audio = audio_dir / f"{segment_id}_mix.wav"
+        write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+        write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+        segments.append(
+            Segment(
+                id=segment_id,
+                start=start,
+                end=end,
+                duration=end - start,
+                audio_for_gemma=str(gemma_audio),
+                audio_for_mix=str(mix_audio),
+                status="transcribed",
+                source_script=SourceScript(
+                    text="普通の囁きです",
+                    language="ja",
+                    backend="mock",
+                    start=start,
+                    end=end,
+                ),
+            )
+        )
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_server_auto_start=True,
+            gemma_text_server_url="http://127.0.0.1:18080",
+            gemma_audio_style_concurrency=2,
+            gemma_text_span_size=4,
+            gemma_text_span_max_sec=30.0,
+            gemma_text_span_max_gap_sec=1.0,
+        ),
+        segments=segments,
+    )
+    manifest.stage_state["segment"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(manifest.project_config, tmp_project_dir / "pipeline.yaml")
+    events: list[tuple[str, object]] = []
+    started_segment_ids: list[str] = []
+    started_lock = Lock()
+    both_requests_started = Event()
+
+    class FakeServer:
+        def __init__(self, **kwargs: object) -> None:
+            self.started = False
+            self.reused_existing = False
+            self.base_url = str(kwargs["base_url"])
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            events.append(("server_stop", self.base_url))
+
+    class FakeClient:
+        def __init__(self, base_url: str, **kwargs: object) -> None:
+            events.append(("client_init", {"base_url": base_url, **kwargs}))
+
+        def analyze_audio_style(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            audio_path, segment = _args
+            with started_lock:
+                started_segment_ids.append(segment.id)
+                if len(started_segment_ids) == 2:
+                    both_requests_started.set()
+            assert both_requests_started.wait(1.0), "audio-style requests should run concurrently"
+            events.append(("analyze_audio_style", {"audio_path": audio_path, "segment_id": segment.id}))
+            return {
+                "nonverbal_cues": [],
+                "spatial_style": "center",
+                "style_tags": [],
+                "estimated_pan": segment.estimated_pan,
+                "keep_original_texture": True,
+                "risk_flags": [],
+                "confidence": 0.9,
+                "effect_events": [],
+                "voice_training": {
+                    "clean_voice": True,
+                    "eligible": True,
+                    "reason": "plain segment voice",
+                    "effect_tags": [],
+                    "same_speaker_under_effect": False,
+                },
+            }
+
+        def analyze_audio_style_batch(
+            self,
+            audio_path: Path,
+            batch_segments: list[Segment],
+            *,
+            clip_segments: list[dict[str, object]],
+        ) -> dict[str, dict[str, object]]:
+            pytest.fail("audio-style should not batch adjacent segments because effects can differ")
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", FakeServer)
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FakeClient)
+
+    def fake_server_command(*args: object, **kwargs: object) -> list[str]:
+        events.append(("server_command", kwargs))
+        return ["llama-server"]
+
+    monkeypatch.setattr(pipeline_steps, "_gemma_text_server_command", fake_server_command)
+
+    audio_style_step(tmp_project_dir, "llama_server_audio", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    style_events = [event for event in events if event[0] == "analyze_audio_style"]
+    assert sorted(event[1]["segment_id"] for event in style_events) == ["seg_0001", "seg_0002"]
+    server_command_events = [event for event in events if event[0] == "server_command"]
+    assert server_command_events[0][1]["parallel_slots"] == 2
+    assert manifest.stage_state["audio-style"]["styled"] == 2
+    assert manifest.stage_state["audio-style"]["concurrency"] == 2
+    assert manifest.stage_state["audio-style"]["server"]["parallel_slots"] == 2
+    assert "batch_requests" not in manifest.stage_state["audio-style"]
+    assert manifest.segments[0].analysis["audio_style"]["effect_tags"] == ["none"]
+    assert manifest.segments[1].analysis["audio_style"]["effect_tags"] == ["none"]
+
+
+def test_audio_style_skips_existing_analysis_without_force(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    gemma_audio = audio_dir / "seg_0001_gemma.wav"
+    mix_audio = audio_dir / "seg_0001_mix.wav"
+    write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(gemma_audio),
+        audio_for_mix=str(mix_audio),
+        status="transcribed",
+        analysis={
+            "audio_style": {
+                "backend_task": "audio_style",
+                "effect_tags": ["echo"],
+                "effect_events": [],
+                "confidence": 0.9,
+            },
+            "voice_training": {
+                "clean_voice": False,
+                "eligible": False,
+                "reason": "existing echo analysis",
+                "effect_tags": ["echo"],
+                "same_speaker_under_effect": True,
+            },
+        },
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["segment"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+
+    class FailingGemmaBackend:
+        def analyze_audio_style(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            pytest.fail("audio-style should reuse existing segment analysis unless force=True")
+
+    monkeypatch.setattr(pipeline_steps, "create_gemma_backend", lambda *_args, **_kwargs: FailingGemmaBackend())
+
+    audio_style_step(tmp_project_dir, "mock", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["audio-style"]["styled"] == 0
+    assert manifest.stage_state["audio-style"]["skipped_existing"] == 1
+    assert manifest.stage_state["audio-style"]["tagged_segments"] == 1
+    assert manifest.segments[0].analysis["audio_style"]["effect_tags"] == ["echo"]
+
+
+def test_audio_style_skip_existing_analysis_does_not_start_llama_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    gemma_audio = audio_dir / "seg_0001_gemma.wav"
+    mix_audio = audio_dir / "seg_0001_mix.wav"
+    write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(gemma_audio),
+        audio_for_mix=str(mix_audio),
+        status="transcribed",
+        analysis={
+            "audio_style": {
+                "backend_task": "audio_style",
+                "effect_tags": ["none"],
+                "effect_events": [],
+                "confidence": 0.9,
+            },
+            "voice_training": {
+                "clean_voice": True,
+                "eligible": True,
+                "reason": "existing plain analysis",
+                "effect_tags": ["none"],
+                "same_speaker_under_effect": False,
+            },
+        },
+    )
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gemma_text_server_auto_start=True,
+            gemma_text_server_url="http://127.0.0.1:18080",
+        ),
+        segments=[segment],
+    )
+    manifest.stage_state["segment"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+    save_project_config(manifest.project_config, tmp_project_dir / "pipeline.yaml")
+
+    class FailingServer:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("audio-style should not start llama-server when every segment is reused")
+
+    class FailingClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pytest.fail("audio-style should not create a llama-server client when every segment is reused")
+
+    monkeypatch.setattr(pipeline_steps, "ManagedGemmaTextServer", FailingServer)
+    monkeypatch.setattr(pipeline_steps, "LlamaServerTranslationClient", FailingClient)
+
+    audio_style_step(tmp_project_dir, "llama_server_audio", confirm_rights=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert manifest.stage_state["audio-style"]["styled"] == 0
+    assert manifest.stage_state["audio-style"]["skipped_existing"] == 1
+    assert manifest.stage_state["audio-style"]["server"] is None
+
+
+def test_audio_style_force_reanalyzes_existing_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project_dir: Path,
+) -> None:
+    audio_dir = tmp_project_dir / "work" / "segments" / "audio"
+    gemma_audio = audio_dir / "seg_0001_gemma.wav"
+    mix_audio = audio_dir / "seg_0001_mix.wav"
+    write_audio(gemma_audio, np.zeros((16_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((48_000, 2), dtype=np.float32), 48_000)
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma=str(gemma_audio),
+        audio_for_mix=str(mix_audio),
+        status="transcribed",
+        analysis={
+            "audio_style": {
+                "backend_task": "audio_style",
+                "effect_tags": ["none"],
+                "effect_events": [],
+                "confidence": 0.8,
+            },
+            "voice_training": {
+                "clean_voice": True,
+                "eligible": True,
+                "reason": "existing plain analysis",
+                "effect_tags": ["none"],
+                "same_speaker_under_effect": False,
+            },
+        },
+    )
+    manifest = PipelineManifest(segments=[segment])
+    manifest.stage_state["segment"] = {"status": "completed"}
+    save_manifest(tmp_project_dir, manifest)
+    calls: list[str] = []
+
+    class FakeGemmaBackend:
+        def analyze_audio_style(self, audio_path: Path, segment: Segment, _context: dict[str, object]) -> dict[str, object]:
+            calls.append(segment.id)
+            assert audio_path == gemma_audio
+            return {
+                "nonverbal_cues": [],
+                "spatial_style": "center",
+                "style_tags": ["robot"],
+                "estimated_pan": 0.0,
+                "keep_original_texture": True,
+                "risk_flags": [],
+                "confidence": 0.93,
+                "voice_training": {
+                    "clean_voice": False,
+                    "eligible": False,
+                    "reason": "forced reanalysis found robot processing",
+                    "effect_tags": ["robot"],
+                    "same_speaker_under_effect": True,
+                },
+            }
+
+    monkeypatch.setattr(pipeline_steps, "create_gemma_backend", lambda *_args, **_kwargs: FakeGemmaBackend())
+
+    audio_style_step(tmp_project_dir, "mock", confirm_rights=True, force=True)
+
+    manifest = load_manifest(tmp_project_dir)
+    assert calls == ["seg_0001"]
+    assert manifest.stage_state["audio-style"]["styled"] == 1
+    assert manifest.stage_state["audio-style"]["skipped_existing"] == 0
+    assert manifest.segments[0].analysis["audio_style"]["effect_tags"] == ["robot"]
 
 
 @pytest.mark.parametrize(
@@ -4248,6 +7794,70 @@ def test_translate_ko_cli_accepts_repair_retry_options(
     assert kwargs["force_retranslate_failed"] is True
 
 
+def test_synth_cli_accepts_only_segments(
+    cli_runner,
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_synth_step(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest()
+
+    monkeypatch.setattr(cli_module, "synth_step", fake_synth_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "synth",
+            "-p",
+            str(tmp_project_dir),
+            "--mock",
+            "--confirm-rights",
+            "--only-segments",
+            "seg_0001, seg_0020,,seg_0001",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["only_segment_ids"] == {"seg_0001", "seg_0020"}
+
+
+def test_korean_script_cli_runs_stage(
+    cli_runner,
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_korean_script_step(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest()
+
+    monkeypatch.setattr(cli_module, "korean_script_step", fake_korean_script_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "korean-script",
+            "-p",
+            str(tmp_project_dir),
+            "--confirm-rights",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == (tmp_project_dir.resolve(),)
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["confirm_rights"] is True
+
+
 def test_korean_script_blocks_japanese_fallback_text(tmp_project_dir: Path) -> None:
     segment = Segment(
         id="seg_0001",
@@ -4342,6 +7952,7 @@ def test_transcribe_cli_accepts_asr_debug_options(
             "--asr-batched",
             "--asr-batch-size",
             "16",
+            "--no-asr-repair",
         ],
     )
 
@@ -4355,6 +7966,7 @@ def test_transcribe_cli_accepts_asr_debug_options(
     assert kwargs["asr_compute_type"] == "float16"
     assert kwargs["asr_batched_inference"] is True
     assert kwargs["asr_batch_size"] == 16
+    assert kwargs["asr_repair_enabled"] is False
 
 
 def test_translate_ko_requires_transcribe_stage(tiny_wav_path: Path, tmp_project_dir: Path) -> None:
@@ -4765,6 +8377,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     monkeypatch.setattr(orchestrator, "source_separation_step", step("source-separation"))
     monkeypatch.setattr(orchestrator, "segment_step", step("segment"))
     monkeypatch.setattr(orchestrator, "analyze_step", step("analyze"))
+    monkeypatch.setattr(orchestrator, "audio_style_step", step("audio-style"))
     monkeypatch.setattr(orchestrator, "script_step", step("script"))
     monkeypatch.setattr(orchestrator, "transcribe_step", step("transcribe"))
     monkeypatch.setattr(orchestrator, "translate_ko_step", step("translate-ko"))
@@ -4799,6 +8412,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "transcribe",
         "segment",
         "source-speakers",
+        "audio-style",
         "translate-ko",
         "korean-script",
         "prepare-refs",
@@ -4811,11 +8425,24 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "export",
     ]
     assert calls[3][2]["asr_backend"] == "qwen_asr"
-    assert calls[6][1][1] == "llama_server"
-    assert calls[10][2]["mock"] is False
+    assert calls[6][1][1] == "hf"
+    assert calls[7][1][1] == "llama_server"
     assert calls[11][2]["mock"] is False
     assert calls[12][2]["mock"] is False
-    assert calls[13][1][1] == "mock"
+    assert calls[13][2]["mock"] is False
+    assert calls[14][1][1] == "mock"
+
+    calls.clear()
+    orchestrator.run_pipeline(
+        tmp_path / "input.wav",
+        tmp_path / "project_llama_cpp",
+        confirm_rights=True,
+        mock=False,
+        gemma_backend="llama_cpp",
+        target_language="kr",
+        asr_backend="qwen_asr",
+    )
+    assert calls[6][1][1] == "llama_server_audio"
 
     calls.clear()
     orchestrator.run_pipeline(
@@ -4831,3 +8458,106 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     names = [name for name, _, _ in calls]
     assert names[names.index("qc") + 1] == "regenerate"
     assert names[names.index("regenerate") + 1] == "mix"
+
+
+def test_target_language_ko_auto_demucs_fallback_reruns_asr_after_poor_raw_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    project_dir = tmp_path / "project"
+    transcribe_call_count = 0
+
+    def step(name: str):
+        def inner(*args: object, **kwargs: object) -> PipelineManifest:
+            calls.append((name, args, kwargs))
+            return PipelineManifest()
+
+        return inner
+
+    def fake_init(path: Path) -> PipelineManifest:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        calls.append(("init", (path,), {}))
+        return PipelineManifest()
+
+    def fake_transcribe(*args: object, **kwargs: object) -> PipelineManifest:
+        nonlocal transcribe_call_count
+        transcribe_call_count += 1
+        calls.append(("transcribe", args, kwargs))
+        summary_path = project_dir / "work/transcribe/asr_diagnostics_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        if transcribe_call_count == 1:
+            summary = {
+                "source_separation_fallback": {
+                    "recommended": True,
+                    "recommended_backend": "demucs",
+                    "reasons": ["manual_review_rate"],
+                    "metrics": {"manual_review_rate": 0.03},
+                },
+                "recommend_source_separation_fallback": True,
+            }
+        else:
+            summary = {
+                "source_separation_fallback": {
+                    "recommended": False,
+                    "reason": "source_separation_already_used",
+                },
+                "recommend_source_separation_fallback": False,
+            }
+        summary_path.write_text(json.dumps(summary), "utf-8")
+        return PipelineManifest(artifacts={"asr_diagnostics_summary": str(summary_path)})
+
+    monkeypatch.setattr(orchestrator, "init_project", fake_init)
+    monkeypatch.setattr(orchestrator, "extract_step", step("extract"))
+    monkeypatch.setattr(orchestrator, "source_separation_step", step("source-separation"))
+    monkeypatch.setattr(orchestrator, "segment_step", step("segment"))
+    monkeypatch.setattr(orchestrator, "analyze_step", step("analyze"))
+    monkeypatch.setattr(orchestrator, "audio_style_step", step("audio-style"))
+    monkeypatch.setattr(orchestrator, "script_step", step("script"))
+    monkeypatch.setattr(orchestrator, "transcribe_step", fake_transcribe)
+    monkeypatch.setattr(orchestrator, "translate_ko_step", step("translate-ko"))
+    monkeypatch.setattr(orchestrator, "korean_script_step", step("korean-script"))
+    monkeypatch.setattr(orchestrator, "source_speakers_step", step("source-speakers"))
+    monkeypatch.setattr(orchestrator, "prepare_source_voice_refs_step", step("prepare-refs"))
+    monkeypatch.setattr(orchestrator, "gsv_few_shot_step", step("gsv-few-shot"))
+    monkeypatch.setattr(orchestrator, "synth_step", step("synth"))
+    monkeypatch.setattr(orchestrator, "rvc_train_step", step("train-rvc"))
+    monkeypatch.setattr(orchestrator, "rvc_step", step("rvc"))
+    monkeypatch.setattr(orchestrator, "qc_step", step("qc"))
+    monkeypatch.setattr(orchestrator, "regenerate_needs_step", step("regenerate"))
+    monkeypatch.setattr(orchestrator, "mix_step", step("mix"))
+    monkeypatch.setattr(orchestrator, "export_step", step("export"))
+    monkeypatch.setattr(orchestrator, "validate_rvc_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "validate_rvc_training_config", lambda *args, **kwargs: None)
+
+    orchestrator.run_pipeline(
+        tmp_path / "input.wav",
+        project_dir,
+        confirm_rights=True,
+        mock=False,
+        gemma_backend="hf",
+        target_language="ko",
+        asr_backend="faster_whisper",
+        asr_preset="whisper",
+        asr_batched_inference=True,
+        asr_batch_size=16,
+    )
+
+    assert [name for name, _, _ in calls[:6]] == [
+        "init",
+        "extract",
+        "source-separation",
+        "transcribe",
+        "source-separation",
+        "transcribe",
+    ]
+    source_separation_calls = [call for call in calls if call[0] == "source-separation"]
+    assert len(source_separation_calls) == 2
+    assert source_separation_calls[1][2] == {"confirm_rights": True, "force": True}
+    transcribe_calls = [call for call in calls if call[0] == "transcribe"]
+    assert len(transcribe_calls) == 2
+    assert transcribe_calls[1][2]["asr_backend"] == "faster_whisper"
+    assert transcribe_calls[1][2]["asr_preset"] == "whisper"
+    assert transcribe_calls[1][2]["asr_batched_inference"] is True
+    assert transcribe_calls[1][2]["asr_batch_size"] == 16
+    assert orchestrator.load_project_config(project_dir).source_separation_backend == "demucs"

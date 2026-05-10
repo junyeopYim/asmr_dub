@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+import asmr_dub_pipeline.audio.mixing as mixing
 from asmr_dub_pipeline.audio.mixing import (
     build_dialogue_stem,
     build_segment_mix_plan,
@@ -170,6 +171,124 @@ def test_dialogue_stem_can_include_segment_with_predicate(tmp_path: Path) -> Non
     assert np.max(np.abs(_read_wav(draft_output))) > 0.0
 
 
+def test_dialogue_stem_applies_voice_effect_bus_from_tags(tmp_path: Path) -> None:
+    tts = _write_wav(tmp_path / "tts.wav", _sine(0.20, frequency=1_000.0, channels=1))
+    effect_output = tmp_path / "effect.wav"
+    dry_output = tmp_path / "dry.wav"
+    effect_segment = _passing_segment("seg_effect", 0.05, 0.20, 0.0, tts)
+    effect_segment.script = JapaneseScript(
+        ja_text="聞こえますか。",
+        tts_text="聞こえますか。",
+        style_tags=["telephone"],
+    )
+    dry_segment = _passing_segment("seg_dry", 0.05, 0.20, 0.0, tts)
+
+    build_dialogue_stem([effect_segment], effect_output, target_duration_sec=0.40, sample_rate=SAMPLE_RATE)
+    build_dialogue_stem([dry_segment], dry_output, target_duration_sec=0.40, sample_rate=SAMPLE_RATE)
+
+    assert effect_segment.mix["effects"][0]["name"] == "telephone"
+    assert not dry_segment.mix.get("effects")
+    effect_audio = _read_wav(effect_output)
+    dry_audio = _read_wav(dry_output)
+    assert _rms(effect_audio) > 0.0
+    assert not np.allclose(effect_audio, dry_audio, atol=1e-5)
+
+
+def test_dialogue_stem_uses_audio_style_effect_event_parameters(tmp_path: Path) -> None:
+    tts = _write_wav(tmp_path / "tts.wav", _sine(0.20, frequency=1_000.0, channels=1))
+    output = tmp_path / "effect_event.wav"
+    segment = _passing_segment("seg_effect_event", 0.05, 0.20, 0.0, tts)
+    segment.analysis = {
+        "voice_training": {
+            "effect_tags": ["echo"],
+        },
+        "audio_style": {
+            "effect_tags": ["echo"],
+            "effect_events": [
+                {
+                    "tag": "echo",
+                    "target": "voice",
+                    "start_sec": 0.0,
+                    "end_sec": 0.20,
+                    "intensity": 0.45,
+                    "confidence": 0.88,
+                    "params": {
+                        "delays_ms": [96.0],
+                        "decays": [0.32],
+                    },
+                }
+            ],
+        },
+    }
+
+    build_dialogue_stem([segment], output, target_duration_sec=0.40, sample_rate=SAMPLE_RATE)
+
+    assert segment.mix["effects"][0]["name"] == "echo"
+    assert segment.mix["effects"][0]["settings"]["intensity"] == 0.45
+    assert segment.mix["effects"][0]["settings"]["delays_ms"] == [96.0]
+    assert segment.mix["effects"][0]["target"] == "voice"
+    assert segment.mix["effects"][0]["confidence"] == 0.88
+
+
+def test_dialogue_stem_writes_timeline_without_full_buffer(monkeypatch, tmp_path: Path) -> None:
+    duration_sec = 2.0
+    tts = _write_wav(tmp_path / "tts.wav", _sine(0.12, frequency=180.0, channels=1))
+    output = tmp_path / "dialogue_stem.wav"
+    segment = _passing_segment("seg_streamed", 0.50, 0.12, 0.0, tts)
+    original_zeros = mixing.np.zeros
+    forbidden_shape = (_frame(duration_sec), 2)
+
+    def guarded_zeros(shape, *args, **kwargs):
+        if tuple(shape) == forbidden_shape:
+            raise AssertionError("dialogue stem should not allocate the full timeline")
+        return original_zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(mixing.np, "zeros", guarded_zeros)
+
+    build_dialogue_stem([segment], output, target_duration_sec=duration_sec, sample_rate=SAMPLE_RATE)
+
+    stem = _read_wav(output)
+    assert stem.shape == forbidden_shape
+    assert np.max(np.abs(stem)) > 0.0
+
+
+def test_dialogue_stem_caches_room_tone_source_loads(monkeypatch, tmp_path: Path) -> None:
+    tts = _write_wav(tmp_path / "tts.wav", _sine(0.18, frequency=240.0, channels=1))
+    room_path = _write_wav(tmp_path / "source_room.wav", _room_tone(0.70, amplitude=0.01, seed=13))
+    output = tmp_path / "dialogue.wav"
+    segment = Segment(
+        id="seg_room_cache",
+        start=0.30,
+        end=0.48,
+        duration=0.18,
+        audio_for_gemma=str(room_path),
+        audio_for_mix=str(room_path),
+        status="ok",
+        script=JapaneseScript(
+            ja_text="ゆっくり待ってね。",
+            tts_text="ゆっくり待ってね。",
+            spatial_style="sleepy_center",
+            nonverbal_cues=[NonverbalCue(kind="pause", position=99, pause_sec=0.5)],
+        ),
+        tts=TTSMetadata(selected_candidate_path=str(tts)),
+        qc=QCMetadata(recommendation="pass", status="ok"),
+    )
+    original_load_for_mix = mixing._load_for_mix
+    room_loads: list[Path] = []
+
+    def counting_load_for_mix(path: Path, target_sr: int) -> np.ndarray:
+        if Path(path) == room_path:
+            room_loads.append(Path(path))
+        return original_load_for_mix(path, target_sr)
+
+    monkeypatch.setattr(mixing, "_load_for_mix", counting_load_for_mix)
+
+    build_dialogue_stem([segment], output, target_duration_sec=0.90, sample_rate=SAMPLE_RATE)
+
+    assert room_loads == [room_path]
+    assert segment.mix["room_tone_used"] is True
+
+
 def test_overlay_segment_reuses_base_buffer(tmp_path: Path) -> None:
     base = np.zeros((_frame(0.35), 2), dtype=np.float32)
     clip = np.ones((_frame(0.12), 1), dtype=np.float32) * 0.08
@@ -244,6 +363,34 @@ def test_background_bed_is_preserved_without_aggressive_normalization(tmp_path: 
     pause = slice(_frame(0.32), _frame(0.48))
     assert _rms(mixed[pause]) > 0.001
     assert np.max(np.abs(mixed)) < 0.10
+
+
+def test_mix_with_background_streams_without_full_mix_load(monkeypatch, tmp_path: Path) -> None:
+    duration_sec = 0.80
+    dialogue = np.zeros((_frame(duration_sec), 2), dtype=np.float32)
+    dialogue[_frame(0.10) : _frame(0.24)] = _sine(0.14, amplitude=0.07)
+    background = _room_tone(duration_sec, amplitude=0.012, seed=17)
+    dialogue_path = _write_wav(tmp_path / "dialogue.wav", dialogue)
+    background_path = _write_wav(tmp_path / "background.wav", background)
+    output = tmp_path / "final_audio.wav"
+
+    def forbidden_load_for_mix(path: Path, target_sr: int) -> np.ndarray:
+        raise AssertionError(f"streamable final mix should not load full audio: {path}")
+
+    monkeypatch.setattr(mixing, "_load_for_mix", forbidden_load_for_mix)
+
+    mix_with_background(
+        dialogue_path,
+        output,
+        background_path,
+        background_gain_db=-12.0,
+        sample_rate=SAMPLE_RATE,
+        suppress_background_speech=False,
+    )
+
+    mixed = _read_wav(output)
+    expected = dialogue + background * db_to_gain(-12.0)
+    np.testing.assert_allclose(mixed, expected, atol=8e-5)
 
 
 def test_background_speech_bleed_reduction_attenuates_center_voice_band() -> None:
@@ -404,6 +551,25 @@ def test_score_qc_warns_for_too_much_leading_or_trailing_silence(tmp_path: Path)
     assert metrics["trailing_silence_sec"] >= 0.54
     assert "too_much_silence" in qc.issues
     assert qc.status == "needs_regeneration"
+
+
+def test_score_qc_allows_intentional_source_pause_padding(tmp_path: Path) -> None:
+    data = np.concatenate(
+        [
+            _sine(0.70, amplitude=0.06),
+            np.zeros((_frame(4.30), 2), dtype=np.float32),
+        ],
+        axis=0,
+    )
+    padded_path = _write_wav(tmp_path / "source_pause_padded.wav", data)
+    metrics = measure_audio_qc(padded_path, target_duration_sec=5.0)
+    metrics["intentional_trailing_silence_sec"] = 4.30
+
+    qc = score_qc(metrics, {"recommendation": "pass"})
+
+    assert metrics["trailing_silence_sec"] >= 4.29
+    assert "too_much_silence" not in qc.issues
+    assert qc.status == "ok"
 
 
 def test_score_qc_allows_short_asmr_edge_pause_on_long_segment(tmp_path: Path) -> None:

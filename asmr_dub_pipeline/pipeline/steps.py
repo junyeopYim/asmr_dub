@@ -15,6 +15,7 @@ from asmr_dub_pipeline.pipeline.stages.voice_bank_cache import run_import_voice_
 from asmr_dub_pipeline.pipeline.stages.segment import run_segment_stage
 from asmr_dub_pipeline.pipeline.stages.transcribe import run_transcribe_stage
 from asmr_dub_pipeline.pipeline.stages.analyze import run_analyze_stage
+from asmr_dub_pipeline.pipeline.stages.audio_style import run_audio_style_stage
 from asmr_dub_pipeline.pipeline.stages.script import run_script_stage
 from asmr_dub_pipeline.pipeline.stages.translate_ko import run_translate_ko_stage
 from asmr_dub_pipeline.pipeline.stages.korean_script import run_korean_script_stage
@@ -34,6 +35,7 @@ from asmr_dub_pipeline.pipeline.stages.mix import run_mix_stage
 from asmr_dub_pipeline.pipeline.stages.export import run_export_stage
 
 from asmr_dub_pipeline.pipeline.stages import analyze as _analyze_stage
+from asmr_dub_pipeline.pipeline.stages import audio_style as _audio_style_stage
 from asmr_dub_pipeline.pipeline.stages import experimental_tts as _experimental_tts_stage
 from asmr_dub_pipeline.pipeline.stages import export as _export_stage
 from asmr_dub_pipeline.pipeline.stages import extract as _extract_stage
@@ -74,13 +76,17 @@ def segment_step(project_dir: Path, confirm_rights: bool = False) -> PipelineMan
     ctx = PipelineContext.load(project_dir)
     return run_segment_stage(ctx, confirm_rights)
 
-def transcribe_step(project_dir: Path, asr_backend: str | None = None, confirm_rights: bool = False, asr_review: bool | None = None, asr_preset: str | None = None, asr_vad_off: bool | None = None, asr_diagnostics: bool | None = None, asr_device: str | None = None, asr_compute_type: str | None = None, asr_batched_inference: bool | None = None, asr_batch_size: int | None = None) -> PipelineManifest:
+def transcribe_step(project_dir: Path, asr_backend: str | None = None, confirm_rights: bool = False, asr_review: bool | None = None, asr_preset: str | None = None, asr_vad_off: bool | None = None, asr_diagnostics: bool | None = None, asr_device: str | None = None, asr_compute_type: str | None = None, asr_batched_inference: bool | None = None, asr_batch_size: int | None = None, asr_repair_enabled: bool | None = None, asr_backend_factory: Any | None = None) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_transcribe_stage(ctx, asr_backend, confirm_rights, asr_review, asr_preset, asr_vad_off, asr_diagnostics, asr_device, asr_compute_type, asr_batched_inference, asr_batch_size)
+    return run_transcribe_stage(ctx, asr_backend, confirm_rights, asr_review, asr_preset, asr_vad_off, asr_diagnostics, asr_device, asr_compute_type, asr_batched_inference, asr_batch_size, asr_repair_enabled, asr_backend_factory)
 
 def analyze_step(project_dir: Path, backend_kind: str, model_id: str | None = None, confirm_rights: bool = False) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
     return run_analyze_stage(ctx, backend_kind, model_id, confirm_rights)
+
+def audio_style_step(project_dir: Path, backend_kind: str, model_id: str | None = None, confirm_rights: bool = False, force: bool = False) -> PipelineManifest:
+    ctx = PipelineContext.load(project_dir)
+    return run_audio_style_stage(ctx, backend_kind, model_id, confirm_rights, force)
 
 def script_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -94,9 +100,9 @@ def korean_script_step(project_dir: Path, confirm_rights: bool = False) -> Pipel
     ctx = PipelineContext.load(project_dir)
     return run_korean_script_stage(ctx, confirm_rights)
 
-def source_speakers_step(project_dir: Path, backend_kind: str | None = None, confirm_rights: bool = False) -> PipelineManifest:
+def source_speakers_step(project_dir: Path, backend_kind: str | None = None, confirm_rights: bool = False, jobs: int = 4) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_source_speakers_stage(ctx, backend_kind, confirm_rights)
+    return run_source_speakers_stage(ctx, backend_kind, confirm_rights, jobs)
 
 def assign_speakers_step(project_dir: Path, voice_bank_path: Path | None = None, backend_kind: str | None = None, require_all: bool = True) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -110,9 +116,9 @@ def gsv_few_shot_step(project_dir: Path, confirm_rights: bool = False, force: bo
     ctx = PipelineContext.load(project_dir)
     return run_gsv_few_shot_stage(ctx, confirm_rights, force, gsv_url, gsv_server_command)
 
-def synth_step(project_dir: Path, gsv_url: str | None, refs_path: Path, mock: bool = False, confirm_rights: bool = False, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, use_trained_gpt: bool = False, only_segment_ids: set[str] | None = None) -> PipelineManifest:
+def synth_step(project_dir: Path, gsv_url: str | None, refs_path: Path, mock: bool = False, confirm_rights: bool = False, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, use_trained_gpt: bool = False, only_segment_ids: set[str] | None = None, retry_failed: bool = False, force: bool = False) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_synth_stage(ctx, gsv_url, refs_path, mock, confirm_rights, gpt_weights_path, sovits_weights_path, auto_gsv_server, gsv_server_command, use_trained_gpt, only_segment_ids)
+    return run_synth_stage(ctx, gsv_url, refs_path, mock, confirm_rights, gpt_weights_path, sovits_weights_path, auto_gsv_server, gsv_server_command, use_trained_gpt, only_segment_ids, retry_failed, force)
 
 def synth_qwen_step(project_dir: Path, refs_path: Path, confirm_rights: bool = False, *, model_id: str | None = None, candidate_count: int | None = None, candidate_batch_size: int | None = None, segment_batch_size: int | None = None, target_vram_gb: float | None = None, promote: bool = False, local_files_only: bool | None = None, only_segment_ids: set[str] | None = None) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -151,7 +157,7 @@ def export_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> Pi
     return run_export_stage(ctx, input_path, confirm_rights)
 
 
-_COMPAT_MODULES = (_common_stage, _analyze_stage, _experimental_tts_stage, _export_stage, _extract_stage, _gsv_few_shot_stage, _korean_script_stage, _mix_stage, _project_stage, _qc_stage, _regenerate_stage, _rvc_stage, _rvc_train_stage, _script_stage, _segment_stage, _source_separation_stage, _source_speakers_stage, _speaker_assignment_stage, _synth_gpt_sovits_stage, _synth_qwen_stage, _transcribe_stage, _translate_ko_stage, _voice_bank_cache_stage, _voice_refs_stage,)
+_COMPAT_MODULES = (_common_stage, _analyze_stage, _audio_style_stage, _experimental_tts_stage, _export_stage, _extract_stage, _gsv_few_shot_stage, _korean_script_stage, _mix_stage, _project_stage, _qc_stage, _regenerate_stage, _rvc_stage, _rvc_train_stage, _script_stage, _segment_stage, _source_separation_stage, _source_speakers_stage, _speaker_assignment_stage, _synth_gpt_sovits_stage, _synth_qwen_stage, _transcribe_stage, _translate_ko_stage, _voice_bank_cache_stage, _voice_refs_stage,)
 
 class _StepsCompatModule(types.ModuleType):
     def __setattr__(self, name: str, value: object) -> None:

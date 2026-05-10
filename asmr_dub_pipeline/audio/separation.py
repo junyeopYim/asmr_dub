@@ -5,14 +5,17 @@ import json
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .features import ensure_stereo, load_audio, resample_linear, to_mono, write_audio
-from .ffmpeg import FFmpegError, run_ffmpeg
+from .features import duration_sec, ensure_stereo, load_audio, resample_linear, to_mono, write_audio
+from .ffmpeg import FFmpegError, run_ffmpeg, wav_output_args
 
 SourceSeparationBackend = Literal["auto", "none", "demucs", "mock"]
+MAX_PARTWISE_SOURCE_SEPARATION_WORKERS = 2
 
 
 class SourceSeparationUnavailable(RuntimeError):
@@ -29,6 +32,17 @@ class SourceSeparationResult:
     metadata_path: Path
     reused_existing: bool
     command: list[str]
+
+
+@dataclass(frozen=True)
+class _PartwiseSeparationResult:
+    part_index: int
+    input_path: Path
+    command: list[str]
+    vocals_path: Path
+    vocals_mono_path: Path
+    background_path: Path
+    duration_sec: float
 
 
 def demucs_available() -> bool:
@@ -49,6 +63,46 @@ def _demucs_command(
         command.extend(["-d", device])
     command.append(str(input_audio_path))
     return command
+
+
+def _quote_ffmpeg_concat_path(path: Path) -> str:
+    return str(path.resolve()).replace("'", "'\\''")
+
+
+def _concat_audio_files_streaming(
+    input_paths: Sequence[Path],
+    output_path: Path,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    if not input_paths:
+        raise SourceSeparationUnavailable("Cannot concatenate empty Demucs part outputs.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    list_path = output_path.with_suffix(output_path.suffix + ".concat.txt")
+    list_path.write_text(
+        "".join(f"file '{_quote_ffmpeg_concat_path(path)}'\n" for path in input_paths),
+        "utf-8",
+    )
+    run_ffmpeg(
+        [
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-vn",
+            "-ac",
+            str(channels),
+            "-ar",
+            str(sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            *wav_output_args(output_path),
+        ]
+    )
 
 
 def _find_demucs_stem(output_dir: Path, model: str, input_stem: str, stem_name: str) -> Path:
@@ -85,7 +139,7 @@ def _convert_audio_streaming(
             str(sample_rate),
             "-c:a",
             "pcm_s16le",
-            str(output_path),
+            *wav_output_args(output_path),
         ]
     )
 
@@ -118,7 +172,7 @@ def _write_normalized_stems_streaming(
             str(sample_rate),
             "-c:a",
             "pcm_s16le",
-            str(vocals_path),
+            *wav_output_args(vocals_path),
             "-map",
             "1:a:0",
             "-ac",
@@ -127,7 +181,7 @@ def _write_normalized_stems_streaming(
             str(sample_rate),
             "-c:a",
             "pcm_s16le",
-            str(background_path),
+            *wav_output_args(background_path),
             "-map",
             "0:a:0",
             "-ac",
@@ -136,7 +190,7 @@ def _write_normalized_stems_streaming(
             str(mono_sample_rate),
             "-c:a",
             "pcm_s16le",
-            str(vocals_mono_path),
+            *wav_output_args(vocals_mono_path),
         ]
     )
 
@@ -174,6 +228,8 @@ def _write_normalized_stems(
     background_path: Path,
     sample_rate: int,
     mono_sample_rate: int,
+    *,
+    allow_in_memory_fallback: bool = True,
 ) -> str:
     try:
         _write_normalized_stems_streaming(
@@ -185,7 +241,11 @@ def _write_normalized_stems(
             sample_rate,
             mono_sample_rate,
         )
-    except FFmpegError:
+    except FFmpegError as exc:
+        if not allow_in_memory_fallback:
+            raise SourceSeparationUnavailable(
+                "ffmpeg streaming postprocess failed; refusing in-memory fallback for part-wise source separation."
+            ) from exc
         _write_normalized_stems_in_memory(
             vocals_source,
             background_source,
@@ -223,16 +283,18 @@ def separate_source_audio(
     input_audio_path: Path,
     project_dir: Path,
     *,
+    input_part_paths: Sequence[Path] | None = None,
     backend: SourceSeparationBackend = "auto",
     model: str = "htdemucs",
     device: str | None = None,
     sample_rate: int = 48_000,
     mono_sample_rate: int = 16_000,
     force: bool = False,
-    runner: Any = subprocess.run,
+    runner: Any | None = None,
 ) -> SourceSeparationResult | None:
     if backend == "none":
         return None
+    runner = runner or subprocess.run
 
     audio_dir = project_dir / "work" / "audio"
     separation_dir = project_dir / "work" / "source_separation"
@@ -247,6 +309,9 @@ def separate_source_audio(
     selected_backend = backend
     selected_model = model
     postprocess_method = ""
+    input_parts = [Path(path) for path in (input_part_paths or [])]
+    partwise = len(input_parts) > 1
+    part_records: list[dict[str, Any]] = []
 
     if reused_existing:
         if metadata_path.exists():
@@ -282,23 +347,110 @@ def separate_source_audio(
                 mono_sample_rate,
             )
         else:
-            command = _demucs_command(input_audio_path, demucs_dir, model, device)
             demucs_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                runner(command, check=True, text=True)
-            except subprocess.CalledProcessError as exc:
-                raise SourceSeparationUnavailable(f"Demucs source separation failed: {exc}") from exc
-            vocals_source = _find_demucs_stem(demucs_dir, model, input_audio_path.stem, "vocals")
-            background_source = _find_demucs_stem(demucs_dir, model, input_audio_path.stem, "no_vocals")
-            postprocess_method = _write_normalized_stems(
-                vocals_source,
-                background_source,
-                vocals_path,
-                vocals_mono_path,
-                background_path,
-                sample_rate,
-                mono_sample_rate,
-            )
+            if partwise:
+                commands: list[list[str]] = []
+                part_vocals: list[Path] = []
+                part_vocals_mono: list[Path] = []
+                part_backgrounds: list[Path] = []
+                cursor_sec = 0.0
+
+                def separate_part(index: int, part_path: Path) -> _PartwiseSeparationResult:
+                    part_demucs_dir = demucs_dir / "parts" / f"part_{index:04d}"
+                    command = _demucs_command(part_path, part_demucs_dir, model, device)
+                    part_demucs_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        runner(command, check=True, text=True)
+                    except subprocess.CalledProcessError as exc:
+                        raise SourceSeparationUnavailable(f"Demucs source separation failed: {exc}") from exc
+                    raw_vocals = _find_demucs_stem(part_demucs_dir, model, part_path.stem, "vocals")
+                    raw_background = _find_demucs_stem(part_demucs_dir, model, part_path.stem, "no_vocals")
+                    normalized_dir = separation_dir / "partwise" / f"part_{index:04d}"
+                    part_vocals_path = normalized_dir / "source_vocals_48k.wav"
+                    part_vocals_mono_path = normalized_dir / "source_vocals_mono_16k.wav"
+                    part_background_path = normalized_dir / "background_only_48k.wav"
+                    _write_normalized_stems(
+                        raw_vocals,
+                        raw_background,
+                        part_vocals_path,
+                        part_vocals_mono_path,
+                        part_background_path,
+                        sample_rate,
+                        mono_sample_rate,
+                        allow_in_memory_fallback=False,
+                    )
+                    part_duration = duration_sec(part_vocals_mono_path)
+                    return _PartwiseSeparationResult(
+                        part_index=index,
+                        input_path=part_path,
+                        command=command,
+                        vocals_path=part_vocals_path,
+                        vocals_mono_path=part_vocals_mono_path,
+                        background_path=part_background_path,
+                        duration_sec=part_duration,
+                    )
+
+                worker_count = min(MAX_PARTWISE_SOURCE_SEPARATION_WORKERS, len(input_parts))
+                if worker_count <= 1:
+                    part_results = [
+                        separate_part(index, part_path)
+                        for index, part_path in enumerate(input_parts, start=1)
+                    ]
+                else:
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        futures = [
+                            executor.submit(separate_part, index, part_path)
+                            for index, part_path in enumerate(input_parts, start=1)
+                        ]
+                        part_results = [future.result() for future in as_completed(futures)]
+                    part_results.sort(key=lambda part: part.part_index)
+
+                for part_result in part_results:
+                    commands.append(part_result.command)
+                    part_duration = part_result.duration_sec
+                    part_vocals.append(part_result.vocals_path)
+                    part_vocals_mono.append(part_result.vocals_mono_path)
+                    part_backgrounds.append(part_result.background_path)
+                    part_records.append(
+                        {
+                            "part_index": part_result.part_index,
+                            "input_path": str(part_result.input_path),
+                            "start_sec": round(cursor_sec, 6),
+                            "end_sec": round(cursor_sec + part_duration, 6),
+                            "duration_sec": round(part_duration, 6),
+                            "vocals_path": str(part_result.vocals_path),
+                            "vocals_mono_path": str(part_result.vocals_mono_path),
+                            "background_path": str(part_result.background_path),
+                        }
+                    )
+                    cursor_sec += part_duration
+                command = commands[0] if commands else []
+                _concat_audio_files_streaming(part_vocals, vocals_path, sample_rate=sample_rate, channels=2)
+                _concat_audio_files_streaming(
+                    part_vocals_mono,
+                    vocals_mono_path,
+                    sample_rate=mono_sample_rate,
+                    channels=1,
+                )
+                _concat_audio_files_streaming(part_backgrounds, background_path, sample_rate=sample_rate, channels=2)
+                postprocess_method = "partwise_ffmpeg_streaming"
+            else:
+                command = _demucs_command(input_audio_path, demucs_dir, model, device)
+                try:
+                    runner(command, check=True, text=True)
+                except subprocess.CalledProcessError as exc:
+                    raise SourceSeparationUnavailable(f"Demucs source separation failed: {exc}") from exc
+                vocals_source = _find_demucs_stem(demucs_dir, model, input_audio_path.stem, "vocals")
+                background_source = _find_demucs_stem(demucs_dir, model, input_audio_path.stem, "no_vocals")
+                postprocess_method = _write_normalized_stems(
+                    vocals_source,
+                    background_source,
+                    vocals_path,
+                    vocals_mono_path,
+                    background_path,
+                    sample_rate,
+                    mono_sample_rate,
+                )
 
     metadata: dict[str, Any] = {
         "backend": selected_backend,
@@ -310,6 +462,10 @@ def separate_source_audio(
         "reused_existing": reused_existing,
         "command": command,
     }
+    if partwise:
+        metadata["partwise"] = True
+        metadata["input_part_paths"] = [str(path) for path in input_parts]
+        metadata["parts"] = part_records
     if postprocess_method:
         metadata["postprocess_method"] = postprocess_method
     metadata_path.parent.mkdir(parents=True, exist_ok=True)

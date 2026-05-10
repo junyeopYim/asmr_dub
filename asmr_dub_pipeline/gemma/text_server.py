@@ -89,10 +89,12 @@ def default_llama_server_command(
     ctx_size: int,
     gpu_layers: int,
     n_predict: int,
+    parallel_slots: int = 1,
 ) -> list[str]:
     host, port = _host_port(base_url)
     server_path = _resolve_existing_path(DEFAULT_LLAMA_SERVER, "binary")
     model = _resolve_existing_path(model_path, "model")
+    effective_parallel_slots = max(1, int(parallel_slots))
     command = [
         str(server_path),
         "-m",
@@ -113,6 +115,13 @@ def default_llama_server_command(
             "--reasoning-budget",
             "0",
             "--no-warmup",
+            "--parallel",
+            str(effective_parallel_slots),
+            "--no-cache-prompt",
+            "--cache-ram",
+            "0",
+            "--ctx-checkpoints",
+            "0",
             "-c",
             str(ctx_size),
             "-ngl",

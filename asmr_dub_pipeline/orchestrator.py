@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 from .config import load_project_config, save_project_config
+from .pipeline.manifest_io import save_manifest
 from .pipeline.steps import (
     analyze_step,
     assign_speakers_step,
+    audio_style_step,
     export_step,
     extract_step,
     gsv_few_shot_step,
@@ -29,6 +33,91 @@ from .pipeline.steps import (
 )
 from .rvc import validate_rvc_config, validate_rvc_training_config
 from .schemas import PipelineManifest
+
+
+def _asr_source_separation_fallback_recommendation(
+    manifest: PipelineManifest,
+) -> dict[str, Any] | None:
+    summary_path = manifest.artifacts.get("asr_diagnostics_summary")
+    if not summary_path:
+        return None
+    try:
+        summary = json.loads(Path(summary_path).read_text("utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    raw_recommendation = summary.get("source_separation_fallback")
+    if isinstance(raw_recommendation, dict):
+        recommendation = raw_recommendation
+    elif summary.get("recommend_source_separation_fallback"):
+        recommendation = {
+            "recommended": True,
+            "recommended_backend": summary.get("recommended_source_separation_backend"),
+        }
+    else:
+        return None
+    if not recommendation.get("recommended"):
+        return None
+    if recommendation.get("recommended_backend") != "demucs":
+        return None
+    return recommendation
+
+
+def _set_source_separation_backend(project_dir: Path, backend: str) -> str:
+    cfg = load_project_config(project_dir)
+    previous_backend = cfg.source_separation_backend
+    if cfg.source_separation_backend == backend:
+        return previous_backend
+    cfg.source_separation_backend = backend
+    save_project_config(cfg, project_dir / "pipeline.yaml")
+    return previous_backend
+
+
+def _transcribe_with_optional_source_separation_fallback(
+    project_dir: Path,
+    *,
+    confirm_rights: bool,
+    asr_backend: str | None,
+    asr_preset: str | None,
+    asr_vad_off: bool | None,
+    asr_diagnostics: bool | None,
+    asr_device: str | None,
+    asr_compute_type: str | None,
+    asr_batched_inference: bool | None,
+    asr_batch_size: int | None,
+) -> PipelineManifest:
+    transcribe_kwargs = {
+        "asr_backend": asr_backend,
+        "asr_preset": asr_preset,
+        "asr_vad_off": asr_vad_off,
+        "asr_diagnostics": asr_diagnostics,
+        "asr_device": asr_device,
+        "asr_compute_type": asr_compute_type,
+        "asr_batched_inference": asr_batched_inference,
+        "asr_batch_size": asr_batch_size,
+    }
+    manifest = transcribe_step(project_dir, **transcribe_kwargs)
+    recommendation = _asr_source_separation_fallback_recommendation(manifest)
+    if recommendation is None:
+        return manifest
+
+    previous_source_separation_backend = _set_source_separation_backend(project_dir, "demucs")
+    try:
+        source_separation_step(project_dir, confirm_rights=confirm_rights, force=True)
+    except Exception:
+        if previous_source_separation_backend != "demucs":
+            _set_source_separation_backend(project_dir, previous_source_separation_backend)
+        raise
+    rerun_manifest = transcribe_step(project_dir, **transcribe_kwargs)
+    rerun_manifest.stage_state["asr-source-separation-fallback"] = {
+        "status": "completed",
+        "backend": "demucs",
+        "reasons": list(recommendation.get("reasons", [])),
+        "initial_metrics": dict(recommendation.get("metrics", {}) or {}),
+    }
+    save_manifest(project_dir, rerun_manifest)
+    return rerun_manifest
 
 
 def run_pipeline(
@@ -108,8 +197,9 @@ def run_pipeline(
         )
     source_separation_step(project_dir, confirm_rights)
     if use_korean_text_lane:
-        transcribe_step(
+        _transcribe_with_optional_source_separation_fallback(
             project_dir,
+            confirm_rights=confirm_rights,
             asr_backend=normalized_asr_backend,
             asr_preset=asr_preset,
             asr_vad_off=asr_vad_off,
@@ -129,6 +219,14 @@ def run_pipeline(
             )
         elif not mock:
             source_speakers_step(project_dir, backend_kind="pyannote", confirm_rights=confirm_rights)
+        audio_style_backend = (
+            "mock"
+            if mock
+            else "llama_server_audio"
+            if normalized_gemma_backend == "llama_cpp"
+            else gemma_backend
+        )
+        audio_style_step(project_dir, audio_style_backend, confirm_rights=confirm_rights)
         translate_ko_step(project_dir, "mock" if mock else "llama_server")
         korean_script_step(project_dir)
         if not mock and not use_voice_bank:
@@ -143,8 +241,9 @@ def run_pipeline(
                 require_all=True,
             )
         if use_few_shot:
-            transcribe_step(
+            _transcribe_with_optional_source_separation_fallback(
                 project_dir,
+                confirm_rights=confirm_rights,
                 asr_backend=normalized_asr_backend,
                 asr_preset=asr_preset,
                 asr_vad_off=asr_vad_off,

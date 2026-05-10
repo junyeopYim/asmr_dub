@@ -14,6 +14,7 @@ from asmr_dub_pipeline.gpt_sovits.server import (
     ManagedGPTSoVITSServer,
     _default_gsv_command,
     _gsv_subprocess_env,
+    _patch_gsv_korean_text_preprocessor,
     is_tcp_open,
 )
 
@@ -232,6 +233,58 @@ def test_default_gsv_command_prepares_fast_langdetect_cache(monkeypatch, tmp_pat
     cache_dir = source / "fast_langdetect"
     assert cache_dir.is_dir()
     assert (target / "fast_langdetect").resolve() == cache_dir.resolve()
+
+
+def test_patch_gsv_korean_text_preprocessor_disables_short_prefix(tmp_path: Path) -> None:
+    install = tmp_path / "GPT-SoVITS"
+    text_preprocessor = install / "GPT_SoVITS" / "TTS_infer_pack" / "TextPreprocessor.py"
+    text_preprocessor.parent.mkdir(parents=True)
+    text_preprocessor.write_text(
+        """
+def pre_seg_text(text, lang):
+    if text[0] not in splits and len(get_first(text)) < 4:
+        text = "。" + text if lang != "en" else "." + text
+    return text
+""".lstrip(),
+        "utf-8",
+    )
+
+    assert _patch_gsv_korean_text_preprocessor(install) is True
+
+    patched = text_preprocessor.read_text("utf-8")
+    assert 'lang not in {"all_ko", "ko", "kr", "korean"}' in patched
+    assert _patch_gsv_korean_text_preprocessor(install) is False
+
+
+def test_managed_gsv_server_patches_korean_text_preprocessor_before_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install = tmp_path / "GPT-SoVITS"
+    api = install / "api_v2.py"
+    text_preprocessor = install / "GPT_SoVITS" / "TTS_infer_pack" / "TextPreprocessor.py"
+    text_preprocessor.parent.mkdir(parents=True)
+    api.write_text("", "utf-8")
+    text_preprocessor.write_text(
+        """
+def pre_seg_text(text, lang):
+    if text[0] not in splits and len(get_first(text)) < 4:
+        text = "。" + text if lang != "en" else "." + text
+    return text
+""".lstrip(),
+        "utf-8",
+    )
+    monkeypatch.setattr(gsv_server, "is_http_ready", lambda _base_url, **_kwargs: True)
+
+    manager = ManagedGPTSoVITSServer(
+        enabled=True,
+        base_url="http://127.0.0.1:9880",
+        command=[sys.executable, str(api)],
+    )
+    manager.start()
+
+    assert manager.reused_existing is True
+    assert 'lang not in {"all_ko", "ko", "kr", "korean"}' in text_preprocessor.read_text("utf-8")
 
 
 def test_default_gsv_python_prefers_dependency_complete_env(monkeypatch, tmp_path: Path) -> None:

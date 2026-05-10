@@ -75,7 +75,12 @@ def run_mix_stage(ctx: PipelineContext, confirm_rights: bool) -> PipelineManifes
     background_available = background_source is not None
     background = background_source
     background_suppressed_path: Path | None = None
-    if background_source and cfg.background_speech_suppression:
+    should_suppress_background = (
+        background_source is not None
+        and cfg.background_speech_suppression
+        and background_kind != "source_separated"
+    )
+    if should_suppress_background:
         background_suppressed_path = ensure_inside_project(
             project_dir,
             project_dir / "work" / "mix" / "source_suppressed_background.wav",
@@ -94,6 +99,8 @@ def run_mix_stage(ctx: PipelineContext, confirm_rights: bool) -> PipelineManifes
         )
         manifest.artifacts["source_suppressed_background"] = str(background_suppressed_path)
         background = background_suppressed_path
+    else:
+        manifest.artifacts.pop("source_suppressed_background", None)
     console.print("[cyan]mix[/cyan] combining dialogue with background")
     mix_with_background(
         dialogue,

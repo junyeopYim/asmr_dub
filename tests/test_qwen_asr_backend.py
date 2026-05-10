@@ -111,12 +111,58 @@ def test_qwen_asr_backend_converts_timestamps_to_chunks(monkeypatch: pytest.Monk
         (0.0, 1.4, "いらっしゃいませお兄さん"),
         (0.0, 1.8, "またね"),
     ]
+    assert [(word.text, word.start, word.end) for word in chunks[0].words] == [
+        ("いらっしゃいませ", 0.0, 0.8),
+        ("お兄さん", 0.8, 1.4),
+    ]
     assert chunks[0].language == "Japanese"
     transcribe_call = next(value for name, value in calls if name == "transcribe")
     assert isinstance(transcribe_call, dict)
     assert transcribe_call["language"] == "Japanese"
     assert transcribe_call["context"] == "固有名詞: 鳥桜"
     assert transcribe_call["return_time_stamps"] is True
+
+
+def test_qwen_asr_backend_reuses_loaded_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeQwenModel:
+        @classmethod
+        def from_pretrained(cls, model_id: str, **kwargs: object) -> FakeQwenModel:
+            calls.append(("from_pretrained", model_id))
+            calls.append(("kwargs", kwargs))
+            return cls()
+
+        def transcribe(self, **kwargs: object) -> object:
+            calls.append(("transcribe", kwargs))
+            return SimpleNamespace(
+                language="Japanese",
+                text="またね",
+                time_stamps=[],
+            )
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16=object()))
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_asr",
+        SimpleNamespace(Qwen3ASRModel=FakeQwenModel),
+    )
+    monkeypatch.setattr(qwen_module, "_audio_duration_sec", lambda _audio_path: 1.0)
+    backend = QwenASRBackend(
+        model_id="local-or-remote/qwen",
+        local_files_only=False,
+        forced_aligner_model_id=None,
+        return_timestamps=False,
+        language="ja",
+    )
+
+    first = backend.transcribe(Path("first.wav"), [])
+    second = backend.transcribe(Path("second.wav"), [])
+
+    assert [chunk.text for chunk in first] == ["またね"]
+    assert [chunk.text for chunk in second] == ["またね"]
+    assert [name for name, _value in calls].count("from_pretrained") == 1
+    assert [name for name, _value in calls].count("transcribe") == 2
 
 
 def test_qwen_asr_coalesces_japanese_word_timestamps() -> None:
@@ -134,6 +180,14 @@ def test_qwen_asr_coalesces_japanese_word_timestamps() -> None:
 
     assert [(chunk.start, chunk.end, chunk.text) for chunk in chunks] == [
         (1.52, 4.48, "深呼吸やリラックスでも")
+    ]
+    assert [(word.text, word.start, word.end) for word in chunks[0].words] == [
+        ("深", 1.52, 1.84),
+        ("呼吸", 2.0, 2.4),
+        ("や", 2.4, 2.48),
+        ("リラックス", 2.72, 3.52),
+        ("で", 3.52, 3.6),
+        ("も", 3.84, 4.48),
     ]
 
 

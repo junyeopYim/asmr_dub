@@ -7,6 +7,105 @@ from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.rvc import output_fresh_for_input
 
 
+def _run_pre_rvc_fallback_stage(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    backend: str,
+    confirm_rights: bool,
+    only_segment_ids: set[str] | None = None,
+) -> PipelineManifest:
+    cfg = manifest.project_config
+    if not (cfg.rvc_allow_pre_rvc_fallback and not _rvc_downstream_required(cfg)):
+        raise ValueError("RVC requires a completed train-rvc stage.")
+    if backend == "command":
+        if not confirm_rights:
+            raise RightsError("Real RVC conversion requires --confirm-rights for the source and voice model.")
+        source_path = Path(manifest.source_info.path) if manifest.source_info else None
+        manifest.rights_audit = merge_rights_audit(
+            manifest.rights_audit,
+            require_confirmed_rights(
+                True,
+                "rvc",
+                source_path,
+                metadata={"backend": "command", "fallback": "pre_rvc"},
+            ),
+        )
+    else:
+        _require_audio_stage_rights(manifest, "rvc", confirm_rights, metadata={"backend": backend})
+
+    reason = "train-rvc skipped because clean source voice data was insufficient."
+    failed_segments: list[str] = []
+    for segment in manifest.segments:
+        if only_segment_ids is not None and segment.id not in only_segment_ids:
+            continue
+        if segment.status in SKIP_STATUSES:
+            continue
+        selected = segment.tts.selected_candidate_path if segment.tts else None
+        input_path = _resolve_manifest_path(project_dir, selected)
+        if input_path is None or not input_path.exists():
+            message = "RVC fallback requires segment.tts.selected_candidate_path from synth."
+            segment.status = "failed"
+            segment.errors.append(message)
+            segment.rvc = RVCMetadata(
+                backend=backend,
+                input_path=str(input_path) if input_path else "",
+                error=message,
+            )
+            failed_segments.append(segment.id)
+            continue
+        segment.rvc = RVCMetadata(
+            backend=backend,
+            input_path=str(input_path),
+            output_path=str(input_path),
+            selected_profile_name=None,
+            accepted=False,
+            fallback_used=True,
+            fallback_reason=reason,
+            error=reason,
+        )
+
+    out_path = project_dir / "work" / "rvc" / "rvc_manifest.json"
+    write_json_atomic(
+        out_path,
+        {
+            "backend": backend,
+            "execution_mode": "pre_rvc_fallback",
+            "segments": [
+                {"id": segment.id, "rvc": segment.rvc.model_dump(mode="json") if segment.rvc else None}
+                for segment in manifest.segments
+            ],
+        },
+    )
+    manifest.artifacts["rvc_manifest"] = str(out_path)
+    if failed_segments:
+        mark_stage(
+            manifest,
+            "rvc",
+            "failed",
+            backend=backend,
+            failed_segments=failed_segments,
+            rvc_manifest=str(out_path),
+            execution_mode="pre_rvc_fallback",
+            segment_counts=_segment_counts(manifest),
+        )
+        save_manifest(project_dir, manifest)
+        raise RVCCommandError("RVC fallback failed for segments: " + ", ".join(failed_segments[:20]))
+    mark_stage(
+        manifest,
+        "rvc",
+        "completed",
+        backend=backend,
+        rvc_manifest=str(out_path),
+        execution_mode="pre_rvc_fallback",
+        fallback_segment_count=sum(1 for segment in manifest.segments if segment.rvc and segment.rvc.fallback_used),
+        segment_counts=_segment_counts(manifest),
+    )
+    save_manifest(project_dir, manifest)
+    _log_stage_complete("rvc", manifest, f"backend={backend} pre_rvc_fallback")
+    return manifest
+
+
 def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None, only_segment_ids: set[str] | None = None) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
@@ -18,6 +117,16 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         raise ValueError("RVC requires a completed synth stage.")
     if not _train_rvc_ready_for_rvc(manifest):
         raise ValueError("RVC requires a completed train-rvc stage.")
+    if manifest.stage_state.get("train-rvc", {}).get("status") == "skipped_insufficient_training_data":
+        return ctx.update_manifest(
+            _run_pre_rvc_fallback_stage(
+                project_dir,
+                manifest,
+                backend=backend,
+                confirm_rights=confirm_rights,
+                only_segment_ids=only_segment_ids,
+            )
+        )
     validate_rvc_config(
         project_dir,
         cfg,

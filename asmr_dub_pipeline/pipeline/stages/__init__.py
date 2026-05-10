@@ -10,6 +10,7 @@ from asmr_dub_pipeline.pipeline.stages.voice_bank_cache import run_import_voice_
 from asmr_dub_pipeline.pipeline.stages.segment import run_segment_stage
 from asmr_dub_pipeline.pipeline.stages.transcribe import run_transcribe_stage
 from asmr_dub_pipeline.pipeline.stages.analyze import run_analyze_stage
+from asmr_dub_pipeline.pipeline.stages.audio_style import run_audio_style_stage
 from asmr_dub_pipeline.pipeline.stages.script import run_script_stage
 from asmr_dub_pipeline.pipeline.stages.translate_ko import run_translate_ko_stage
 from asmr_dub_pipeline.pipeline.stages.korean_script import run_korean_script_stage
@@ -36,6 +37,7 @@ __all__ = [
     "run_segment_stage",
     "run_transcribe_stage",
     "run_analyze_stage",
+    "run_audio_style_stage",
     "run_script_stage",
     "run_translate_ko_stage",
     "run_korean_script_stage",

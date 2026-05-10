@@ -22,6 +22,7 @@ SegmentStatus = Literal[
     "needs_regeneration",
     "needs_manual_review",
     "no_speech_detected",
+    "non_speech_texture",
     "failed",
 ]
 Emotion = Literal["gentle", "sleepy", "reassuring", "playful", "serious", "neutral"]
@@ -47,6 +48,8 @@ SourceLanguage = Literal["ja"]
 TargetLanguage = Literal["ko"]
 GSVGPTWeightsPolicy = Literal["auto", "explicit", "few_shot", "base_for_korean", "unchanged"]
 GSVSoVITSWeightsPolicy = Literal["auto", "explicit", "few_shot", "unchanged"]
+GSVRefMode = Literal["static", "segment", "auto"]
+GSVDurationRewriteBackend = Literal["none", "gemma"]
 SpeakerAssignmentBackend = Literal["none", "mock", "pyannote"]
 ASRPreset = Literal["default", "conservative", "whisper", "no_vad_repair"]
 
@@ -235,6 +238,9 @@ BUILTIN_ASR_CORRECTION_PROFILE = "builtin:asmr_ja"
 
 
 class ASRCorrectionProfile(StrictBaseModel):
+    initial_prompt: str = ""
+    review_initial_prompt: str = ""
+    qwen_context: str = ""
     hotwords: str = ""
     repair_suspicious_text_patterns: list[str] = Field(default_factory=list)
     text_replacements: dict[str, str] = Field(default_factory=dict)
@@ -311,6 +317,9 @@ class ASRConfig(StrictBaseModel):
     resegment_min_sec: float = Field(default=3.0, gt=0)
     resegment_max_sec: float = Field(default=20.0, gt=0)
     resegment_merge_gap_sec: float = Field(default=1.0, ge=0)
+    countdown_merge_enabled: bool = True
+    countdown_merge_gap_sec: float = Field(default=2.5, ge=0)
+    countdown_merge_max_span_sec: float = Field(default=60.0, gt=0)
     sparse_chunk_max_sec: float = Field(default=30.0, gt=0)
     sparse_chunk_min_chars_per_sec: float = Field(default=0.5, ge=0)
     repair_enabled: bool = True
@@ -332,7 +341,7 @@ class ASRConfig(StrictBaseModel):
     review_initial_prompt: str = ""
     translation_backcheck_enabled: bool = True
     translation_backcheck_mark_manual_review: bool = False
-    source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "demucs"
+    source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "auto"
     source_separation_model: str = "htdemucs"
     source_separation_device: str | None = None
     segmentation_min_segment_sec: float = Field(default=0.25, gt=0)
@@ -388,7 +397,7 @@ class GemmaConfig(StrictBaseModel):
         "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"
     )
     llama_cpp_timeout_sec: float = Field(default=600.0, gt=0)
-    llama_cpp_ctx_size: int = Field(default=4096, ge=512)
+    llama_cpp_ctx_size: int = Field(default=16384, ge=512)
     llama_cpp_n_predict: int = Field(default=1024, ge=64)
     llama_cpp_gpu_layers: int = Field(default=999, ge=0)
     llama_cpp_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -398,13 +407,14 @@ class GemmaConfig(StrictBaseModel):
     text_server_auto_start: bool = True
     text_server_command: list[str] = Field(default_factory=list)
     text_batch_size: int = Field(default=12, ge=1, le=200)
-    text_span_size: int = Field(default=4, ge=1, le=20)
-    text_span_max_sec: float = Field(default=18.0, gt=0)
-    text_span_max_gap_sec: float = Field(default=1.2, ge=0)
-    text_context_radius: int = Field(default=4, ge=0, le=20)
+    text_span_size: int = Field(default=10, ge=1, le=20)
+    text_span_max_sec: float = Field(default=75.0, gt=0)
+    text_span_max_gap_sec: float = Field(default=5.0, ge=0)
+    text_context_radius: int = Field(default=10, ge=0, le=20)
     text_two_pass: bool = True
-    text_concurrency: int = Field(default=4, ge=1, le=8)
-    text_n_predict: int = Field(default=2048, ge=64)
+    text_concurrency: int = Field(default=1, ge=1, le=8)
+    audio_style_concurrency: int = Field(default=2, ge=1, le=8)
+    text_n_predict: int = Field(default=1536, ge=64)
     text_timeout_sec: float = Field(default=180.0, gt=0)
     text_retries: int = Field(default=1, ge=0, le=5)
     text_server_startup_timeout_sec: float = Field(default=120.0, gt=0)
@@ -455,7 +465,7 @@ class GSVConfig(StrictBaseModel):
     speaker_models: dict[str, GSVSpeakerConfig] = Field(default_factory=dict)
     timeout_sec: float = Field(default=120.0, gt=0)
     retries: int = Field(default=2, ge=0)
-    concurrency: int = Field(default=3, ge=1, le=8)
+    concurrency: int = Field(default=6, ge=1, le=8)
     auto_start: bool = False
     server_command: list[str] = Field(default_factory=list)
     server_cwd: str | None = None
@@ -465,10 +475,28 @@ class GSVConfig(StrictBaseModel):
     trim_silence_threshold_db: float = -50.0
     trim_silence_keep_sec: float = Field(default=0.08, ge=0.0, le=1.0)
     few_shot_enabled: bool = True
-    few_shot_target_sec: float = Field(default=60.0, gt=0)
+    few_shot_min_total_sec: float | None = Field(default=None, gt=0)
     few_shot_min_clip_sec: float = Field(default=1.0, gt=0)
     few_shot_max_clip_sec: float = Field(default=10.0, gt=0)
     few_shot_min_quality_score: float = Field(default=0.20, ge=0.0, le=1.0)
+    few_shot_clean_source_filter: bool = True
+    few_shot_max_background_bleed_db: float = Field(default=-24.0, ge=-80.0, le=0.0)
+    few_shot_max_side_to_mid_db: float = Field(default=-8.0, ge=-80.0, le=20.0)
+    few_shot_preferred_chars_per_sec: float | None = Field(default=4.5, gt=0)
+    few_shot_max_chars_per_sec: float | None = Field(default=5.2, gt=0)
+    few_shot_prefer_plain_text: bool = True
+    few_shot_pacing_target_enabled: bool = True
+    few_shot_pacing_target_tolerance: float = Field(default=0.10, ge=0.0, le=2.0)
+    few_shot_pacing_max_target_tolerance: float = Field(default=0.30, ge=0.0, le=2.0)
+    few_shot_pacing_variance_weight: float = Field(default=1.0, ge=0.0, le=10.0)
+    few_shot_pacing_quality_weight: float = Field(default=0.25, ge=0.0, le=10.0)
+    few_shot_pacing_beam_size: int = Field(default=768, ge=32, le=4096)
+    few_shot_pacing_search_iterations: int = Field(default=12_000, ge=0, le=100_000)
+    few_shot_pacing_max_duration_overage_ratio: float = Field(default=0.10, ge=0.0, le=1.0)
+    few_shot_relax_clean_source_for_pacing: bool = True
+    few_shot_relaxed_clean_source_penalty: float = Field(default=0.15, ge=0.0, le=1.0)
+    few_shot_insufficient_policy: Literal["error", "zero_shot"] = "error"
+    ref_mode: GSVRefMode = "static"
     ref_min_sec: float = Field(default=3.0, gt=0)
     ref_max_sec: float = Field(default=10.0, gt=0)
     ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
@@ -486,6 +514,36 @@ class GSVConfig(StrictBaseModel):
     fragment_interval: float = Field(default=0.3, ge=0.0)
     tts_min_speed_factor: float = Field(default=0.85, gt=0.0, le=1.0)
     tts_max_speed_factor: float = Field(default=1.12, ge=1.0, le=1.35)
+    countdown_renderer: Literal["token", "compact"] = "token"
+    countdown_fallback_renderer: Literal["compact", "manual_review", "none"] = "compact"
+    countdown_candidate_count: int = Field(default=8, ge=1, le=24)
+    countdown_temperature: float = Field(default=0.55, ge=0.0, le=2.0)
+    countdown_token_speed_factor: float = Field(default=1.20, ge=0.5, le=1.35)
+    countdown_token_min_sec: float = Field(default=0.25, ge=0.0, le=5.0)
+    countdown_token_max_sec: float = Field(default=0.95, gt=0.0, le=10.0)
+    countdown_token_max_slot_occupancy: float = Field(default=0.85, gt=0.0, le=2.0)
+    countdown_max_tempo: float = Field(default=1.15, ge=1.0, le=8.0)
+    max_attempts_per_candidate: int = Field(default=3, ge=1, le=8)
+    initial_candidate_count: int | None = Field(default=None, ge=1, le=8)
+    retry_candidate_count: int | None = Field(default=7, ge=1, le=8)
+    low_temperature_retry_enabled: bool = True
+    low_temperature_retry_candidate_count: int | None = Field(default=20, ge=1, le=20)
+    low_temperature_retry_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    zero_shot_candidate_count: int | None = Field(default=None, ge=1, le=8)
+    duration_rewrite_backend: GSVDurationRewriteBackend = "none"
+    duration_rewrite_max_attempts: int = Field(default=1, ge=0, le=5)
+    duration_rewrite_pre_candidate_count: int | None = Field(default=None, ge=1, le=24)
+    timefit_max_tempo: float = Field(default=1.18, ge=1.0, le=8.0)
+    timefit_max_stretch: float = Field(default=1.08, ge=1.0, le=2.0)
+    timefit_micro_max_sec: float = Field(default=2.0, gt=0.0)
+    timefit_micro_max_tempo: float = Field(default=1.30, ge=1.0, le=8.0)
+    timefit_long_min_sec: float = Field(default=7.0, gt=0.0)
+    timefit_long_max_stretch: float = Field(default=1.15, ge=1.0, le=2.0)
+    rescue_duration_tolerance: float | None = Field(default=0.35, gt=0.0, lt=1.0)
+    rescue_timefit_top_k: int = Field(default=3, ge=0, le=8)
+    rescue_timefit_max_tempo: float = Field(default=1.45, ge=1.0, le=8.0)
+    rescue_timefit_max_stretch: float = Field(default=1.25, ge=1.0, le=2.0)
+    rescue_micro_segment_max_sec: float = Field(default=0.6, ge=0.0)
     few_shot_force: bool = False
     few_shot_version: Literal["auto", "v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"] = "auto"
 
@@ -501,12 +559,28 @@ class RVCConfig(StrictBaseModel):
     train_experiment_name: str = "asmr-rvc-speaker-1"
     train_sample_rate: int = Field(default=48_000, ge=0)
     train_epochs: int = Field(default=20, ge=1)
+    train_epoch_policy: Literal["fixed", "auto"] = "fixed"
+    train_quality_preset: Literal["balanced", "strict"] = "balanced"
     train_batch_size: int = Field(default=0, ge=0, le=64)
     train_min_quality_score: float = Field(default=0.20, ge=0.0, le=1.0)
+    train_preferred_chars_per_sec: float | None = Field(default=4.5, gt=0)
+    train_max_chars_per_sec: float | None = Field(default=5.2, gt=0)
+    train_max_clip_sec: float | None = Field(default=None, gt=0.0)
+    train_min_snr_db: float | None = Field(default=None, ge=0.0)
+    train_max_background_bleed_db: float | None = None
+    train_max_side_to_mid_db: float | None = None
+    train_target_clean_sec: float | None = Field(default=None, gt=0.0)
+    train_auto_epoch_min: int = Field(default=20, ge=1)
+    train_auto_epoch_max: int = Field(default=200, ge=1)
+    train_min_clean_sec: float = Field(default=600.0, ge=0.0)
+    train_min_clean_segments: int = Field(default=1, ge=1)
+    train_augment_enabled: bool = False
+    train_augment_min_real_sec: float = Field(default=300.0, ge=0.0)
+    train_augment_max_multiplier: int = Field(default=3, ge=1, le=8)
     train_preprocess_processes: int = Field(default=0, ge=0)
     train_f0_workers: int = Field(default=0, ge=0)
     train_feature_workers: int = Field(default=0, ge=0)
-    train_save_every_epoch: int = Field(default=50, ge=1)
+    train_save_every_epoch: int = Field(default=5, ge=1)
     train_reuse_intermediate_cache: bool = True
     train_output_model_path: str | None = None
     train_output_index_path: str | None = None
@@ -534,6 +608,12 @@ class RVCConfig(StrictBaseModel):
     auto_profiles: list[RVCProfile] = Field(default_factory=default_rvc_profiles)
     speaker_models: dict[str, RVCSpeakerConfig] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def _validate_train_auto_epoch_bounds(self) -> RVCConfig:
+        if self.train_auto_epoch_max < self.train_auto_epoch_min:
+            raise ValueError("rvc_train_auto_epoch_max must be >= rvc_train_auto_epoch_min")
+        return self
+
 
 class MixConfig(StrictBaseModel):
     sample_rate: int = 48_000
@@ -560,7 +640,7 @@ class VoiceBankConfig(StrictBaseModel):
     diarization_auto_download: bool = True
     diarization_min_speakers: int | None = Field(default=None, ge=1)
     diarization_max_speakers: int | None = Field(default=None, ge=1)
-    diarization_embedding_match_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    diarization_embedding_match_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
 
 
 class SafetyConfig(StrictBaseModel):
@@ -571,7 +651,7 @@ class ProjectConfig(StrictBaseModel):
     project_name: str = "asmr-dub-project"
     source_language: SourceLanguage = "ja"
     target_language: TargetLanguage = "ko"
-    candidate_count: int = Field(default=1, ge=1, le=8)
+    candidate_count: int = Field(default=5, ge=1, le=8)
     base_seed: int = 12345
     asr: ASRConfig = Field(default_factory=ASRConfig)
     gemma: GemmaConfig = Field(default_factory=GemmaConfig)
@@ -705,6 +785,9 @@ _ASR_DIRECT_FLAT_FIELDS = [
     "resegment_min_sec",
     "resegment_max_sec",
     "resegment_merge_gap_sec",
+    "countdown_merge_enabled",
+    "countdown_merge_gap_sec",
+    "countdown_merge_max_span_sec",
     "sparse_chunk_max_sec",
     "sparse_chunk_min_chars_per_sec",
     "repair_enabled",
@@ -789,10 +872,28 @@ _GSV_FLAT_FIELDS = [
     "trim_silence_threshold_db",
     "trim_silence_keep_sec",
     "few_shot_enabled",
-    "few_shot_target_sec",
+    "few_shot_min_total_sec",
     "few_shot_min_clip_sec",
     "few_shot_max_clip_sec",
     "few_shot_min_quality_score",
+    "few_shot_clean_source_filter",
+    "few_shot_max_background_bleed_db",
+    "few_shot_max_side_to_mid_db",
+    "few_shot_preferred_chars_per_sec",
+    "few_shot_max_chars_per_sec",
+    "few_shot_prefer_plain_text",
+    "few_shot_pacing_target_enabled",
+    "few_shot_pacing_target_tolerance",
+    "few_shot_pacing_max_target_tolerance",
+    "few_shot_pacing_variance_weight",
+    "few_shot_pacing_quality_weight",
+    "few_shot_pacing_beam_size",
+    "few_shot_pacing_search_iterations",
+    "few_shot_pacing_max_duration_overage_ratio",
+    "few_shot_relax_clean_source_for_pacing",
+    "few_shot_relaxed_clean_source_penalty",
+    "few_shot_insufficient_policy",
+    "ref_mode",
     "ref_min_sec",
     "ref_max_sec",
     "ref_min_quality_score",
@@ -810,6 +911,36 @@ _GSV_FLAT_FIELDS = [
     "fragment_interval",
     "tts_min_speed_factor",
     "tts_max_speed_factor",
+    "countdown_renderer",
+    "countdown_fallback_renderer",
+    "countdown_candidate_count",
+    "countdown_temperature",
+    "countdown_token_speed_factor",
+    "countdown_token_min_sec",
+    "countdown_token_max_sec",
+    "countdown_token_max_slot_occupancy",
+    "countdown_max_tempo",
+    "max_attempts_per_candidate",
+    "initial_candidate_count",
+    "retry_candidate_count",
+    "low_temperature_retry_enabled",
+    "low_temperature_retry_candidate_count",
+    "low_temperature_retry_temperature",
+    "zero_shot_candidate_count",
+    "duration_rewrite_backend",
+    "duration_rewrite_max_attempts",
+    "duration_rewrite_pre_candidate_count",
+    "timefit_max_tempo",
+    "timefit_max_stretch",
+    "timefit_micro_max_sec",
+    "timefit_micro_max_tempo",
+    "timefit_long_min_sec",
+    "timefit_long_max_stretch",
+    "rescue_duration_tolerance",
+    "rescue_timefit_top_k",
+    "rescue_timefit_max_tempo",
+    "rescue_timefit_max_stretch",
+    "rescue_micro_segment_max_sec",
     "few_shot_force",
     "few_shot_version",
 ]
@@ -824,8 +955,24 @@ _RVC_FLAT_FIELDS = [
     "train_experiment_name",
     "train_sample_rate",
     "train_epochs",
+    "train_epoch_policy",
+    "train_quality_preset",
     "train_batch_size",
     "train_min_quality_score",
+    "train_preferred_chars_per_sec",
+    "train_max_chars_per_sec",
+    "train_max_clip_sec",
+    "train_min_snr_db",
+    "train_max_background_bleed_db",
+    "train_max_side_to_mid_db",
+    "train_target_clean_sec",
+    "train_auto_epoch_min",
+    "train_auto_epoch_max",
+    "train_min_clean_sec",
+    "train_min_clean_segments",
+    "train_augment_enabled",
+    "train_augment_min_real_sec",
+    "train_augment_max_multiplier",
     "train_preprocess_processes",
     "train_f0_workers",
     "train_feature_workers",
@@ -980,6 +1127,10 @@ _PROJECT_CONFIG_FLAT_ALIASES.update(
 )
 _PROJECT_CONFIG_FLAT_ALIASES.update(
     {f"gemma_text_{field}": ("gemma", f"text_{field}") for field in _GEMMA_TEXT_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES["gemma_audio_style_concurrency"] = (
+    "gemma",
+    "audio_style_concurrency",
 )
 _PROJECT_CONFIG_FLAT_ALIASES.update(
     {f"gsv_{field}": ("gsv", field) for field in _GSV_FLAT_FIELDS}
@@ -1141,7 +1292,14 @@ class TTSCandidate(StrictBaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     output_path: str
     duration_sec: float | None = Field(default=None, ge=0)
-    backend: Literal["mock", "gpt-sovits", "qwen-tts", "fish-tts", "cosyvoice"] = "mock"
+    backend: Literal[
+        "mock",
+        "gpt-sovits",
+        "gpt-sovits-countdown-renderer",
+        "qwen-tts",
+        "fish-tts",
+        "cosyvoice",
+    ] = "mock"
     selected: bool = False
     error: str | None = None
     duration_ratio: float | None = Field(default=None, ge=0)
@@ -1153,7 +1311,14 @@ class TTSCandidate(StrictBaseModel):
 
 
 class TTSMetadata(StrictBaseModel):
-    backend: Literal["mock", "gpt-sovits", "qwen-tts", "fish-tts", "cosyvoice"] = "mock"
+    backend: Literal[
+        "mock",
+        "gpt-sovits",
+        "gpt-sovits-countdown-renderer",
+        "qwen-tts",
+        "fish-tts",
+        "cosyvoice",
+    ] = "mock"
     ref_style: str = "whisper_close"
     speed_factor: float = Field(default=1.0, gt=0)
     candidate_count: int = Field(default=1, ge=1)

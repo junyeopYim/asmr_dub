@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from asmr_dub_pipeline.config import save_project_config
+from asmr_dub_pipeline.config import load_project_config, save_project_config
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
 from asmr_dub_pipeline.pipeline.state import mark_stage
@@ -136,7 +136,7 @@ def test_rvc_rerun_uses_raw_tts_not_previous_rvc_output(
 
 
 def test_mock_train_rvc_creates_model_artifacts(tmp_project_dir: Path) -> None:
-    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock")
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock", rvc_train_min_clean_sec=0.0)
     save_project_config(cfg.model_copy(update={"project_name": tmp_project_dir.name}), tmp_project_dir / "pipeline.yaml")
     manifest = PipelineManifest(
         project_config=cfg,
@@ -152,6 +152,35 @@ def test_mock_train_rvc_creates_model_artifacts(tmp_project_dir: Path) -> None:
     assert Path(trained.artifacts["rvc_model_path"]).exists()
     assert Path(trained.artifacts["rvc_index_path"]).exists()
     assert Path(trained.artifacts["rvc_train_manifest"]).exists()
+
+
+def test_train_rvc_auto_epoch_records_effective_epochs(tmp_project_dir: Path) -> None:
+    cfg = ProjectConfig(
+        rvc_backend="mock",
+        rvc_train_backend="mock",
+        rvc_train_min_clean_sec=0.0,
+        rvc_train_epoch_policy="auto",
+        rvc_train_auto_epoch_min=80,
+        rvc_train_auto_epoch_max=120,
+    )
+    save_project_config(cfg.model_copy(update={"project_name": tmp_project_dir.name}), tmp_project_dir / "pipeline.yaml")
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[_segment_with_tts(tmp_project_dir)],
+    )
+    mark_stage(manifest, "synth", "completed")
+    save_manifest(tmp_project_dir, manifest)
+
+    trained = pipeline_steps.rvc_train_step(tmp_project_dir, confirm_rights=True, mock=True)
+
+    train_payload = json.loads(Path(trained.artifacts["rvc_train_manifest"]).read_text("utf-8"))
+    assert train_payload["epoch_decision"]["policy"] == "auto"
+    assert train_payload["epoch_decision"]["configured_epochs"] == 20
+    assert train_payload["epoch_decision"]["recommended_epoch_count"] == 25
+    assert train_payload["epoch_decision"]["effective_epochs"] == 80
+    assert train_payload["effective_train_epochs"] == 80
+    assert trained.stage_state["train-rvc"]["effective_train_epochs"] == 80
 
 
 def test_voice_bank_rvc_skips_training_and_uses_speaker_model(
@@ -202,7 +231,7 @@ def test_voice_bank_rvc_skips_training_and_uses_speaker_model(
 
 
 def test_rvc_train_dataset_skips_identical_existing_copy(tmp_project_dir: Path, monkeypatch) -> None:
-    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock")
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock", rvc_train_min_clean_sec=0.0)
     manifest = PipelineManifest(
         project_config=cfg,
         rights_audit=require_confirmed_rights(True, "test"),
@@ -224,7 +253,7 @@ def test_rvc_train_dataset_skips_identical_existing_copy(tmp_project_dir: Path, 
 
 
 def test_rvc_train_dataset_keeps_metadata_out_of_audio_directory(tmp_project_dir: Path) -> None:
-    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock")
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock", rvc_train_min_clean_sec=0.0)
     manifest = PipelineManifest(
         project_config=cfg,
         rights_audit=require_confirmed_rights(True, "test"),
@@ -245,7 +274,7 @@ def test_real_rvc_train_dataset_filters_effected_and_multi_speaker_segments(tmp_
     effected.analysis = {"speaker_count": 1, "risk_flags": ["voice_effect"]}
     multi_speaker = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0003")
     multi_speaker.analysis = {"speaker_count": 2}
-    cfg = ProjectConfig()
+    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0)
     manifest = PipelineManifest(
         project_config=cfg,
         rights_audit=require_confirmed_rights(True, "test"),
@@ -263,6 +292,217 @@ def test_real_rvc_train_dataset_filters_effected_and_multi_speaker_segments(tmp_
     }
     assert rejected[effected.id] == ["disallowed_training_tag:voice_effect"]
     assert rejected[multi_speaker.id] == ["speaker_count_not_one:2"]
+
+
+def test_real_rvc_train_dataset_requires_none_effect_tag(tmp_project_dir: Path) -> None:
+    clean = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    clean.analysis = {
+        "speaker_count": 1,
+        "voice_training": {
+            "clean_voice": True,
+            "eligible": True,
+            "effect_tags": ["none"],
+        },
+    }
+    effected = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    effected.analysis = {
+        "speaker_count": 1,
+        "voice_training": {
+            "clean_voice": True,
+            "eligible": True,
+            "effect_tags": ["pitch_shift"],
+        },
+    }
+    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0)
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[clean, effected],
+    )
+
+    dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert [row["segment_id"] for row in rows] == [clean.id]
+    assert {path.name for path in dataset_dir.iterdir()} == {f"{clean.id}.wav"}
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    rejected = {
+        item["segment_id"]: item["reject_reasons"]
+        for item in dataset_manifest["rejected_segments"]
+    }
+    assert rejected[effected.id] == ["voice_training_effect_tag_not_none:pitch_shift"]
+
+
+def test_real_rvc_train_dataset_rejects_overly_fast_source_speech(tmp_project_dir: Path) -> None:
+    fast = _segment_with_tts(tmp_project_dir, duration=3.0, segment_id="seg_0001")
+    fast.source_script = SourceScript(
+        text="これはとても速く詰め込まれた長い長い長い台詞です",
+        language="ja",
+        backend="mock",
+        start=0.0,
+        end=3.0,
+    )
+    slow = _segment_with_tts(tmp_project_dir, duration=4.0, segment_id="seg_0002")
+    slow.source_script = SourceScript(
+        text="ゆっくり話すね",
+        language="ja",
+        backend="mock",
+        start=0.0,
+        end=4.0,
+    )
+    cfg = ProjectConfig(
+        rvc_train_backend="command",
+        rvc_train_min_clean_sec=0.0,
+        rvc_train_preferred_chars_per_sec=4.5,
+        rvc_train_max_chars_per_sec=5.2,
+    )
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[fast, slow],
+    )
+
+    dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert [row["segment_id"] for row in rows] == [slow.id]
+    assert {path.name for path in dataset_dir.iterdir()} == {f"{slow.id}.wav"}
+    assert rows[0]["source_chars_per_sec"] == pytest.approx(1.75)
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    rejected = {
+        item["segment_id"]: item
+        for item in dataset_manifest["rejected_segments"]
+    }
+    assert rejected[fast.id]["source_chars_per_sec"] == pytest.approx(8.0)
+    assert rejected[fast.id]["reject_reasons"] == [
+        "source_chars_per_sec_above_max:8.000>5.200"
+    ]
+
+
+def test_rvc_train_dataset_augments_borderline_clean_data(tmp_project_dir: Path) -> None:
+    clean = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    cfg = ProjectConfig(
+        rvc_train_backend="command",
+        rvc_train_min_clean_sec=2.4,
+        rvc_train_min_clean_segments=3,
+        rvc_train_augment_enabled=True,
+        rvc_train_augment_min_real_sec=0.5,
+        rvc_train_augment_max_multiplier=3,
+    )
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[clean],
+    )
+
+    dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert len(rows) == 3
+    assert {path.name for path in dataset_dir.iterdir()} == {
+        "seg_0001.wav",
+        "seg_0001_aug_gain_minus3.wav",
+        "seg_0001_aug_gain_plus3.wav",
+    }
+    augmented_rows = [row for row in rows if row.get("augmentation_method")]
+    assert [row["augmentation_method"] for row in augmented_rows] == ["gain_minus3", "gain_plus3"]
+    assert all(row["augmentation_source_segment_id"] == clean.id for row in augmented_rows)
+
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    assert dataset_manifest["summary"]["augmentation_applied"] is True
+    assert dataset_manifest["summary"]["real_clean_segment_count"] == 1
+    assert dataset_manifest["summary"]["real_clean_duration_sec"] == pytest.approx(1.0)
+    assert dataset_manifest["summary"]["augmented_segment_count"] == 2
+    assert dataset_manifest["summary"]["clean_segment_count"] == 3
+    assert dataset_manifest["summary"]["clean_duration_sec"] >= 2.4
+
+
+def test_rvc_train_dataset_rejects_duplicate_source_audio_segments(tmp_project_dir: Path) -> None:
+    first = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    duplicate = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    duplicate.audio_for_mix = first.audio_for_mix
+    cfg = ProjectConfig(rvc_train_backend="command", rvc_train_min_clean_sec=0.0)
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[first, duplicate],
+    )
+
+    dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert [row["segment_id"] for row in rows] == [first.id]
+    assert {path.name for path in dataset_dir.iterdir()} == {f"{first.id}.wav"}
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    rejected = {
+        item["segment_id"]: item["reject_reasons"]
+        for item in dataset_manifest["rejected_segments"]
+    }
+    assert rejected[duplicate.id] == [f"duplicate_source_audio:{first.id}"]
+
+
+def test_train_rvc_registers_speaker_models_for_mixed_speakers(tmp_project_dir: Path) -> None:
+    speaker_1 = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    speaker_2 = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    speaker_2.speaker_id = "speaker_0002"
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock", rvc_train_min_clean_sec=0.0)
+    save_project_config(cfg.model_copy(update={"project_name": tmp_project_dir.name}), tmp_project_dir / "pipeline.yaml")
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[speaker_1, speaker_2],
+    )
+    mark_stage(manifest, "synth", "completed")
+    save_manifest(tmp_project_dir, manifest)
+
+    trained = pipeline_steps.rvc_train_step(tmp_project_dir, confirm_rights=True, mock=True)
+
+    saved_cfg = load_project_config(tmp_project_dir)
+    assert sorted(saved_cfg.rvc_speaker_models) == ["speaker_0001", "speaker_0002"]
+    assert sorted(trained.project_config.rvc_speaker_models) == ["speaker_0001", "speaker_0002"]
+    assert trained.stage_state["train-rvc"]["speaker_count"] == 2
+    for speaker_id, speaker_cfg in saved_cfg.rvc_speaker_models.items():
+        assert Path(speaker_cfg.model_path).exists()
+        assert speaker_cfg.index_path is not None
+        assert Path(speaker_cfg.index_path).exists()
+        assert f"work/rvc_train/speakers/{speaker_id}/" in speaker_cfg.model_path
+
+
+def test_rvc_skips_training_and_uses_pre_rvc_fallback_when_clean_data_is_too_small(
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(
+        rvc_required=False,
+        rvc_backend="command",
+        rvc_command=["rvc", "{input}", "{output}", "{model}"],
+        rvc_train_backend="command",
+        rvc_train_command=["train-rvc", "{dataset}", "{output_model}", "{output_index}"],
+        rvc_train_min_clean_sec=2.0,
+        rvc_train_min_clean_segments=2,
+        rvc_allow_pre_rvc_fallback=True,
+    )
+    save_project_config(cfg.model_copy(update={"project_name": tmp_project_dir.name}), tmp_project_dir / "pipeline.yaml")
+    segment = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[segment],
+    )
+    mark_stage(manifest, "synth", "completed")
+    save_manifest(tmp_project_dir, manifest)
+
+    trained = pipeline_steps.rvc_train_step(tmp_project_dir, confirm_rights=True)
+    converted = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True)
+
+    assert trained.stage_state["train-rvc"]["status"] == "skipped_insufficient_training_data"
+    assert trained.stage_state["train-rvc"]["clean_segment_count"] == 1
+    assert trained.stage_state["train-rvc"]["clean_duration_sec"] == pytest.approx(1.0)
+    assert trained.stage_state["train-rvc"]["augmentation_applied"] is False
+    assert trained.stage_state["train-rvc"]["augmentation_skipped_reason"] == "disabled"
+    assert converted.stage_state["rvc"]["status"] == "completed"
+    assert converted.stage_state["rvc"]["execution_mode"] == "pre_rvc_fallback"
+    converted_segment = converted.segments[0]
+    assert converted_segment.tts is not None
+    assert converted_segment.rvc is not None
+    assert converted_segment.rvc.output_path == converted_segment.tts.selected_candidate_path
+    assert converted_segment.rvc.fallback_used is True
+    assert converted_segment.rvc.accepted is False
 
 
 def test_duration_mismatch_triggers_next_retry_profile(tmp_project_dir: Path, monkeypatch) -> None:

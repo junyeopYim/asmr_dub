@@ -5,11 +5,20 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from pydantic import Field
+
 from asmr_dub_pipeline.schemas import Segment, SourceScript, StrictBaseModel
 
 
 class ASRUnavailableError(RuntimeError):
     pass
+
+
+class ASRWord(StrictBaseModel):
+    start: float
+    end: float
+    text: str
+    confidence: float | None = None
 
 
 class ASRChunk(StrictBaseModel):
@@ -18,6 +27,7 @@ class ASRChunk(StrictBaseModel):
     text: str
     language: str = "ja"
     confidence: float | None = None
+    words: list[ASRWord] = Field(default_factory=list)
 
 
 class ASRBackend(ABC):

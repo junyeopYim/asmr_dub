@@ -97,11 +97,16 @@ def test_default_llama_server_command_includes_mmproj_when_requested(
         ctx_size=4096,
         gpu_layers=999,
         n_predict=1024,
+        parallel_slots=3,
     )
 
     assert command[:5] == [str(server.resolve()), "-m", str(model.resolve()), "--mmproj", str(mmproj.resolve())]
     assert "--host" in command
     assert "--port" in command
+    assert command[command.index("--parallel") + 1] == "3"
+    assert "--no-cache-prompt" in command
+    assert command[command.index("--cache-ram") + 1] == "0"
+    assert command[command.index("--ctx-checkpoints") + 1] == "0"
 
 
 def test_managed_gemma_text_server_waits_for_http_readiness(tmp_path: Path) -> None:

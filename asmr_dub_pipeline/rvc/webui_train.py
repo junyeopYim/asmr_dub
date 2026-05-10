@@ -7,8 +7,11 @@ import shutil
 import subprocess
 import sys
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import numpy as np
 
 _TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
 CACHE_MANIFEST_NAME = "rvc_train_cache_manifest.json"
@@ -110,7 +113,8 @@ def _parse_bool(value: str | bool) -> bool:
 
 
 def _auto_cpu_workers() -> int:
-    return max(1, min(8, os.cpu_count() or 1))
+    cpu_count = os.cpu_count() or 1
+    return max(1, (2 * cpu_count + 2) // 3)
 
 
 def _auto_gpu_workers(device: str) -> int:
@@ -136,6 +140,48 @@ def _copy_config(rvc_root: Path, exp_dir: Path, sample_rate: str, version: str) 
     shutil.copy2(src, exp_dir / "config.json")
 
 
+def _sample_rate_hz(sample_rate: str) -> int:
+    return {"32k": 32_000, "40k": 40_000, "48k": 48_000}.get(sample_rate, 40_000)
+
+
+def _write_silence_wav(path: Path, sample_rate: int, duration_sec: float = 0.5) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames = max(1, int(round(sample_rate * duration_sec)))
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\0\0" * frames)
+
+
+def _ensure_mute_training_assets(
+    rvc_root: Path,
+    *,
+    sample_rate: str,
+    feature_dim: int,
+    if_f0: bool,
+) -> None:
+    mute_root = rvc_root / "logs" / "mute"
+    wav_path = mute_root / "0_gt_wavs" / f"mute{sample_rate}.wav"
+    if not wav_path.exists() or wav_path.stat().st_size == 0:
+        _write_silence_wav(wav_path, _sample_rate_hz(sample_rate))
+
+    feature_path = mute_root / f"3_feature{feature_dim}" / "mute.npy"
+    if not feature_path.exists() or feature_path.stat().st_size == 0:
+        feature_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(feature_path, np.zeros((3, feature_dim), dtype=np.float32))
+
+    if if_f0:
+        for path, dtype in (
+            (mute_root / "2a_f0" / "mute.wav.npy", np.int64),
+            (mute_root / "2b-f0nsf" / "mute.wav.npy", np.float64),
+        ):
+            if path.exists() and path.stat().st_size > 0:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, np.zeros(6, dtype=dtype))
+
+
 def _write_filelist(rvc_root: Path, exp_dir: Path, sample_rate: str, version: str, if_f0: bool) -> None:
     gt_wavs_dir = exp_dir / "0_gt_wavs"
     feature_dir = exp_dir / ("3_feature256" if version == "v1" else "3_feature768")
@@ -148,6 +194,7 @@ def _write_filelist(rvc_root: Path, exp_dir: Path, sample_rate: str, version: st
     if not names:
         raise SystemExit(f"No RVC training feature rows were produced under {exp_dir}")
     fea_dim = 256 if version == "v1" else 768
+    _ensure_mute_training_assets(rvc_root, sample_rate=sample_rate, feature_dim=fea_dim, if_f0=if_f0)
     rows: list[str] = []
     for name in sorted(names):
         if if_f0:
@@ -353,10 +400,10 @@ def main() -> None:
     parser.add_argument("--experiment-name", required=True)
     parser.add_argument("--output-model", required=True)
     parser.add_argument("--output-index", required=True)
-    parser.add_argument("--sample-rate", default="48k")
+    parser.add_argument("--sample-rate", default="40k")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--save-every-epoch", type=int, default=50)
+    parser.add_argument("--save-every-epoch", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--processes", type=int, default=0)
     parser.add_argument("--f0-workers", type=int, default=0)
@@ -372,7 +419,7 @@ def main() -> None:
     output_model = Path(args.output_model).expanduser().resolve()
     output_index = Path(args.output_index).expanduser().resolve()
     exp_dir = rvc_root / "logs" / args.experiment_name
-    sample_rate_int = {"32k": 32000, "40k": 40000, "48k": 48000}.get(args.sample_rate, 48000)
+    sample_rate_int = {"32k": 32000, "40k": 40000, "48k": 48000}.get(args.sample_rate, 40000)
     gpu = args.device.split(":")[-1] if "cuda" in args.device else ""
     is_half = "True"
     preprocess_workers = _resolve_worker_count(args.processes, auto=_auto_cpu_workers())

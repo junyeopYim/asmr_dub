@@ -85,7 +85,8 @@ def create_project_structure(project_dir: Path | str) -> None:
 def load_project_config(project_dir: Path | str) -> ProjectConfig:
     path = Path(project_dir).expanduser().resolve() / "pipeline.yaml"
     if not path.exists():
-        return ProjectConfig(project_name=Path(project_dir).name or "asmr-dub-project")
+        config = ProjectConfig(project_name=Path(project_dir).name or "asmr-dub-project")
+        return _apply_asr_profile_guidance_defaults(config)
     data = yaml.safe_load(path.read_text("utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Project config must be a mapping: {path}")
@@ -94,6 +95,17 @@ def load_project_config(project_dir: Path | str) -> ProjectConfig:
         config.asr.correction_profile_path,
         base_dir=path.parent,
     )
+    return _apply_asr_profile_guidance_defaults(config)
+
+
+def _apply_asr_profile_guidance_defaults(config: ProjectConfig) -> ProjectConfig:
+    profile = config.asr.correction_profile
+    if not config.asr.initial_prompt.strip() and profile.initial_prompt.strip():
+        config.asr.initial_prompt = profile.initial_prompt.strip()
+    if not config.asr.review_initial_prompt.strip() and profile.review_initial_prompt.strip():
+        config.asr.review_initial_prompt = profile.review_initial_prompt.strip()
+    if not config.asr.qwen_context.strip() and profile.qwen_context.strip():
+        config.asr.qwen_context = profile.qwen_context.strip()
     return config
 
 

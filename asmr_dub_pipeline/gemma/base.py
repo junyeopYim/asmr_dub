@@ -31,6 +31,9 @@ class GemmaBackend(ABC):
     def analyze_segment(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def analyze_audio_style(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
+        return self.analyze_segment(audio_path, segment, context)
+
     @abstractmethod
     def generate_script(self, audio_path: Path, segment: Segment, context: Mapping[str, Any]) -> dict[str, Any]:
         raise NotImplementedError

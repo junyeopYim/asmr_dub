@@ -40,12 +40,20 @@ def score_qc(audio_metrics: dict[str, Any], gemma_qc: dict[str, Any] | None = No
         issues.append("too_loud_for_asmr")
     leading_silence = float(audio_metrics.get("leading_silence_sec") or 0.0)
     trailing_silence = float(audio_metrics.get("trailing_silence_sec") or 0.0)
+    intentional_leading_silence = max(
+        0.0, float(audio_metrics.get("intentional_leading_silence_sec") or 0.0)
+    )
+    intentional_trailing_silence = max(
+        0.0, float(audio_metrics.get("intentional_trailing_silence_sec") or 0.0)
+    )
+    unintentional_leading_silence = max(0.0, leading_silence - intentional_leading_silence)
+    unintentional_trailing_silence = max(0.0, trailing_silence - intentional_trailing_silence)
     duration_sec = max(0.0, float(audio_metrics.get("duration_sec") or 0.0))
-    edge_silence = leading_silence + trailing_silence
+    edge_silence = unintentional_leading_silence + unintentional_trailing_silence
     edge_ratio = edge_silence / duration_sec if duration_sec > 0.0 else 0.0
     if (
-        leading_silence > ASMR_MAX_SINGLE_EDGE_SILENCE_SEC
-        or trailing_silence > ASMR_MAX_SINGLE_EDGE_SILENCE_SEC
+        unintentional_leading_silence > ASMR_MAX_SINGLE_EDGE_SILENCE_SEC
+        or unintentional_trailing_silence > ASMR_MAX_SINGLE_EDGE_SILENCE_SEC
         or edge_ratio > ASMR_MAX_TOTAL_EDGE_SILENCE_RATIO
     ):
         issues.append("too_much_silence")

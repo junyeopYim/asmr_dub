@@ -10,6 +10,7 @@ class GPTSoVITSRetrySignal(StrEnum):
     DURATION_TOO_SHORT = "duration_too_short"
     SPEED_FACTOR_ADJUSTED = "speed_factor_adjusted"
     SCRIPT_SHORTENING_REQUESTED = "script_shortening_requested"
+    SCRIPT_DURATION_REWRITE_REQUESTED = "script_duration_rewrite_requested"
     REPETITION_OR_OMISSION = "repetition_or_omission"
     SEED_CHANGED = "seed_changed"
     REPETITION_PENALTY_INCREASED = "repetition_penalty_increased"

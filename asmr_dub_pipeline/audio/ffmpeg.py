@@ -90,17 +90,23 @@ def probe_media(path: Path | str) -> SourceInfo:
     )
 
 
+def wav_output_args(output_path: Path) -> list[str]:
+    if output_path.suffix.lower() == ".wav":
+        return ["-rf64", "auto", str(output_path)]
+    return [str(output_path)]
+
+
 def extract_stereo_48k(input_path: Path, output_path: Path) -> Path:
     ensure_not_same_path(input_path, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    run_ffmpeg(["-y", "-i", str(input_path), "-vn", "-ac", "2", "-ar", "48000", str(output_path)])
+    run_ffmpeg(["-y", "-i", str(input_path), "-vn", "-ac", "2", "-ar", "48000", *wav_output_args(output_path)])
     return output_path
 
 
 def extract_mono_16k(input_path: Path, output_path: Path) -> Path:
     ensure_not_same_path(input_path, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    run_ffmpeg(["-y", "-i", str(input_path), "-vn", "-ac", "1", "-ar", "16000", str(output_path)])
+    run_ffmpeg(["-y", "-i", str(input_path), "-vn", "-ac", "1", "-ar", "16000", *wav_output_args(output_path)])
     return output_path
 
 
@@ -129,7 +135,58 @@ def concat_audio_to_wav(
         str(channels),
         "-ar",
         str(sample_rate),
-        str(output_path),
+        *wav_output_args(output_path),
+    ]
+    run_ffmpeg(args)
+    return output_path
+
+
+def concat_audio_to_wav_with_silence(
+    input_paths: list[Path],
+    output_path: Path,
+    *,
+    silent_paths: list[Path],
+    sample_rate: int = 48_000,
+    channels: int = 2,
+) -> Path:
+    if not input_paths:
+        raise FFmpegError("At least one input file is required for audio concatenation.")
+    for input_path in input_paths:
+        ensure_not_same_path(input_path, output_path)
+    if channels == 1:
+        channel_layout = "mono"
+    elif channels == 2:
+        channel_layout = "stereo"
+    else:
+        raise FFmpegError("Silence concat currently supports mono or stereo output.")
+
+    silent_set = {path.resolve() for path in silent_paths}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args = ["-y"]
+    for input_path in input_paths:
+        if input_path.resolve() in silent_set:
+            duration = max(0.001, float(probe_media(input_path).duration_sec))
+            args += [
+                "-f",
+                "lavfi",
+                "-t",
+                f"{duration:.6f}",
+                "-i",
+                f"anullsrc=r={sample_rate}:cl={channel_layout}",
+            ]
+        else:
+            args += ["-i", str(input_path)]
+    concat_inputs = "".join(f"[{index}:a:0]" for index in range(len(input_paths)))
+    args += [
+        "-filter_complex",
+        f"{concat_inputs}concat=n={len(input_paths)}:v=0:a=1[a]",
+        "-map",
+        "[a]",
+        "-ac",
+        str(channels),
+        "-ar",
+        str(sample_rate),
+        *wav_output_args(output_path),
     ]
     run_ffmpeg(args)
     return output_path
@@ -149,7 +206,7 @@ def slice_audio(
         args += ["-ac", str(channels)]
     if sample_rate:
         args += ["-ar", str(sample_rate)]
-    args += [str(output_path)]
+    args += wav_output_args(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run_ffmpeg(args)
     return output_path
@@ -190,7 +247,7 @@ def fit_audio_duration(
         args += ["-ac", str(channels)]
     if sample_rate:
         args += ["-ar", str(sample_rate)]
-    args += [str(output_path)]
+    args += wav_output_args(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run_ffmpeg(args)
     return output_path

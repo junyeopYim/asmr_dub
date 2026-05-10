@@ -1,21 +1,44 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+DEFAULT_BLOCK_FRAMES = 65_536
 
 
 class AudioProcessingError(RuntimeError):
     pass
 
 
+def _validate_audio_block(data: np.ndarray, path: Path | str) -> None:
+    if data.size and not np.isfinite(data).all():
+        raise AudioProcessingError(f"Audio contains NaN or infinity: {path}")
+
+
+def iter_audio_blocks(
+    path: Path | str,
+    *,
+    block_frames: int = DEFAULT_BLOCK_FRAMES,
+) -> Iterator[tuple[np.ndarray, int]]:
+    with sf.SoundFile(str(path)) as audio:
+        if audio.frames <= 0:
+            raise AudioProcessingError(f"Audio file is empty: {path}")
+        while True:
+            block = audio.read(block_frames, always_2d=True, dtype="float32")
+            if len(block) == 0:
+                break
+            _validate_audio_block(block, path)
+            yield block, int(audio.samplerate)
+
+
 def load_audio(path: Path | str) -> tuple[np.ndarray, int]:
     data, sample_rate = sf.read(str(path), always_2d=True, dtype="float32")
     if data.size == 0:
         raise AudioProcessingError(f"Audio file is empty: {path}")
-    if not np.isfinite(data).all():
-        raise AudioProcessingError(f"Audio contains NaN or infinity: {path}")
+    _validate_audio_block(data, path)
     return data, int(sample_rate)
 
 
@@ -45,24 +68,34 @@ def duration_sec(path: Path | str) -> float:
 
 
 def peak_dbfs(path: Path | str) -> float:
-    data, _ = load_audio(path)
-    peak = float(np.max(np.abs(data)))
+    peak = 0.0
+    for block, _ in iter_audio_blocks(path):
+        peak = max(peak, float(np.max(np.abs(block))))
     if peak <= 0:
         return -120.0
     return 20.0 * float(np.log10(peak))
 
 
 def rms_dbfs(path: Path | str) -> float:
-    data, _ = load_audio(path)
-    rms = float(np.sqrt(np.mean(np.square(data))))
+    total_squares = 0.0
+    total_samples = 0
+    for block, _ in iter_audio_blocks(path):
+        data = block.astype(np.float64, copy=False)
+        total_squares += float(np.sum(data * data))
+        total_samples += int(data.size)
+    rms = float(np.sqrt(total_squares / total_samples)) if total_samples else 0.0
     if rms <= 0:
         return -120.0
     return 20.0 * float(np.log10(rms))
 
 
 def clipping_ratio(path: Path | str, threshold: float = 0.999) -> float:
-    data, _ = load_audio(path)
-    return float(np.mean(np.abs(data) >= threshold))
+    clipped = 0
+    total_samples = 0
+    for block, _ in iter_audio_blocks(path):
+        clipped += int(np.count_nonzero(np.abs(block) >= threshold))
+        total_samples += int(block.size)
+    return float(clipped / total_samples) if total_samples else 0.0
 
 
 def resample_linear(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
@@ -88,23 +121,32 @@ def leading_trailing_silence(
     threshold_db: float = -50.0,
     frame_ms: float = 20.0,
 ) -> tuple[float, float]:
-    data, sr = load_audio(path)
-    mono = to_mono(data)
-    frame = max(1, int(sr * frame_ms / 1000.0))
-    if len(mono) <= frame:
-        active = np.max(np.abs(mono)) > 10 ** (threshold_db / 20.0)
-        return (0.0, 0.0) if active else (len(mono) / sr, len(mono) / sr)
-    frames = []
-    for start in range(0, len(mono), frame):
-        chunk = mono[start : start + frame]
-        rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
-        frames.append(rms > 10 ** (threshold_db / 20.0))
-    active_idx = [idx for idx, active in enumerate(frames) if active]
-    if not active_idx:
-        total = len(mono) / sr
-        return total, total
-    leading = active_idx[0] * frame / sr
-    trailing = max(0.0, (len(frames) - active_idx[-1] - 1) * frame / sr)
+    with sf.SoundFile(str(path)) as audio:
+        if audio.frames <= 0:
+            raise AudioProcessingError(f"Audio file is empty: {path}")
+        sr = int(audio.samplerate)
+        frame = max(1, int(sr * frame_ms / 1000.0))
+        threshold = 10 ** (threshold_db / 20.0)
+        frame_count = 0
+        first_active: int | None = None
+        last_active: int | None = None
+        while True:
+            chunk = audio.read(frame, always_2d=True, dtype="float32")
+            if len(chunk) == 0:
+                break
+            _validate_audio_block(chunk, path)
+            mono = to_mono(chunk)
+            rms = float(np.sqrt(np.mean(np.square(mono)))) if len(mono) else 0.0
+            if rms > threshold:
+                if first_active is None:
+                    first_active = frame_count
+                last_active = frame_count
+            frame_count += 1
+        if first_active is None or last_active is None:
+            total = float(audio.frames) / float(sr)
+            return total, total
+    leading = first_active * frame / sr
+    trailing = max(0.0, (frame_count - last_active - 1) * frame / sr)
     return leading, trailing
 
 

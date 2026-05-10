@@ -116,7 +116,7 @@ gsv:
   server_startup_timeout_sec: 120.0
   server_shutdown_timeout_sec: 10.0
   few_shot_enabled: true
-  few_shot_target_sec: 60.0
+  few_shot_min_total_sec: 60.0
   few_shot_min_clip_sec: 1.0
   few_shot_max_clip_sec: 10.0
   few_shot_force: false

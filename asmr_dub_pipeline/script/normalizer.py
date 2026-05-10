@@ -150,6 +150,7 @@ KOREAN_PUNCT_TRANSLATION = str.maketrans(
 SPACE_RE = re.compile(r"[\s\u3000]+")
 JAPANESE_PUNCT_RE = re.compile(r"\s*([、。！？])\s*")
 KOREAN_PUNCT_RE = re.compile(r"\s*([,.!?…])\s*")
+KOREAN_LEADING_SENTENCE_FRAGMENT_RE = re.compile(r"^[\s、。！？,.!?]+(?=\s*[\uac00-\ud7a3])")
 KOREAN_LATIN_TOKEN_RE = re.compile(r"[A-Za-z]+(?:[-_][A-Za-z]+)*")
 KOREAN_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 KOREAN_LONG_CLAUSE_MAX_CHARS = 44
@@ -398,6 +399,7 @@ def _normalize_korean_punctuation_and_space(text: str) -> str:
     text = re.sub(r",{2,}", ",", text)
     text = re.sub(r"!{2,}", "!", text)
     text = re.sub(r"\?{2,}", "?", text)
+    text = KOREAN_LEADING_SENTENCE_FRAGMENT_RE.sub("", text)
     text = KOREAN_PUNCT_RE.sub(r"\1", text)
     text = re.sub(r"([,.!?])([,.!?])+", r"\1", text)
     text = re.sub(r"([,.!?…])(?=[^\s,.!?…])", r"\1 ", text)
