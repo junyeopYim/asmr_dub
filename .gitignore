@@ -35,6 +35,7 @@ env/
 /work/
 /outputs/
 /artifacts/
+/experiments/
 
 # Heavy model/checkpoint artifacts
 models/

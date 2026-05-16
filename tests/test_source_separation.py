@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import threading
-import time
 from io import StringIO
 from pathlib import Path
 
@@ -25,7 +23,14 @@ from asmr_dub_pipeline.pipeline.steps import (
     source_separation_step,
     transcribe_step,
 )
-from asmr_dub_pipeline.schemas import ProjectConfig
+from asmr_dub_pipeline.schemas import PipelineManifest, ProjectConfig, Segment, SourceInfo
+
+
+def _demucs_track_paths(command: list[str]) -> list[Path]:
+    tail = command[command.index("-o") + 2 :]
+    if tail[:1] == ["-d"]:
+        tail = tail[2:]
+    return [Path(raw) for raw in tail]
 
 
 def _mock_separation_config(project: Path) -> None:
@@ -557,13 +562,13 @@ def test_demucs_separates_folder_parts_before_concatenating_stems(
     def fake_demucs_runner(command: list[str], check: bool, text: bool) -> None:
         assert check is True
         assert text is True
-        input_path = Path(command[-1])
-        demucs_inputs.append(input_path)
         output_dir = Path(command[command.index("-o") + 1])
-        stem_dir = output_dir / model / input_path.stem
-        stem_dir.mkdir(parents=True, exist_ok=True)
-        write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
-        write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
+        for input_path in _demucs_track_paths(command):
+            demucs_inputs.append(input_path)
+            stem_dir = output_dir / model / input_path.stem
+            stem_dir.mkdir(parents=True, exist_ok=True)
+            write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
+            write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
 
     def fake_run_ffmpeg(args: list[str]) -> None:
         for raw in args:
@@ -594,7 +599,7 @@ def test_demucs_separates_folder_parts_before_concatenating_stems(
     )
 
     assert result is not None
-    assert set(demucs_inputs) == {part_1, part_2}
+    assert [path.stem for path in demucs_inputs] == ["part_0001", "part_0002"]
     assert len(demucs_inputs) == 2
     assert merged_input not in demucs_inputs
     metadata = json.loads(result.metadata_path.read_text("utf-8"))
@@ -602,11 +607,11 @@ def test_demucs_separates_folder_parts_before_concatenating_stems(
     assert metadata["input_part_paths"] == [str(part_1), str(part_2)]
 
 
-def test_demucs_folder_partwise_separation_runs_up_to_two_parts_in_parallel(
+def test_demucs_folder_partwise_separation_batches_parts_in_single_process(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    project = tmp_path / "folder_partwise_two_worker_separation"
+    project = tmp_path / "folder_partwise_batch_separation"
     folder = tmp_path / "folder"
     parts = [folder / f"{index:02d} part.wav" for index in range(1, 9)]
     for index, part in enumerate(parts, start=1):
@@ -614,30 +619,18 @@ def test_demucs_folder_partwise_separation_runs_up_to_two_parts_in_parallel(
     merged_input = project / "work" / "audio" / "original_stereo_48k.wav"
     write_audio(merged_input, np.zeros((48_000, 2), dtype=np.float32), 48_000)
     model = "htdemucs"
-    lock = threading.Lock()
-    active_demucs = 0
-    max_active_demucs = 0
-    demucs_inputs: list[Path] = []
+    demucs_commands: list[list[str]] = []
 
     def fake_demucs_runner(command: list[str], check: bool, text: bool) -> None:
-        nonlocal active_demucs, max_active_demucs
         assert check is True
         assert text is True
-        input_path = Path(command[-1])
-        with lock:
-            active_demucs += 1
-            max_active_demucs = max(max_active_demucs, active_demucs)
-            demucs_inputs.append(input_path)
-        try:
-            time.sleep(0.05)
-            output_dir = Path(command[command.index("-o") + 1])
+        demucs_commands.append(command)
+        output_dir = Path(command[command.index("-o") + 1])
+        for input_path in _demucs_track_paths(command):
             stem_dir = output_dir / model / input_path.stem
             stem_dir.mkdir(parents=True, exist_ok=True)
             write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
             write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
-        finally:
-            with lock:
-                active_demucs -= 1
 
     def fake_run_ffmpeg(args: list[str]) -> None:
         for raw in args:
@@ -668,8 +661,11 @@ def test_demucs_folder_partwise_separation_runs_up_to_two_parts_in_parallel(
     )
 
     assert result is not None
-    assert 1 < max_active_demucs <= 2
-    assert set(demucs_inputs) == set(parts)
+    assert len(demucs_commands) == 1
+    demucs_inputs = _demucs_track_paths(demucs_commands[0])
+    assert [path.stem for path in demucs_inputs] == [f"part_{index:04d}" for index in range(1, 9)]
+    assert all(path.exists() for path in demucs_inputs)
+    assert not any(path in parts for path in demucs_inputs)
     metadata = json.loads(result.metadata_path.read_text("utf-8"))
     assert metadata["parts"] == sorted(metadata["parts"], key=lambda part: part["part_index"])
     assert metadata["input_part_paths"] == [str(part) for part in parts]
@@ -697,13 +693,13 @@ def test_source_separation_stage_uses_folder_mix_parts_for_demucs(
     def fake_demucs_runner(command: list[str], check: bool, text: bool) -> None:
         assert check is True
         assert text is True
-        input_path = Path(command[-1])
-        demucs_inputs.append(input_path)
         output_dir = Path(command[command.index("-o") + 1])
-        stem_dir = output_dir / model / input_path.stem
-        stem_dir.mkdir(parents=True, exist_ok=True)
-        write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
-        write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
+        for input_path in _demucs_track_paths(command):
+            demucs_inputs.append(input_path)
+            stem_dir = output_dir / model / input_path.stem
+            stem_dir.mkdir(parents=True, exist_ok=True)
+            write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
+            write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
 
     def fake_run_ffmpeg(args: list[str]) -> None:
         for raw in args:
@@ -728,7 +724,7 @@ def test_source_separation_stage_uses_folder_mix_parts_for_demucs(
     manifest = source_separation_step(project, confirm_rights=True)
 
     assert manifest.stage_state["source-separation"]["status"] == "completed"
-    assert set(demucs_inputs) == {part_1.resolve(), part_2.resolve()}
+    assert [path.stem for path in demucs_inputs] == ["part_0001", "part_0002"]
     assert len(demucs_inputs) == 2
     assert Path(manifest.artifacts["original_stereo_48k"]) not in demucs_inputs
 
@@ -764,12 +760,12 @@ def test_transcribe_uses_source_separated_folder_part_audio(
     def fake_demucs_runner(command: list[str], check: bool, text: bool) -> None:
         assert check is True
         assert text is True
-        input_path = Path(command[-1])
         output_dir = Path(command[command.index("-o") + 1])
-        stem_dir = output_dir / model / input_path.stem
-        stem_dir.mkdir(parents=True, exist_ok=True)
-        write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
-        write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
+        for input_path in _demucs_track_paths(command):
+            stem_dir = output_dir / model / input_path.stem
+            stem_dir.mkdir(parents=True, exist_ok=True)
+            write_audio(stem_dir / "vocals.wav", np.full((4_410, 2), 0.05, dtype=np.float32), 44_100)
+            write_audio(stem_dir / "no_vocals.wav", np.zeros((4_410, 2), dtype=np.float32), 44_100)
 
     def fake_run_ffmpeg(args: list[str]) -> None:
         for raw in args:
@@ -867,6 +863,137 @@ def test_partwise_transcribe_offsets_word_timestamps(tmp_path: Path) -> None:
         (10.12, 10.32, "5"),
         (20.12, 20.32, "4"),
     ]
+
+
+def test_partwise_transcribe_skips_asr_silenced_parts(tmp_path: Path) -> None:
+    from asmr_dub_pipeline.pipeline.stages.transcribe import _transcribe_partwise_audio
+
+    spoken = tmp_path / "spoken.wav"
+    effect_only = tmp_path / "効果音トラック02e.wav"
+    write_audio(spoken, np.zeros((160, 1), dtype=np.float32), 16_000)
+    write_audio(effect_only, np.zeros((160, 1), dtype=np.float32), 16_000)
+    captured_paths: list[Path] = []
+
+    class FakeASRBackend:
+        def transcribe(self, audio_path: Path, segments: list[object]) -> list[ASRChunk]:
+            _ = segments
+            captured_paths.append(audio_path)
+            return [ASRChunk(start=0.1, end=0.7, text="声", language="ja", confidence=0.9)]
+
+    chunks = _transcribe_partwise_audio(
+        FakeASRBackend(),
+        [
+            {"start_sec": 10.0, "vocals_mono_path": str(spoken)},
+            {
+                "start_sec": 20.0,
+                "vocals_mono_path": str(effect_only),
+                "asr_silenced": True,
+                "asr_skip_reason": "effect_only",
+            },
+        ],
+    )
+
+    assert captured_paths == [spoken]
+    assert [(chunk.start, chunk.end, chunk.text) for chunk in chunks] == [(10.1, 10.7, "声")]
+
+
+def test_transcribe_marks_segments_in_asr_silenced_folder_parts_no_speech(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "transcribe_skip_effect_only_part"
+    create_project_structure(project)
+    save_project_config(
+        ProjectConfig(
+            project_name=project.name,
+            source_separation_backend="none",
+            asr_resegment_from_chunks=False,
+            asr_repair_enabled=False,
+            asr_review_enabled=False,
+            asr_input_duration_tolerance=1.0,
+        ),
+        project / "pipeline.yaml",
+    )
+    audio_dir = project / "work" / "audio"
+    gemma_audio = audio_dir / "gemma_mono_16k.wav"
+    mix_audio = audio_dir / "original_stereo_48k.wav"
+    write_audio(gemma_audio, np.zeros((32_000, 1), dtype=np.float32), 16_000)
+    write_audio(mix_audio, np.zeros((96_000, 2), dtype=np.float32), 48_000)
+    manifest = PipelineManifest(
+        source_info=SourceInfo(
+            path=str(mix_audio),
+            duration_sec=2.0,
+            sample_rate=48_000,
+            channels=2,
+            has_video=False,
+            format_name="wav",
+            raw={
+                "folder_input": {
+                    "input_kind": "folder",
+                    "asr_source_status": "mix_parts_silenced_for_asr",
+                    "asr_silent_part_count": 1,
+                    "asr_parts": [
+                        {
+                            "part_index": 1,
+                            "path": str(tmp_path / "spoken.wav"),
+                            "stem": "spoken",
+                            "start_sec": 0.0,
+                            "end_sec": 1.0,
+                        },
+                        {
+                            "part_index": 2,
+                            "path": str(tmp_path / "効果音トラック02e.mp3"),
+                            "stem": "効果音トラック02e",
+                            "start_sec": 1.0,
+                            "end_sec": 2.0,
+                            "asr_silenced": True,
+                            "asr_skip_reason": "effect_only",
+                        },
+                    ],
+                }
+            },
+        ),
+        artifacts={"gemma_mono_16k": str(gemma_audio), "original_stereo_48k": str(mix_audio)},
+        segments=[
+            Segment(
+                id="seg_0001",
+                start=0.0,
+                end=1.0,
+                duration=1.0,
+                audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+            ),
+            Segment(
+                id="seg_0002",
+                start=1.0,
+                end=2.0,
+                duration=1.0,
+                audio_for_gemma="work/segments/audio/seg_0002_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_0002_mix.wav",
+            ),
+        ],
+    )
+    save_manifest(project, manifest)
+
+    class FakeASRBackend:
+        name = "faster_whisper"
+
+        def transcribe(self, audio_path: Path, segments: list[object]) -> list[ASRChunk]:
+            _ = audio_path, segments
+            return [ASRChunk(start=0.1, end=0.7, text="声です", language="ja", confidence=0.9)]
+
+    monkeypatch.setattr(pipeline_steps, "create_asr_backend", lambda *_args, **_kwargs: FakeASRBackend())
+
+    manifest = transcribe_step(project, asr_backend="faster_whisper", confirm_rights=True)
+
+    assert manifest.segments[0].status == "transcribed"
+    assert manifest.segments[1].status == "no_speech_detected"
+    assert manifest.segments[1].source_script is None
+    assert manifest.segments[1].analysis["asr_quality_gate"] == {
+        "decision": "no_speech",
+        "reasons": ["asr_skipped_folder_part:effect_only"],
+        "tts_blocked": True,
+    }
 
 
 def test_full_imports_matching_voice_bank_source_separation_cache(

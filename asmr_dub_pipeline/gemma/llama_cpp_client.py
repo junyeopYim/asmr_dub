@@ -12,7 +12,13 @@ from asmr_dub_pipeline.schemas import Segment
 from .base import GemmaBackend, GemmaResponseParseError, GemmaUnavailableError
 from .json_repair import JSONRepairError
 from .parser import parse_gemma_task_response
-from .prompts import analysis_prompt, audio_style_prompt, json_repair_prompt, qc_prompt, script_prompt
+from .prompts import (
+    analysis_prompt,
+    audio_style_prompt,
+    json_repair_prompt,
+    qc_prompt,
+    script_prompt,
+)
 from .schemas import TASK_REQUIRED_KEYS, TaskName
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

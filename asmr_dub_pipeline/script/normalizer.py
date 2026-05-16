@@ -14,6 +14,18 @@ class NormalizedScriptText:
     risk_flags: list[str]
 
 
+@dataclass(frozen=True)
+class JapaneseKanaText:
+    text: str
+    original_text: str
+    changed: bool
+    risk_flags: list[str]
+
+
+class JapaneseKanaNormalizationError(ValueError):
+    pass
+
+
 BRACKET_PATTERN = re.compile(
     r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|（[^）]*）|【[^】]*】|｛[^｝]*｝|〈[^〉]*〉|《[^》]*》)"
 )
@@ -154,6 +166,10 @@ KOREAN_LEADING_SENTENCE_FRAGMENT_RE = re.compile(r"^[\s、。！？,.!?]+(?=\s*[
 KOREAN_LATIN_TOKEN_RE = re.compile(r"[A-Za-z]+(?:[-_][A-Za-z]+)*")
 KOREAN_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 KOREAN_LONG_CLAUSE_MAX_CHARS = 44
+JAPANESE_REMAINING_NON_KANA_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff々〆〤A-Za-z0-9]")
+KATAKANA_TO_HIRAGANA = str.maketrans(
+    {chr(codepoint): chr(codepoint - 0x60) for codepoint in range(0x30A1, 0x30F7)}
+)
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -164,6 +180,49 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(value)
             deduped.append(value)
     return deduped
+
+
+def _pyopenjtalk_kana(text: str) -> str | None:
+    try:
+        import pyopenjtalk  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        return str(pyopenjtalk.g2p(text, kana=True))
+    except Exception:
+        return None
+
+
+def normalize_japanese_kana_text(text: str, *, strict: bool = False) -> JapaneseKanaText:
+    """Normalize Japanese model-training/reference text to hiragana pronunciation text."""
+    original = str(text or "").strip()
+    if not original:
+        return JapaneseKanaText(
+            text="",
+            original_text=original,
+            changed=False,
+            risk_flags=["japanese_kana_text_empty"],
+        )
+    converted = _pyopenjtalk_kana(original)
+    if converted is None:
+        converted = original
+    normalized = _normalize_punctuation_and_space(converted).translate(KATAKANA_TO_HIRAGANA)
+    risk_flags: list[str] = []
+    if normalized != original:
+        risk_flags.append("normalized_japanese_kana_text")
+    if JAPANESE_REMAINING_NON_KANA_RE.search(normalized):
+        risk_flags.append("remaining_non_kana_japanese_text")
+        if strict:
+            raise JapaneseKanaNormalizationError(
+                "Japanese kana normalization left remaining non-kana Japanese text: "
+                f"{normalized!r}"
+            )
+    return JapaneseKanaText(
+        text=normalized,
+        original_text=original,
+        changed=normalized != original,
+        risk_flags=_dedupe(risk_flags),
+    )
 
 
 def _cue_kind(content: str) -> tuple[str, str]:

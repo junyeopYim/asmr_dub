@@ -34,7 +34,11 @@ def run_prepare_source_voice_refs_stage(ctx: PipelineContext, refs_path: Path | 
         raise ValueError(f"refs JSON must be an object keyed by style name: {actual_refs_path}")
 
     aux_spans = selected_spans[1:]
-    prompt_text = _voice_ref_span_prompt_text(selected_span)
+    prompt_lang = selected.source_script.language or cfg.source_language
+    prompt_text, prompt_text_original, prompt_text_flags = _model_boundary_text_for_language(
+        _voice_ref_span_prompt_text(selected_span),
+        prompt_lang,
+    )
     prepared: dict[str, str] = {}
     ref_qc_rows: list[dict[str, Any]] = []
     for style in ("whisper_close", "sleepy"):
@@ -59,11 +63,16 @@ def run_prepare_source_voice_refs_stage(ctx: PipelineContext, refs_path: Path | 
             **entry,
             "ref_audio_path": raw_ref_path,
             "prompt_text": prompt_text,
-            "prompt_lang": selected.source_script.language or cfg.source_language,
+            "prompt_text_original": prompt_text_original,
+            "prompt_lang": prompt_lang,
             "aux_ref_audio_paths": aux_ref_audio_paths,
             "source_language": cfg.source_language,
             "target_language": cfg.target_language,
             "cross_lingual_role": "ja_source_prompt_for_ko_tts",
+            "text_normalization": {
+                "policy": "ja_hiragana" if _canonical_language(prompt_lang) == "ja" else "none",
+                "risk_flags": prompt_text_flags,
+            },
         }
         prepared[style] = str(resolved_ref_path)
         ref_qc_rows.append(
@@ -72,7 +81,13 @@ def run_prepare_source_voice_refs_stage(ctx: PipelineContext, refs_path: Path | 
                 "segment_id": selected.id,
                 "source_language": cfg.source_language,
                 "target_language": cfg.target_language,
-                "prompt_lang": selected.source_script.language or cfg.source_language,
+                "prompt_lang": prompt_lang,
+                "prompt_text": prompt_text,
+                "prompt_text_original": prompt_text_original,
+                "prompt_text_normalization": {
+                    "policy": "ja_hiragana" if _canonical_language(prompt_lang) == "ja" else "none",
+                    "risk_flags": prompt_text_flags,
+                },
                 "metrics": selected_metrics.as_payload(),
                 "selected_segment_ids": [segment.id for segment in selected_span.segments],
                 "selected_span_start_sec": selected_span.segments[0].start,

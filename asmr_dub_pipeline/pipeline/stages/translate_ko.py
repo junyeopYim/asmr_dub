@@ -40,6 +40,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     ordinal_postprocessed = 0
     asr_homophone_postprocessed = 0
     numeric_counting_postprocessed = 0
+    embedded_countdown_translation_repaired = 0
     asr_backcheck_count = 0
     safety_blocked = 0
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
@@ -65,6 +66,60 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             and not error.startswith("Korean TTS preflight blocked synthesis")
             and not error.startswith("korean-script skipped segment status")
         ]
+
+    def embedded_countdown_event_values(segment: Segment) -> list[int] | None:
+        event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
+        if not isinstance(event, dict):
+            return None
+        raw_values = event.get("values")
+        if not isinstance(raw_values, list) or not all(isinstance(value, int) for value in raw_values):
+            return None
+        values = [int(value) for value in raw_values]
+        source_text = _translation_source_text(segment)
+        if not source_text:
+            return None
+        if not values or not is_descending_countdown(values):
+            return None
+        if source_countdown_values(source_text) == values:
+            return None
+        return values
+
+    def deterministic_countdown_translation_needs_repair(segment: Segment) -> list[int] | None:
+        values = embedded_countdown_event_values(segment)
+        if values is None or segment.translation_ko is None:
+            return None
+        translation = segment.translation_ko
+        if translation.model == "deterministic:countdown-event":
+            return values
+        if COUNTDOWN_EVENT_NOTE in translation.notes:
+            return values
+        return None
+
+    def reset_embedded_countdown_translation(segment: Segment, values: list[int]) -> None:
+        reset_downstream_state_for_retranslation(segment)
+        segment.status = "transcribed"
+        segment.translation_ko = None
+        segment.script = None
+        segment.tts = None
+        segment.rvc = None
+        segment.qc = None
+        segment.mix = {}
+        segment.errors = [
+            error
+            for error in segment.errors
+            if error != "RVC requires segment.tts.selected_candidate_path from synth."
+            and not error.startswith("Countdown ")
+        ]
+        event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
+        if isinstance(event, dict):
+            event["kind"] = "embedded_countdown"
+            event["synth_eligible"] = False
+            event["deterministic_translation_eligible"] = False
+        segment.analysis["embedded_countdown_translation_repair"] = {
+            "reason": "deterministic_countdown_translation_on_embedded_countdown",
+            "action": "clear_translation_and_downstream_state",
+            "values": values,
+        }
 
     for segment in manifest.segments:
         if segment.status in NO_SPEECH_STATUSES:
@@ -98,6 +153,11 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 }
             )
             continue
+        repair_values = deterministic_countdown_translation_needs_repair(segment)
+        if repair_values is not None:
+            reset_embedded_countdown_translation(segment, repair_values)
+            embedded_countdown_translation_repaired += 1
+            quality_counters["embedded_countdown_translation_repair"] += 1
         translation = segment.translation_ko
         failed_status = segment.status in SKIP_STATUSES
         retry_this_failed = retry_failed and failed_status
@@ -249,6 +309,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 n_predict=cfg.gemma_text_n_predict,
                 model=model_name,
                 two_pass=cfg.gemma_text_two_pass,
+                auto_salvage_enabled=cfg.gemma_text_auto_salvage_enabled,
             )
         return MockTranslationClient(model=model_name)
 
@@ -271,6 +332,58 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                     shutdown_timeout_sec=cfg.gemma_text_server_shutdown_timeout_sec,
                 )
             )
+
+    def build_server_metadata() -> dict[str, Any] | None:
+        if backend_kind != "llama_server":
+            return None
+        instances: list[dict[str, Any]] = []
+        for index, manager in enumerate(server_managers):
+            base_url = getattr(
+                manager,
+                "base_url",
+                translation_base_urls[index] if index < len(translation_base_urls) else "",
+            )
+            command = [str(part) for part in list(getattr(manager, "command", []) or [])]
+            log_path = getattr(manager, "log_path", None)
+            instance = {
+                "base_url": base_url,
+                "enabled": bool(getattr(manager, "enabled", translation_auto_start)),
+                "started": bool(getattr(manager, "started", False)),
+                "reused_existing": bool(getattr(manager, "reused_existing", False)),
+                "log_path": str(log_path) if log_path else None,
+                "command_preview": _format_command_preview(command) if command else None,
+            }
+            instances.append(instance)
+        metadata: dict[str, Any] = {
+            "auto_start": translation_auto_start,
+            "concurrency": translation_worker_count,
+            "server_count": len(server_managers),
+            "mode": "single_server_slots",
+            "base_urls": translation_base_urls,
+            "instances": instances,
+        }
+        if len(instances) == 1:
+            metadata.update(
+                started=instances[0]["started"],
+                reused_existing=instances[0]["reused_existing"],
+                log_path=instances[0]["log_path"],
+                command_preview=instances[0]["command_preview"],
+            )
+        return metadata
+
+    if server_managers:
+        server_metadata = build_server_metadata() or {}
+        first_instance = (server_metadata.get("instances") or [{}])[0]
+        _log_stage_checkpoint(
+            "translate-ko",
+            "Gemma text server configured",
+            "auto_start={auto_start} base_urls={base_urls} log_path={log_path} command={command}".format(
+                auto_start=translation_auto_start,
+                base_urls=",".join(translation_base_urls),
+                log_path=first_instance.get("log_path"),
+                command=first_instance.get("command_preview"),
+            ),
+        )
 
     started_at = monotonic()
     last_logged_at = started_at
@@ -313,7 +426,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         return final_rows
 
     def build_diagnostics_payload(partial: bool) -> dict[str, Any]:
-        return {
+        payload = {
             "backend": backend_kind,
             "model": model_name,
             "partial": partial,
@@ -331,43 +444,85 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 "severe_backcheck_promotes_manual_review": True,
             },
         }
+        server_metadata = build_server_metadata()
+        if server_metadata is not None:
+            payload["server"] = server_metadata
+        return payload
 
     def persist_partial() -> None:
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         _write_jsonl_atomic(jsonl_path, rows)
-        write_json_atomic(
-            summary_path,
-            {
-                "backend": backend_kind,
-                "model": model_name,
-                "segments": total,
-                "translated": translated,
-                "needs_manual_review": needs_manual_review,
-                "colloquialized": colloquialized,
-                "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
-                "ordinal_postprocessed": ordinal_postprocessed,
-                "asr_homophone_postprocessed": asr_homophone_postprocessed,
-                "numeric_counting_postprocessed": numeric_counting_postprocessed,
-                "asr_backcheck_count": asr_backcheck_count,
-                "concurrency": translation_worker_count,
-                "context_radius": cfg.gemma_text_context_radius,
-                "span_size": cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
-                "span_max_sec": cfg.gemma_text_span_max_sec if backend_kind == "llama_server" else None,
-                "span_max_gap_sec": cfg.gemma_text_span_max_gap_sec if backend_kind == "llama_server" else None,
-                "span_count": len(translation_batches),
-                "two_pass": cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
-                "force_retranslate": force_retranslate,
-                "retry_failed": retry_failed,
-                "repair_only": repair_only,
-                "force_retranslate_failed": force_retranslate_failed,
-                "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
-                "partial": True,
-            },
-        )
+        summary_payload: dict[str, Any] = {
+            "backend": backend_kind,
+            "model": model_name,
+            "segments": total,
+            "translated": translated,
+            "needs_manual_review": needs_manual_review,
+            "colloquialized": colloquialized,
+            "digit_pronunciation_postprocessed": digit_pronunciation_postprocessed,
+            "ordinal_postprocessed": ordinal_postprocessed,
+            "asr_homophone_postprocessed": asr_homophone_postprocessed,
+            "numeric_counting_postprocessed": numeric_counting_postprocessed,
+            "embedded_countdown_translation_repaired": embedded_countdown_translation_repaired,
+            "asr_backcheck_count": asr_backcheck_count,
+            "concurrency": translation_worker_count,
+            "context_radius": cfg.gemma_text_context_radius,
+            "span_size": cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
+            "span_max_sec": cfg.gemma_text_span_max_sec if backend_kind == "llama_server" else None,
+            "span_max_gap_sec": cfg.gemma_text_span_max_gap_sec if backend_kind == "llama_server" else None,
+            "span_count": len(translation_batches),
+            "two_pass": cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
+            "force_retranslate": force_retranslate,
+            "retry_failed": retry_failed,
+            "repair_only": repair_only,
+            "force_retranslate_failed": force_retranslate_failed,
+            "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
+            "partial": True,
+        }
+        server_metadata = build_server_metadata()
+        if server_metadata is not None:
+            summary_payload["server"] = server_metadata
+        write_json_atomic(summary_path, summary_payload)
         write_json_atomic(diagnostics_path, build_diagnostics_payload(partial=True))
         manifest.artifacts["translation_bundles"] = str(jsonl_path)
         manifest.artifacts["translation_summary"] = str(summary_path)
         manifest.artifacts["translation_diagnostics"] = str(diagnostics_path)
+        save_manifest(project_dir, manifest)
+
+    def persist_failed(exc: Exception) -> None:
+        persist_partial()
+        server_metadata = build_server_metadata()
+        _log_stage_checkpoint(
+            "translate-ko",
+            "failed",
+            f"error={exc} server={server_metadata}",
+        )
+        mark_stage(
+            manifest,
+            "translate-ko",
+            "failed",
+            backend=backend_kind,
+            model=model_name,
+            translated=translated,
+            needs_manual_review=needs_manual_review,
+            no_speech_detected=no_speech_detected,
+            quality_counters=dict(sorted(quality_counters.items())),
+            concurrency=translation_worker_count,
+            context_radius=cfg.gemma_text_context_radius,
+            span_size=cfg.gemma_text_span_size if backend_kind == "llama_server" else cfg.gemma_text_batch_size,
+            span_max_sec=cfg.gemma_text_span_max_sec if backend_kind == "llama_server" else None,
+            span_max_gap_sec=cfg.gemma_text_span_max_gap_sec if backend_kind == "llama_server" else None,
+            span_count=len(translation_batches),
+            two_pass=cfg.gemma_text_two_pass if backend_kind == "llama_server" else False,
+            force_retranslate=force_retranslate,
+            retry_failed=retry_failed,
+            repair_only=repair_only,
+            force_retranslate_failed=force_retranslate_failed,
+            base_urls=translation_base_urls if backend_kind == "llama_server" else [],
+            partial=True,
+            error=str(exc),
+            server=server_metadata,
+        )
         save_manifest(project_dir, manifest)
 
     if rows:
@@ -590,7 +745,25 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
 
     try:
         for server_manager in server_managers:
+            _log_stage_checkpoint(
+                "translate-ko",
+                "starting Gemma text server",
+                "base_url={base_url} auto_start={auto_start} log_path={log_path}".format(
+                    base_url=getattr(server_manager, "base_url", ""),
+                    auto_start=translation_auto_start,
+                    log_path=getattr(server_manager, "log_path", None),
+                ),
+            )
             server_manager.start()
+            _log_stage_checkpoint(
+                "translate-ko",
+                "Gemma text server ready",
+                "base_url={base_url} started={started} reused_existing={reused_existing}".format(
+                    base_url=getattr(server_manager, "base_url", ""),
+                    started=getattr(server_manager, "started", False),
+                    reused_existing=getattr(server_manager, "reused_existing", False),
+                ),
+            )
         batch_jobs = []
         for job_index, batch in enumerate(translation_batches):
             batch_id = f"batch_{job_index + 1:04d}"
@@ -620,6 +793,9 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             for _, batch, batch_id, worker_index in batch_jobs:
                 apply_batch_result(*translate_batch_with_retries(batch, batch_id, worker_index))
                 persist_partial()
+    except Exception as exc:
+        persist_failed(exc)
+        raise
     finally:
         for server_manager in reversed(server_managers):
             server_manager.stop()
@@ -660,6 +836,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         manifest.segments,
         asr_backcheck_items,
         quality_counters,
+        cfg=cfg,
     )
     translated = sum(1 for row in rows if row.get("status") == "translated")
     needs_manual_review = sum(1 for row in rows if row.get("status") == "needs_manual_review")
@@ -689,6 +866,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         "ordinal_postprocessed": ordinal_postprocessed,
         "asr_homophone_postprocessed": asr_homophone_postprocessed,
         "numeric_counting_postprocessed": numeric_counting_postprocessed,
+        "embedded_countdown_translation_repaired": embedded_countdown_translation_repaired,
         "asr_backcheck_count": asr_backcheck_count,
         "concurrency": translation_worker_count,
         "context_radius": cfg.gemma_text_context_radius,
@@ -710,31 +888,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     manifest.artifacts["translation_summary"] = str(summary_path)
     manifest.artifacts["translation_diagnostics"] = str(diagnostics_path)
     manifest.artifacts["translation_asr_backcheck_summary"] = str(asr_backcheck_summary_path)
-    server_metadata = None
-    if backend_kind == "llama_server":
-        instances = [
-            {
-                "base_url": getattr(manager, "base_url", translation_base_urls[index]),
-                "started": manager.started,
-                "reused_existing": manager.reused_existing,
-                "log_path": str(manager.log_path) if manager.log_path else None,
-            }
-            for index, manager in enumerate(server_managers)
-        ]
-        server_metadata = {
-            "auto_start": translation_auto_start,
-            "concurrency": translation_worker_count,
-            "server_count": len(server_managers),
-            "mode": "single_server_slots",
-            "base_urls": translation_base_urls,
-            "instances": instances,
-        }
-        if len(instances) == 1:
-            server_metadata.update(
-                started=instances[0]["started"],
-                reused_existing=instances[0]["reused_existing"],
-                log_path=instances[0]["log_path"],
-            )
+    server_metadata = build_server_metadata()
     mark_stage(
         manifest,
         "translate-ko",
@@ -750,6 +904,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         ordinal_postprocessed=ordinal_postprocessed,
         asr_homophone_postprocessed=asr_homophone_postprocessed,
         numeric_counting_postprocessed=numeric_counting_postprocessed,
+        embedded_countdown_translation_repaired=embedded_countdown_translation_repaired,
         asr_backcheck_count=asr_backcheck_count,
         quality_counters=dict(sorted(quality_counters.items())),
         concurrency=translation_worker_count,

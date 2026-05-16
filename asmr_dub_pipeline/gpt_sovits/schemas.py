@@ -12,11 +12,14 @@ class GPTSoVITSBase(BaseModel):
 class GPTSoVITSRef(GPTSoVITSBase):
     ref_audio_path: str
     prompt_text: str
+    prompt_text_original: str = ""
     prompt_lang: str = "ja"
     aux_ref_audio_paths: list[str] = Field(default_factory=list)
     source_language: str = "ja"
     target_language: str = "ko"
+    speaker_id: str = ""
     cross_lingual_role: str = ""
+    text_normalization: dict[str, Any] = Field(default_factory=dict)
 
 
 class GPTSoVITSTTSOptions(GPTSoVITSBase):

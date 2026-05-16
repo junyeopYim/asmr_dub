@@ -17,6 +17,7 @@ from asmr_dub_pipeline.pipeline.stages.korean_script import run_korean_script_st
 from asmr_dub_pipeline.pipeline.stages.speaker_assignment import run_assign_speakers_stage
 from asmr_dub_pipeline.pipeline.stages.voice_refs import run_prepare_source_voice_refs_stage
 from asmr_dub_pipeline.pipeline.stages.gsv_few_shot import run_gsv_few_shot_stage
+from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_countdown_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_qwen import run_synth_qwen_stage
 from asmr_dub_pipeline.pipeline.stages.rvc_train import run_rvc_train_stage
@@ -44,6 +45,7 @@ __all__ = [
     "run_assign_speakers_stage",
     "run_prepare_source_voice_refs_stage",
     "run_gsv_few_shot_stage",
+    "run_countdown_synth_stage",
     "run_synth_stage",
     "run_synth_qwen_stage",
     "run_rvc_train_stage",

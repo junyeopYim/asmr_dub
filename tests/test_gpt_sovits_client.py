@@ -18,6 +18,7 @@ def test_payload_contains_required_fields() -> None:
     data = payload.as_payload()
     assert data["text"] == "テスト"
     assert data["text_lang"] == "all_ja"
+    assert data["prompt_text"] == "こんにちわ"
     assert data["prompt_lang"] == "all_ja"
     assert data["seed"] == 7
     assert data["speed_factor"] == 1.1
@@ -97,7 +98,7 @@ def test_tts_contract_posts_api_v2_payload_without_real_server(
         "text": "ゆっくり……おやすみなさい。",
         "text_lang": "all_ja",
         "ref_audio_path": "/project/refs/main.wav",
-        "prompt_text": "近くで囁きます",
+        "prompt_text": "ちかくでささやきます",
         "prompt_lang": "all_ja",
         "aux_ref_audio_paths": ["/project/refs/aux-left.wav"],
         "top_k": 8,
@@ -202,6 +203,22 @@ def test_set_weight_helpers_accept_json_success() -> None:
     client = GPTSoVITSClient("http://gsv.local", transport=transport)
 
     assert client.set_gpt_weights("a.ckpt") == "success"
+
+
+def test_set_weight_cuda_illegal_memory_error_has_restart_hint() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            400,
+            json={
+                "message": "change gpt weight failed",
+                "Exception": "CUDA error: an illegal memory access was encountered",
+            },
+        )
+    )
+    client = GPTSoVITSClient("http://gsv.local", transport=transport)
+
+    with pytest.raises(GPTSoVITSError, match="restart the GPT-SoVITS api_v2 process"):
+        client.set_gpt_weights("a.ckpt")
 
 
 def test_resolve_ref_fallback() -> None:

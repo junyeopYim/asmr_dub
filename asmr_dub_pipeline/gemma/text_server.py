@@ -232,12 +232,11 @@ class ManagedGemmaTextServer:
         if self.process is None:
             self._close_log()
             return
-        if self.process.poll() is None:
-            terminate_process_group(
-                self.process,
-                terminate_timeout_sec=self.shutdown_timeout_sec,
-                kill_timeout_sec=5,
-            )
+        terminate_process_group(
+            self.process,
+            terminate_timeout_sec=self.shutdown_timeout_sec,
+            kill_timeout_sec=5,
+        )
         self._close_log()
 
     def _close_log(self) -> None:

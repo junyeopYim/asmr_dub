@@ -7,7 +7,7 @@ asr:
   compute_type: default
   condition_on_previous_text: false
   correction_profile_path: builtin:asmr_ja
-  device: auto
+  device: cuda
   diagnostics_enabled: true
   hallucination_silence_threshold: null
   initial_prompt: ''
@@ -34,7 +34,7 @@ asr:
   repair_sparse_min_chars_per_sec: 1.0
   repair_sparse_min_sec: 12.0
   resegment_from_chunks: true
-  resegment_max_sec: 20.0
+  resegment_max_sec: 10.0
   resegment_merge_gap_sec: 1.0
   resegment_min_sec: 3.0
   countdown_merge_enabled: true
@@ -103,17 +103,21 @@ gemma:
   text_two_pass: true
 gsv:
   auto_start: false
-  concurrency: 6
+  concurrency: 4
   few_shot_clean_source_filter: true
-  few_shot_enabled: true
+  few_shot_enabled: false
   few_shot_force: false
+  few_shot_insufficient_policy: zero_shot
   few_shot_max_clip_sec: 10.0
   few_shot_max_chars_per_sec: 5.2
   few_shot_max_background_bleed_db: -21.0
   few_shot_max_side_to_mid_db: -6.0
+  few_shot_max_total_sec: 240.0
   few_shot_min_clip_sec: 1.0
+  few_shot_min_selection_score: 0.50
   few_shot_min_total_sec: 60.0
   few_shot_min_quality_score: 0.2
+  few_shot_asr_risk_filter: true
   few_shot_pacing_beam_size: 768
   few_shot_pacing_max_duration_overage_ratio: 0.1
   few_shot_pacing_max_target_tolerance: 0.3
@@ -122,14 +126,14 @@ gsv:
   few_shot_pacing_target_enabled: true
   few_shot_pacing_target_tolerance: 0.1
   few_shot_pacing_variance_weight: 1.0
-  few_shot_prefer_plain_text: true
+  few_shot_prefer_plain_text: false
   few_shot_preferred_chars_per_sec: 4.5
   few_shot_relax_clean_source_for_pacing: true
   few_shot_relaxed_clean_source_penalty: 0.15
   few_shot_version: auto
   fragment_interval: 0.3
   gpt_weights_path: null
-  gpt_weights_policy: auto
+  gpt_weights_policy: base_for_korean
   ko_text_min_hangul_ratio: 0.2
   min_chunk_length: 16
   overlap_length: 2
@@ -138,6 +142,13 @@ gsv:
   ref_mode: segment
   ref_min_quality_score: 0.25
   ref_min_sec: 3.0
+  korean_segment_ref_enabled: true
+  korean_segment_ref_clarity_profile_enabled: true
+  korean_segment_ref_warn_blocks_mix: true
+  korean_segment_ref_temperature: 0.75
+  korean_segment_ref_top_p: 0.85
+  korean_segment_ref_top_k: 8
+  korean_segment_ref_parallel_infer: false
   repetition_penalty: 1.35
   retries: 2
   sample_steps: 32
@@ -146,7 +157,7 @@ gsv:
   server_shutdown_timeout_sec: 10.0
   server_startup_timeout_sec: 120.0
   sovits_weights_path: null
-  sovits_weights_policy: auto
+  sovits_weights_policy: unchanged
   speaker_models: {}
   super_sampling: false
   temperature: 1.0
@@ -159,16 +170,134 @@ gsv:
   trim_silence_threshold_db: -50.0
   tts_max_speed_factor: 1.12
   tts_min_speed_factor: 0.9
-  countdown_renderer: token
+  countdown_renderer: carrier_bank
   countdown_candidate_count: 8
+  countdown_carrier_templates:
+  - 이번 숫자는 {token}. 입니다.
+  - 숫자만 조용히 말해요. {token}. 다시.
+  countdown_carrier_token_templates:
+    십:
+    - 십 번만요.
+    구:
+    - 구팔칠.
+    - 구, 팔, 칠.
+    - '{token}, 살짝만.'
+    팔:
+    - 정답은 팔, 여기.
+    - 팔, 작게요.
+    - 팔 초만요.
+    칠:
+    - 칠 초만요.
+    - 칠, 작게요.
+    - '7.'
+    육:
+    - 육 초만요.
+    - 육, 작게요.
+    - 6, 육.
+    오:
+    - 오 초만요.
+    - 오, 작게요.
+    - 오, 천천히요.
+    사:
+    - 사아 번만요.
+    삼:
+    - 삼 번만요.
+    - 삼 초만요.
+    - 삼 하고요.
+    이:
+    - 이 하고요.
+    - 이 번만요.
+    일:
+    - '1.'
+    - 일, 천천히요.
+    - 일 번만요.
+    - 일, 일.
+    영:
+    - 영 하고요.
+    - 영 번만요.
+    - 영 초만요.
+  countdown_carrier_numeric_unit_enabled: true
+  countdown_carrier_numeric_unit_templates:
+  - '{token} 번만요.'
+  - '{token} 입니다.'
+  - '{token} 하고요.'
+  - '{token} 초만요.'
+  countdown_carrier_numeric_unit_onset_window_sec:
+  - 0.18
+  - 0.24
+  - 0.30
+  - 0.36
+  countdown_carrier_numeric_unit_tail_pad_sec: 0.04
+  countdown_carrier_slice_start_backoff_sec: 0.02
+  countdown_carrier_energy_extend_enabled: true
+  countdown_carrier_energy_extend_max_sec: 0.10
+  countdown_carrier_energy_extend_coda_max_sec: 0.20
+  countdown_carrier_energy_extend_edge_threshold_ratio: 0.12
+  countdown_carrier_energy_extend_quiet_threshold_ratio: 0.08
+  countdown_carrier_bulk_asr_enabled: true
+  countdown_carrier_bulk_asr_workers: 3
+  countdown_carrier_pause_gsv_for_bulk_asr: false
+  countdown_carrier_candidate_count: 2
+  countdown_carrier_slice_search_enabled: true
+  countdown_carrier_slice_window_sec:
+  - 0.30
+  - 0.42
+  - 0.55
+  countdown_carrier_slice_window_offset_sec:
+  - -0.06
+  - 0.0
+  - 0.06
+  countdown_carrier_max_slice_windows_per_candidate: 5
+  countdown_carrier_full_sentence_prefilter_enabled: true
+  countdown_carrier_full_sentence_prefilter_min_coverage: 1.0
+  countdown_carrier_quality_retry_enabled: true
+  countdown_carrier_quality_retry_max_rounds: 3
+  countdown_carrier_quality_retry_target_tier: A
+  countdown_token_bank_enabled: true
+  countdown_token_bank_warmup_enabled: true
+  countdown_token_bank_pack_warmup_enabled: true
+  countdown_token_bank_pack_templates:
+  - '{token}, {token}, {token}'
+  - '{token}. {token}. {token}.'
+  - '{token}... {token}... {token}'
+  countdown_token_bank_max_ref_count: 4
+  countdown_token_bank_beam_width: 8
+  countdown_carrier_stop_window_search_after_pronunciation_pass: true
+  countdown_carrier_target_pronunciation_passes: 2
+  countdown_chunk_candidate_count: 10
+  countdown_chunk_max_size: 10
   countdown_temperature: 0.55
-  countdown_token_speed_factor: 1.2
+  countdown_timing_mode: source_smoothed
+  countdown_strict_token_pronunciation: true
+  countdown_pack_min_span_occupancy: 0.55
+  countdown_phrase_slice_edge_pad_sec: 0.04
+  countdown_token_speed_factor: 1.0
   countdown_token_min_sec: 0.25
   countdown_token_max_sec: 0.95
+  countdown_token_single_syllable_max_sec: 0.55
+  countdown_token_double_syllable_max_sec: 0.75
+  countdown_token_multi_syllable_max_sec: 0.95
   countdown_token_max_slot_occupancy: 0.85
-  countdown_fallback_renderer: compact
+  countdown_max_tempo: 1.0
+  countdown_prosody_failure_blocks_mix: true
+  countdown_fallback_renderer: manual_review
   max_attempts_per_candidate: 3
+  pronunciation_qc_enabled: true
+  pronunciation_qc_backend: auto
+  pronunciation_qc_workers: 1
+  pronunciation_qc_pass_coverage: 0.82
+  pronunciation_qc_warn_coverage: 0.62
+  pronunciation_qc_max_observed_unit_ratio: 1.8
+  pronunciation_qc_max_extra_units: 1
+  pronunciation_qc_failure_blocks_mix: true
+  korean_clarity_retry_enabled: true
+  korean_clarity_retry_candidate_count: null
+  korean_clarity_temperature: 0.65
+  korean_clarity_top_p: 0.75
+  korean_clarity_top_k: 5
+  korean_clarity_parallel_infer: false
   duration_rewrite_backend: none
+  duration_rewrite_timing: after_initial
   duration_rewrite_max_attempts: 1
   duration_rewrite_pre_candidate_count: null
   timefit_max_tempo: 1.18
@@ -315,3 +444,4 @@ voice_bank:
   diarization_model_id: pyannote/speaker-diarization-community-1
   path: voice_bank/voice_bank_manifest.json
   speaker_assignment_backend: none
+  source_speaker_training_min_dominant_overlap_ratio: 0.85

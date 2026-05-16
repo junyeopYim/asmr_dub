@@ -74,6 +74,10 @@ the run finishes. Real runs now default to few-shot GPT-SoVITS: the pipeline
 collects about 60 seconds of transcribed source segments, writes a project-local
 training set, runs GPT-SoVITS prepare/train scripts, loads the resulting
 `.ckpt`/`.pth` weights through `api_v2`, and then calls `/tts`.
+If clean source-speaker data is insufficient, the default policy records
+`skipped_insufficient_training_data` and continues with zero-shot synthesis
+instead of stopping the full run. Set `gsv.few_shot_insufficient_policy: error`
+when you want strict training failures.
 
 ```bash
 asmr-dub full ./audio/RJ01012948.mp4 \
@@ -90,6 +94,11 @@ training stage:
 ```bash
 asmr-dub train-gsv --project ./project --confirm-rights
 ```
+
+For source diarization runs, inspect
+`work/diarization/source_speaker_training_qc.json` to see speaker-level clean
+training eligibility, excluded segment IDs, exclusion reason counts, and up to
+eight representative wav candidates per speaker.
 
 By default, auto-start looks for repo-local installs including
 `.cache/third_party/GPT-SoVITS/api_v2.py`,
@@ -171,7 +180,8 @@ Required text/reference fields:
 - `text`: normalized Japanese TTS text for the segment.
 - `text_lang`: `ja`.
 - `ref_audio_path`: absolute path to a project-local voice reference readable by the GPT-SoVITS server.
-- `prompt_text`: transcript for the reference audio.
+- `prompt_text`: transcript for the reference audio, kana-normalized when possible for Japanese references.
+- `prompt_text_original`: original reference transcript when normalization changed it.
 - `prompt_lang`: usually `ja`.
 - `aux_ref_audio_paths`: zero or more additional project-local reference paths.
 

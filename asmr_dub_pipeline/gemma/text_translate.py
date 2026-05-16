@@ -17,8 +17,13 @@ from asmr_dub_pipeline.gemma.parser import parse_gemma_task_response
 from asmr_dub_pipeline.gemma.prompts import audio_style_prompt, json_repair_prompt
 from asmr_dub_pipeline.schemas import KoreanTranslation, Segment
 from asmr_dub_pipeline.script.duration_rewrite import (
+    korean_tts_slot_timing_budget,
     korean_tts_speech_char_count,
     korean_tts_timing_budget,
+)
+from asmr_dub_pipeline.script.korean_tts_fit import (
+    salvage_korean_translation,
+    sanitize_korean_tts_text,
 )
 
 
@@ -42,6 +47,7 @@ _DIGIT_RE = re.compile(r"\d")
 _NON_SPEECH_SOURCE_RE = re.compile(r"^[\d\s,.;:!?！？、。・ー~〜…]+$")
 _NUMERIC_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 _UNSAFE_TTS_SYMBOL_RE = re.compile(r"[—–―“”‘’「」『』]")
+_KOREAN_TTS_PRONUNCIATION_SYMBOL_RE = re.compile(r"[^\uac00-\ud7a3\s,.!?…]")
 _ASR_REVIEW_COMPARE_DROP_RE = re.compile(r"[\s,.;:!?！？、。・ー~〜…'\"“”‘’「」『』（）()]+")
 _CONTEXT_TRUNCATION_RE = re.compile(
     r"(?:context (?:length|window|overflow|size)|"
@@ -412,6 +418,10 @@ def _translation_quality_error_map(
                 errors.setdefault(segment.id, []).append(
                     f"{segment.id}: {field} contains TTS-unsafe punctuation"
                 )
+            if _KOREAN_TTS_PRONUNCIATION_SYMBOL_RE.search(natural):
+                errors.setdefault(segment.id, []).append(
+                    f"{segment.id}: {field} contains non-Korean pronunciation symbols"
+                )
             timing_budget = korean_tts_timing_budget(segment.duration, source)
             speech_chars = korean_tts_speech_char_count(natural)
             max_speech_chars = int(timing_budget["max_speech_chars"])
@@ -449,8 +459,13 @@ def build_translate_ko_prompt(
     return (
         "Return exactly one valid JSON array and no markdown. Translate Japanese ASMR source "
         "text into Korean. Translate as literally as possible while preserving Korean grammar: "
-        "keep source wording, clause order, repetitions, and implied terms unless minimal "
-        "adjustment is required for Korean or TTS timing. Keep tone gentle, natural, and conversational in polite spoken "
+        "keep source wording, clause order, repetitions, and implied terms unless moderate "
+        "adjustment is required for Korean, TTS timing, or an obvious ASR transcription error. "
+        "Treat source_text as ASR output that may contain misheard words. Use target_span and "
+        "nearby context to infer the intended meaning when a word conflicts with the surrounding "
+        "discourse, but do not invent new facts, new names, or unrelated domain terms. If a "
+        "fragment looks uncertain, translate the context-supported meaning instead of forcing "
+        "a nonsensical literal Korean word. Keep tone gentle, natural, and conversational in polite spoken "
         "Korean suitable for ASMR TTS. Each array item must contain only "
         "segment_id and ko_natural. ko_natural must be Korean Hangul prose; do not leave "
         "Japanese kana or untranslated Japanese particles in ko_natural. Do not include "
@@ -483,7 +498,12 @@ def build_literal_translate_prompt(
         "Return exactly one valid JSON array and no markdown. First pass: translate the "
         "Japanese ASMR source text into faithful Korean literal meaning. Translate as literally "
         "as possible: keep source wording, clause order, repetitions, and implied terms; avoid "
-        "summarizing, embellishing, euphemizing, or paraphrasing beyond what Korean grammar requires. Each array item "
+        "summarizing, embellishing, euphemizing, or paraphrasing beyond what Korean grammar requires. "
+        "However, source_text is ASR output and may include misheard words. When a source word is "
+        "inconsistent with target_span.combined_source_text, nearby context, and the ASMR discourse, "
+        "make a moderate context-supported correction before translating. Do not add facts, names, "
+        "or terms that the surrounding context does not support, and do not force garbled fragments "
+        "into unrelated Korean nouns. Each array item "
         "must contain only segment_id and ko_literal. ko_literal must be Korean Hangul prose; "
         "do not leave Japanese kana or untranslated Japanese particles. Do not polish into "
         "final TTS copy yet. Translate only the items in segments; use context only to resolve "
@@ -517,7 +537,11 @@ def build_naturalize_ko_prompt(
         "literal Korean translations into natural Korean ASMR TTS dialogue. Each array item "
         "must contain only segment_id and ko_natural. ko_natural must be gentle, polite, "
         "spoken Korean that can be read aloud naturally while staying as literal to "
-        "ko_literal/source_text as spoken Korean allows; split stiff written phrasing into "
+        "ko_literal/source_text as spoken Korean allows. Treat both source_text and ko_literal "
+        "as possibly affected by ASR or literal-pass artifacts; if a phrase is unnatural or "
+        "contradicts the nearby context, choose the most context-supported Korean wording while "
+        "preserving the original intent. Do not invent new facts, names, or unrelated domain "
+        "terms, and do not turn uncertain fragments into nonsensical Korean nouns. Split stiff written phrasing into "
         "short breath-friendly wording when useful. Fit ko_natural within each segment's "
         "korean_tts_timing.max_speech_chars whenever possible. If ko_literal is too dense "
         "for the segment duration, semantically compress it into a shorter natural Korean "
@@ -577,6 +601,53 @@ def build_duration_rewrite_ko_prompt(
         "numbers only; ignore spaces and punctuation. Spell numbers and acronyms in Hangul "
         "for TTS. Do not leave Japanese kana, untranslated CJK, raw Latin letters, raw "
         "digits, quotes, or dashes. Keep exactly one output item for the input segment_id. "
+        f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_timing_expansion_ko_prompt(
+    segment: Segment,
+    *,
+    batch_id: str,
+    current_text: str,
+    reason: str,
+    actual_duration_sec: float,
+    target_duration_sec: float,
+    target_speech_chars: int,
+    min_speech_chars: int,
+    max_speech_chars: int,
+    context_segments: Sequence[Segment] | None = None,
+) -> str:
+    payload = _translation_prompt_payload([segment], batch_id, context_segments)
+    payload["timing_expansion"] = {
+        "reason": reason,
+        "current_ko_tts_text": current_text,
+        "current_speech_chars": korean_tts_speech_char_count(current_text),
+        "actual_tts_duration_sec": round(actual_duration_sec, 3),
+        "target_duration_sec": round(target_duration_sec, 3),
+        "target_speech_chars": target_speech_chars,
+        "acceptable_speech_chars": {
+            "min": min_speech_chars,
+            "max": max_speech_chars,
+        },
+        "slot_budget": korean_tts_slot_timing_budget(target_duration_sec),
+    }
+    return (
+        "Return exactly one valid JSON array and no markdown. Expand the Korean ASMR TTS "
+        "line for the single target segment so it can fill the timing slot naturally. "
+        "Each array item must contain only segment_id and ko_natural. Preserve the "
+        "Japanese source meaning, speaker attitude, domain terms, and ASMR tone. You may "
+        "use limited ASMR-safe breath-friendly repetition, soft response words, or short "
+        "sensory callbacks that are implied by the current line and nearby context. Do "
+        "not add new events, new plot facts, explanations, unrelated reassurance, raw "
+        "digits, Japanese kana, untranslated CJK, raw Latin letters, quotes, or dashes. "
+        "For a short prompt like 알겠지?, acceptable expansion includes gentle repetition "
+        "such as 알겠지… 응, 알겠지? For a short prompt like 어떠니?, acceptable expansion "
+        "includes a context-light sensory callback such as 어떠니… 지금 이 느낌은 어떠니? "
+        "Aim for timing_expansion.target_speech_chars Korean speech characters and stay "
+        "inside timing_expansion.acceptable_speech_chars. Count Hangul letters and "
+        "numbers only; ignore spaces and punctuation. Keep exactly one output item for "
+        "the input segment_id. "
         f"Input:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -747,6 +818,7 @@ class LlamaServerTranslationClient:
         n_predict: int = 2048,
         model: str = "gemma4",
         two_pass: bool = True,
+        auto_salvage_enabled: bool = True,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -755,6 +827,7 @@ class LlamaServerTranslationClient:
         self.n_predict = n_predict
         self.model = model
         self.two_pass = two_pass
+        self.auto_salvage_enabled = auto_salvage_enabled
         self.client = client or httpx.Client(timeout=timeout_sec)
 
     def _complete(self, prompt: str, *, n_predict: int | None = None) -> str:
@@ -821,6 +894,7 @@ class LlamaServerTranslationClient:
         parser: Any,
         output_field: str,
         context_segments: Sequence[Segment] | None = None,
+        literal_translations: Mapping[str, KoreanTranslation] | None = None,
     ) -> dict[str, KoreanTranslation]:
         raw_response = ""
         last_error: Exception | None = None
@@ -854,6 +928,53 @@ class LlamaServerTranslationClient:
                     translations,
                     field=output_field,
                 )
+                if (
+                    quality_error_map
+                    and self.auto_salvage_enabled
+                    and attempt >= self.retries
+                ):
+                    segment_by_id = {segment.id: segment for segment in segments}
+                    salvaged: dict[str, KoreanTranslation] = {}
+                    for segment_id, translation in translations.items():
+                        if segment_id not in quality_error_map:
+                            salvaged[segment_id] = translation
+                            continue
+                        if output_field == "ko_literal":
+                            literal, notes = sanitize_korean_tts_text(translation.ko_literal)
+                            if notes:
+                                merged_notes = list(dict.fromkeys([*translation.notes, *notes]))
+                                translation = translation.model_copy(
+                                    update={
+                                        "ko_literal": literal,
+                                        "ko_natural": literal,
+                                        "notes": merged_notes,
+                                    }
+                                )
+                            salvaged[segment_id] = translation
+                            continue
+                        if output_field == "ko_natural":
+                            base_translation = translation
+                            literal_translation = (literal_translations or {}).get(segment_id)
+                            if literal_translation is not None:
+                                base_translation = base_translation.model_copy(
+                                    update={"ko_literal": literal_translation.ko_literal}
+                                )
+                            segment = segment_by_id.get(segment_id)
+                            if segment is None:
+                                salvaged[segment_id] = base_translation
+                                continue
+                            salvage = salvage_korean_translation(segment, base_translation)
+                            salvaged[segment_id] = (
+                                salvage[0] if salvage is not None else base_translation
+                            )
+                            continue
+                        salvaged[segment_id] = translation
+                    translations = salvaged
+                    quality_error_map = _translation_quality_error_map(
+                        segments,
+                        translations,
+                        field=output_field,
+                    )
                 if quality_error_map:
                     quality_errors = [
                         error
@@ -936,6 +1057,7 @@ class LlamaServerTranslationClient:
             parser=parse_translation_response,
             output_field="ko_natural",
             context_segments=context_segments,
+            literal_translations=literal_translations,
         )
         return {
             segment_id: natural.model_copy(
@@ -976,6 +1098,41 @@ class LlamaServerTranslationClient:
             segments=[segment],
             batch_id=batch_id,
             prompt=build_duration_rewrite_ko_prompt(
+                segment,
+                batch_id=batch_id,
+                current_text=current_text,
+                reason=reason,
+                actual_duration_sec=actual_duration_sec,
+                target_duration_sec=target_duration_sec,
+                target_speech_chars=target_speech_chars,
+                min_speech_chars=min_speech_chars,
+                max_speech_chars=max_speech_chars,
+                context_segments=context_segments,
+            ),
+            parser=parse_translation_response,
+            output_field="ko_natural",
+            context_segments=context_segments,
+        )
+        return translations.get(segment.id)
+
+    def rewrite_tts_for_timing_expansion(
+        self,
+        *,
+        segment: Segment,
+        batch_id: str,
+        current_text: str,
+        reason: str,
+        actual_duration_sec: float,
+        target_duration_sec: float,
+        target_speech_chars: int,
+        min_speech_chars: int,
+        max_speech_chars: int,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> KoreanTranslation | None:
+        translations = self._translate_once(
+            segments=[segment],
+            batch_id=batch_id,
+            prompt=build_timing_expansion_ko_prompt(
                 segment,
                 batch_id=batch_id,
                 current_text=current_text,
@@ -1134,6 +1291,39 @@ class MockTranslationClient:
             ko_literal=current_text,
             ko_natural=current_text,
             notes=["mock_duration_rewrite_noop"],
+            confidence=0.99,
+            model=self.model,
+            batch_id=batch_id,
+        )
+
+    def rewrite_tts_for_timing_expansion(
+        self,
+        *,
+        segment: Segment,
+        batch_id: str,
+        current_text: str,
+        reason: str,
+        actual_duration_sec: float,
+        target_duration_sec: float,
+        target_speech_chars: int,
+        min_speech_chars: int,
+        max_speech_chars: int,
+        context_segments: Sequence[Segment] | None = None,
+    ) -> KoreanTranslation | None:
+        _ = (
+            segment,
+            reason,
+            actual_duration_sec,
+            target_duration_sec,
+            target_speech_chars,
+            min_speech_chars,
+            max_speech_chars,
+            context_segments,
+        )
+        return KoreanTranslation(
+            ko_literal=current_text,
+            ko_natural=current_text,
+            notes=["mock_timing_expansion_noop"],
             confidence=0.99,
             model=self.model,
             batch_id=batch_id,

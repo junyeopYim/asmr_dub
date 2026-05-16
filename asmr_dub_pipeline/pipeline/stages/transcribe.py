@@ -17,6 +17,8 @@ ASR_QUALITY_ERROR_VALUES = {
     "no_speech_detected",
     "asr_degenerate_repetition",
     "asr_non_speech_texture",
+    "asr_short_filler_keep_original_texture",
+    "asr_mixed_texture_speech",
     "asr_numeric_runaway",
     "asr_prompt_or_hallucination_leak",
     "asr_sparse_text_density",
@@ -30,6 +32,29 @@ ASR_WARNING_ANALYSIS_KEY_BY_REASON = {
     "asr_countdown_unverified": "asr_countdown_unverified",
     "asr_numeric_sequence_unverified": "asr_numeric_sequence_unverified",
     "asr_sparse_speech_unverified": "asr_sparse_speech_unverified",
+}
+ASR_SEGMENT_RETRY_REASON_PREFIXES = (
+    "asr_low_confidence:",
+    "asr_repair_rejected",
+    "asr_suspicious_pattern:",
+)
+ASR_SEGMENT_RETRY_REASON_VALUES = {
+    "asr_degenerate_repetition",
+    "asr_excessive_text_density",
+    "asr_numeric_runaway",
+    "asr_prompt_or_hallucination_leak",
+    "asr_sparse_text_density",
+}
+ASR_CHANNEL_SPLIT_CHANNELS = ("left", "right", "mid", "side")
+ASR_CHANNEL_SPLIT_LANE_CHANNELS = ("left", "right")
+ASR_CHANNEL_SPLIT_NO_DIALOG_REJECT_REASONS = {
+    "empty_candidate",
+    "empty_clip",
+    "asr_non_speech_texture",
+}
+ASR_CHANNEL_SPLIT_STYLE = {
+    "left": ("L", -0.72, "left_close"),
+    "right": ("R", 0.72, "right_close"),
 }
 
 
@@ -62,6 +87,13 @@ def _source_separation_part_audio_inputs(
     raw_parts = metadata.get("parts")
     if not isinstance(raw_parts, list):
         return []
+    folder_parts = _asr_folder_input_parts(manifest)
+    folder_part_by_index = {int(part["part_index"]): part for part in folder_parts}
+    folder_part_by_path = {
+        str(Path(str(part["path"])).expanduser().resolve()): part
+        for part in folder_parts
+        if part.get("path")
+    }
     parts: list[dict[str, Any]] = []
     for raw_part in raw_parts:
         if not isinstance(raw_part, dict):
@@ -71,15 +103,23 @@ def _source_separation_part_audio_inputs(
         background_path = Path(str(raw_part.get("background_path") or ""))
         if not vocals_mono_path.exists() or not vocals_path.exists():
             continue
+        part_index = int(raw_part.get("part_index") or len(parts) + 1)
+        folder_part = folder_part_by_index.get(part_index)
+        input_path = str(raw_part.get("input_path") or "")
+        if input_path:
+            folder_part = folder_part_by_path.get(str(Path(input_path).expanduser().resolve())) or folder_part
+        skip_reason = _asr_folder_part_skip_reason(folder_part) or _asr_folder_part_skip_reason(raw_part)
         parts.append(
             {
-                "part_index": int(raw_part.get("part_index") or len(parts) + 1),
+                "part_index": part_index,
                 "start_sec": float(raw_part.get("start_sec") or 0.0),
                 "end_sec": float(raw_part.get("end_sec") or 0.0),
                 "duration_sec": float(raw_part.get("duration_sec") or 0.0),
                 "vocals_mono_path": str(vocals_mono_path),
                 "vocals_path": str(vocals_path),
                 "background_path": str(background_path) if background_path else "",
+                "asr_silenced": skip_reason is not None,
+                "asr_skip_reason": skip_reason,
             }
         )
     return parts
@@ -94,6 +134,8 @@ def _partwise_audio_duration(parts: list[dict[str, Any]]) -> float | None:
 def _transcribe_partwise_audio(backend: Any, parts: list[dict[str, Any]]) -> list[ASRChunk]:
     chunks: list[ASRChunk] = []
     for part in parts:
+        if _asr_folder_part_skip_reason(part) is not None:
+            continue
         offset = float(part["start_sec"])
         part_path = Path(str(part["vocals_mono_path"]))
         for chunk in backend.transcribe(part_path, []):
@@ -116,6 +158,932 @@ def _transcribe_partwise_audio(backend: Any, parts: list[dict[str, Any]]) -> lis
                 )
             )
     return chunks
+
+
+def _asr_segment_retry_reasons(review_reasons: list[str]) -> list[str]:
+    return [
+        reason
+        for reason in review_reasons
+        if reason in ASR_SEGMENT_RETRY_REASON_VALUES
+        or any(reason.startswith(prefix) for prefix in ASR_SEGMENT_RETRY_REASON_PREFIXES)
+    ]
+
+
+def _absolute_retry_chunks(
+    chunks: list[ASRChunk],
+    *,
+    clip_start: float,
+    clip_end: float,
+    source_start: float,
+    source_end: float,
+) -> ASRBoundaryClipResult:
+    return _clip_asr_chunks_to_window(
+        chunks,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        window_start=source_start,
+        window_end=source_end,
+        require_word_timestamps_for_boundary=(
+            clip_start < source_start - 0.02 or clip_end > source_end + 0.02
+        ),
+    )
+
+
+def _source_script_from_retry_chunks(
+    source_script: SourceScript,
+    chunks: list[ASRChunk],
+    *,
+    backend_name: str,
+    candidate_id: str,
+    cfg: Any,
+) -> SourceScript | None:
+    text = _asr_candidate_text(chunks)
+    if not text:
+        return None
+    return SourceScript(
+        text=text,
+        language=next((chunk.language for chunk in chunks if chunk.language), cfg.asr_language),
+        confidence=_asr_candidate_confidence(chunks),
+        backend=f"{backend_name}:segment_retry:{candidate_id}",
+        start=float(source_script.start),
+        end=float(source_script.end),
+    )
+
+
+def _asr_segment_retry_candidate_score(
+    original: SourceScript,
+    candidate_source: SourceScript,
+) -> float:
+    original_duration = max(0.001, float(original.end) - float(original.start))
+    candidate_duration = max(0.001, float(candidate_source.end) - float(candidate_source.start))
+    original_density = len(original.text.strip()) / original_duration
+    candidate_density = len(candidate_source.text.strip()) / candidate_duration
+    confidence = float(candidate_source.confidence) if candidate_source.confidence is not None else 0.0
+    return (candidate_density - original_density) + confidence
+
+
+def _attempt_asr_segment_local_retry(
+    source_script: SourceScript,
+    *,
+    segment: Segment,
+    backend: Any,
+    project_dir: Path,
+    retry_audio_path: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+    review_reasons: list[str],
+    summary: dict[str, Any],
+) -> SourceScript | None:
+    retry_reasons = _asr_segment_retry_reasons(review_reasons)
+    if not retry_reasons:
+        summary["skipped"] += 1
+        return None
+
+    source_start = max(0.0, float(source_script.start))
+    source_end = min(float(audio_duration_sec), max(source_start, float(source_script.end)))
+    if source_end - source_start <= 0.05:
+        summary["skipped"] += 1
+        return None
+
+    summary["attempted"] += 1
+    item: dict[str, Any] = {
+        "segment_id": segment.id,
+        "start": round(source_start, 3),
+        "end": round(source_end, 3),
+        "original_text": source_script.text,
+        "original_reasons": list(review_reasons),
+        "retry_reasons": retry_reasons,
+        "accepted": False,
+        "accepted_candidate_id": None,
+        "accepted_text": None,
+        "accepted_vote_count": 0,
+        "candidates": [],
+    }
+    accepted_candidates: list[tuple[str, list[ASRChunk], float]] = []
+    retry_dir = project_dir / "work" / "transcribe" / "asr_segment_retry_clips"
+    for option in _asr_repair_candidate_options(cfg):
+        candidate_id = str(option["candidate_id"])
+        padding = float(option.get("padding_sec") or 0.0)
+        clip_start = max(0.0, source_start - padding)
+        clip_end = min(float(audio_duration_sec), source_end + padding)
+        candidate_row: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "clip_start": round(clip_start, 3),
+            "clip_end": round(clip_end, 3),
+            "accepted_for_vote": False,
+            "reject_reason": None,
+            "text": "",
+            "confidence": None,
+        }
+        if clip_end - clip_start <= 0.05:
+            candidate_row["reject_reason"] = "empty_clip"
+            item["candidates"].append(candidate_row)
+            continue
+        clip_path = retry_dir / f"{segment.id}_{candidate_id}.wav"
+        try:
+            ffmpeg.slice_audio(
+                retry_audio_path,
+                clip_start,
+                clip_end,
+                clip_path,
+                sample_rate=cfg.gemma_sample_rate,
+                channels=1,
+            )
+            local_chunks = _transcribe_with_backend_options(
+                backend,
+                clip_path,
+                [],
+                **dict(option.get("overrides") or {}),
+            )
+        except Exception as exc:  # pragma: no cover - exercised through summary in live runs
+            candidate_row["reject_reason"] = f"retry_error:{type(exc).__name__}"
+            candidate_row["error"] = str(exc)
+            item["candidates"].append(candidate_row)
+            continue
+
+        boundary_result = _absolute_retry_chunks(
+            local_chunks,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            source_start=source_start,
+            source_end=source_end,
+        )
+        if boundary_result.reject_reason is not None:
+            candidate_row["reject_reason"] = boundary_result.reject_reason
+            item["candidates"].append(candidate_row)
+            continue
+        candidate_chunks = boundary_result.chunks
+        candidate_text = _asr_candidate_text(candidate_chunks)
+        candidate_row["text"] = candidate_text
+        candidate_row["confidence"] = _asr_candidate_confidence(candidate_chunks)
+        candidate_row["boundary_clipped"] = boundary_result.boundary_clipped
+        candidate_row["dropped_word_count"] = boundary_result.dropped_word_count
+        candidate_source = _source_script_from_retry_chunks(
+            source_script,
+            candidate_chunks,
+            backend_name=str(getattr(backend, "name", "asr")),
+            candidate_id=candidate_id,
+            cfg=cfg,
+        )
+        if candidate_source is None:
+            candidate_row["reject_reason"] = "empty_candidate"
+            item["candidates"].append(candidate_row)
+            continue
+        if _asr_candidate_looks_prompt_leaked(candidate_source.text, cfg):
+            candidate_row["reject_reason"] = "prompt_or_hallucination_leak"
+            item["candidates"].append(candidate_row)
+            continue
+        texture_reason = _source_script_non_speech_texture_reason(candidate_source)
+        if texture_reason is not None:
+            candidate_row["reject_reason"] = texture_reason
+            item["candidates"].append(candidate_row)
+            continue
+        candidate_review_reasons = _source_script_asr_review_reasons(candidate_source, cfg)
+        if candidate_review_reasons:
+            candidate_row["reject_reason"] = "candidate_review_blocked:" + candidate_review_reasons[0]
+            candidate_row["review_reasons"] = candidate_review_reasons
+            item["candidates"].append(candidate_row)
+            continue
+        score = _asr_segment_retry_candidate_score(source_script, candidate_source)
+        candidate_row["accepted_for_vote"] = True
+        candidate_row["score"] = round(score, 6)
+        accepted_candidates.append((candidate_id, candidate_chunks, score))
+        item["candidates"].append(candidate_row)
+
+    vote = _select_voted_asr_repair_candidate(accepted_candidates, cfg=cfg)
+    if vote is None:
+        item["reject_reason"] = "no_candidate_vote"
+        summary["items"].append(item)
+        return None
+
+    retry_source_script = _source_script_from_retry_chunks(
+        source_script,
+        list(vote.chunks),
+        backend_name=str(getattr(backend, "name", "asr")),
+        candidate_id=vote.candidate_id,
+        cfg=cfg,
+    )
+    if retry_source_script is None:
+        item["reject_reason"] = "empty_voted_candidate"
+        summary["items"].append(item)
+        return None
+
+    summary["repaired"] += 1
+    item["accepted"] = True
+    item["accepted_candidate_id"] = vote.candidate_id
+    item["accepted_text"] = retry_source_script.text
+    item["accepted_vote_count"] = vote.vote_count
+    item["accepted_normalized_text"] = vote.normalized_text
+    item["accepted_score"] = round(vote.score, 6)
+    summary["items"].append(item)
+    return retry_source_script
+
+
+@dataclass(frozen=True)
+class ASRChannelSplitCandidate:
+    channel: str
+    candidate_id: str
+    clip_path: Path
+    clip_start: float
+    clip_end: float
+    chunks: list[ASRChunk]
+    text: str
+    confidence: float | None
+    boundary_clipped: bool
+    dropped_word_count: int
+    review_reasons: list[str]
+    reject_reason: str | None = None
+
+
+def _reset_generated_channel_split_segments(manifest: PipelineManifest) -> int:
+    generated_parent_ids = {
+        str(segment.parent_segment_id)
+        for segment in manifest.segments
+        if segment.parent_segment_id
+        and (
+            segment.analysis.get("generated_by") == "asr_channel_split"
+            or segment.source_lane is not None
+        )
+    }
+    if not generated_parent_ids:
+        return 0
+    kept: list[Segment] = []
+    removed = 0
+    for segment in manifest.segments:
+        if (
+            segment.parent_segment_id in generated_parent_ids
+            and segment.analysis.get("generated_by") == "asr_channel_split"
+        ):
+            removed += 1
+            continue
+        if segment.id in generated_parent_ids:
+            segment.source_lanes = []
+            segment.source_lane = None
+            segment.analysis.pop("stereo_lane_split", None)
+            if segment.status == "absorbed":
+                segment.status = "raw"
+        kept.append(segment)
+    manifest.segments = kept
+    return removed
+
+
+def _channel_split_trigger_reasons(segment: Segment) -> list[str]:
+    if segment.source_script is None or not segment.source_script.text.strip():
+        return []
+    reasons: list[str] = []
+    quality_gate = segment.analysis.get("asr_quality_gate")
+    if isinstance(quality_gate, dict):
+        reasons.extend(str(reason) for reason in quality_gate.get("reasons", []) if reason)
+        reasons.extend(str(reason) for reason in quality_gate.get("warnings", []) if reason)
+    reasons.extend(str(error) for error in segment.errors if error)
+    for key in ASR_WARNING_ANALYSIS_KEYS:
+        if key in segment.analysis:
+            reasons.append(key)
+    if _asr_text_has_unstable_embedded_numeric_sequence(segment.source_script.text):
+        reasons.append("asr_unstable_embedded_numeric_sequence")
+    return list(dict.fromkeys(reasons))
+
+
+def _segment_should_channel_split(segment: Segment, cfg: Any) -> tuple[bool, list[str]]:
+    if not bool(getattr(cfg, "asr_channel_split_enabled", True)):
+        return False, []
+    if segment.parent_segment_id or segment.status in NO_SPEECH_STATUSES:
+        return False, []
+    reasons = _channel_split_trigger_reasons(segment)
+    if not reasons:
+        return False, []
+    trigger = any(
+        reason in {
+            "asr_countdown_unverified",
+            "asr_numeric_sequence_unverified",
+            "asr_numeric_runaway",
+            "asr_unstable_embedded_numeric_sequence",
+        }
+        or reason.startswith("asr_repair_rejected")
+        for reason in reasons
+    )
+    return trigger, reasons
+
+
+def _audio_channel_count(path: Path) -> int | None:
+    try:
+        return int(sf.info(str(path)).channels)
+    except Exception:
+        try:
+            return ffmpeg.probe_media(path).channels
+        except Exception:
+            return None
+
+
+def _channel_split_candidate_specs(cfg: Any) -> list[tuple[str, float]]:
+    specs = [
+        ("exact", 0.0),
+        ("padded", float(getattr(cfg, "asr_channel_split_padding_sec", 1.4))),
+        ("wide", float(getattr(cfg, "asr_channel_split_wide_padding_sec", 3.0))),
+    ]
+    deduped: list[tuple[str, float]] = []
+    seen: set[float] = set()
+    for candidate_id, padding in specs:
+        normalized = max(0.0, round(float(padding), 3))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append((candidate_id, normalized))
+    return deduped
+
+
+def _shift_asr_chunks(chunks: Sequence[ASRChunk], offset_sec: float) -> list[ASRChunk]:
+    shifted: list[ASRChunk] = []
+    for chunk in chunks:
+        words = [
+            word.model_copy(
+                update={
+                    "start": round(float(word.start) + offset_sec, 6),
+                    "end": round(float(word.end) + offset_sec, 6),
+                }
+            )
+            for word in chunk.words
+        ]
+        shifted.append(
+            chunk.model_copy(
+                update={
+                    "start": round(float(chunk.start) + offset_sec, 6),
+                    "end": round(float(chunk.end) + offset_sec, 6),
+                    "words": words,
+                }
+            )
+        )
+    return shifted
+
+
+def _channel_split_clip_window(
+    segment: Segment,
+    source_path: Path,
+    *,
+    audio_duration_sec: float,
+    padding_sec: float,
+) -> dict[str, float | bool]:
+    segment_start = max(0.0, float(segment.start))
+    segment_end = max(segment_start, float(segment.end))
+    segment_duration = max(0.0, segment_end - segment_start)
+    try:
+        source_duration = max(0.0, float(duration_sec(source_path)))
+    except Exception:
+        source_duration = max(0.0, float(audio_duration_sec))
+    source_is_segment_clip = source_duration < segment_end - 0.05
+    if source_is_segment_clip:
+        window_start = 0.0
+        window_end = min(source_duration, segment_duration) if source_duration else segment_duration
+        clip_start = max(0.0, window_start - padding_sec)
+        clip_end = min(source_duration or segment_duration, window_end + padding_sec)
+        return {
+            "slice_start": clip_start,
+            "slice_end": clip_end,
+            "window_start": window_start,
+            "window_end": window_end,
+            "reported_clip_start": segment_start + clip_start,
+            "reported_clip_end": segment_start + clip_end,
+            "shift_offset": segment_start,
+            "is_segment_clip": True,
+        }
+    clip_start = max(0.0, segment_start - padding_sec)
+    clip_end = min(float(audio_duration_sec), segment_end + padding_sec)
+    return {
+        "slice_start": clip_start,
+        "slice_end": clip_end,
+        "window_start": segment_start,
+        "window_end": segment_end,
+        "reported_clip_start": clip_start,
+        "reported_clip_end": clip_end,
+        "shift_offset": 0.0,
+        "is_segment_clip": False,
+    }
+
+
+def _source_script_for_channel_candidate(
+    segment: Segment,
+    candidate: ASRChannelSplitCandidate,
+    *,
+    backend_name: str,
+) -> SourceScript:
+    return SourceScript(
+        text=candidate.text,
+        language=next((chunk.language for chunk in candidate.chunks if chunk.language), "ja"),
+        confidence=candidate.confidence,
+        backend=f"{backend_name}:channel_split:{candidate.channel}:{candidate.candidate_id}",
+        start=float(segment.start),
+        end=float(segment.end),
+    )
+
+
+def _transcript_words_from_chunks(chunks: Sequence[ASRChunk]) -> list[TranscriptWord]:
+    words: list[TranscriptWord] = []
+    for chunk in chunks:
+        for word in chunk.words:
+            text = word.text.strip()
+            if not text:
+                continue
+            words.append(
+                TranscriptWord(
+                    start=float(word.start),
+                    end=float(word.end),
+                    text=text,
+                    confidence=word.confidence,
+                )
+            )
+    return words
+
+
+def _lane_transcript_from_candidate(
+    segment: Segment,
+    candidate: ASRChannelSplitCandidate,
+    *,
+    backend_name: str,
+) -> SourceLaneTranscript:
+    suffix, pan, spatial_style = ASR_CHANNEL_SPLIT_STYLE.get(
+        candidate.channel,
+        ("M", 0.0, "center"),
+    )
+    return SourceLaneTranscript(
+        lane_id=f"{segment.id}_{suffix}",
+        channel=candidate.channel,  # type: ignore[arg-type]
+        text=candidate.text,
+        language=next((chunk.language for chunk in candidate.chunks if chunk.language), "ja"),
+        confidence=candidate.confidence,
+        start=float(segment.start),
+        end=float(segment.end),
+        pan=pan,
+        spatial_style=spatial_style,  # type: ignore[arg-type]
+        backend=f"{backend_name}:channel_split:{candidate.channel}:{candidate.candidate_id}",
+        candidate_id=candidate.candidate_id,
+        clip_start=candidate.clip_start,
+        clip_end=candidate.clip_end,
+        words=_transcript_words_from_chunks(candidate.chunks),
+        boundary_clipped=candidate.boundary_clipped,
+        review_reasons=list(candidate.review_reasons),
+    )
+
+
+def _channel_candidate_payload(candidate: ASRChannelSplitCandidate) -> dict[str, Any]:
+    return {
+        "channel": candidate.channel,
+        "candidate_id": candidate.candidate_id,
+        "clip_path": str(candidate.clip_path),
+        "clip_start": round(candidate.clip_start, 3),
+        "clip_end": round(candidate.clip_end, 3),
+        "text": candidate.text,
+        "confidence": candidate.confidence,
+        "boundary_clipped": candidate.boundary_clipped,
+        "dropped_word_count": candidate.dropped_word_count,
+        "review_reasons": list(candidate.review_reasons),
+        "reject_reason": candidate.reject_reason,
+    }
+
+
+def _channel_split_candidate_score(candidate: ASRChannelSplitCandidate) -> tuple[int, float, float]:
+    confidence = float(candidate.confidence) if candidate.confidence is not None else 0.0
+    duration = max(0.001, candidate.clip_end - candidate.clip_start)
+    density = len(candidate.text) / duration
+    return (len(candidate.text), confidence, density)
+
+
+def _select_channel_lane_candidate(
+    candidates: Sequence[ASRChannelSplitCandidate],
+) -> ASRChannelSplitCandidate | None:
+    viable = [
+        candidate
+        for candidate in candidates
+        if candidate.reject_reason is None
+        and candidate.text.strip()
+        and not candidate.review_reasons
+    ]
+    if not viable:
+        return None
+    return max(viable, key=_channel_split_candidate_score)
+
+
+def _channel_split_candidates_confirm_no_dialog_texture(item: Mapping[str, Any]) -> bool:
+    candidates = item.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            return False
+        reject_reason = str(candidate.get("reject_reason") or "")
+        text = str(candidate.get("text") or "").strip()
+        if reject_reason not in ASR_CHANNEL_SPLIT_NO_DIALOG_REJECT_REASONS:
+            return False
+        if text and reject_reason != "asr_non_speech_texture":
+            return False
+    return True
+
+
+def _channel_split_confirms_no_dialog_texture(
+    segment: Segment,
+    item: Mapping[str, Any],
+    cfg: Any,
+) -> bool:
+    if segment.status != "needs_manual_review":
+        return False
+    trigger_reasons = [str(reason) for reason in item.get("trigger_reasons", []) if reason]
+    if not any(reason.startswith("asr_repair_rejected") for reason in trigger_reasons):
+        return False
+    duration = max(0.001, float(segment.duration or (float(segment.end) - float(segment.start))))
+    max_duration = float(getattr(cfg, "asr_channel_split_no_dialog_texture_max_sec", 1.5))
+    if duration > max_duration:
+        return False
+    return _channel_split_candidates_confirm_no_dialog_texture(item)
+
+
+def _mark_segment_no_dialog_texture(segment: Segment, *, trigger_reasons: Sequence[str]) -> None:
+    _clear_asr_quality_gate_errors(segment)
+    segment.status = "non_speech_texture"
+    segment.keep_original_texture = True
+    if "asr_non_speech_texture" not in segment.errors:
+        segment.errors.append("asr_non_speech_texture")
+    segment.analysis["asr_quality_gate"] = {
+        "decision": "texture",
+        "reasons": ["asr_non_speech_texture"],
+        "tts_blocked": True,
+    }
+    segment.analysis["stereo_lane_split"] = {
+        "mode": "no_dialog_texture",
+        "trigger_reasons": list(trigger_reasons),
+        "diagnostic_channels": list(ASR_CHANNEL_SPLIT_CHANNELS),
+    }
+
+
+def _run_channel_split_candidate(
+    *,
+    segment: Segment,
+    channel: str,
+    candidate_id: str,
+    padding_sec: float,
+    backend: Any,
+    project_dir: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> ASRChannelSplitCandidate:
+    source_path = Path(segment.audio_for_mix)
+    window = _channel_split_clip_window(
+        segment,
+        source_path,
+        audio_duration_sec=audio_duration_sec,
+        padding_sec=padding_sec,
+    )
+    slice_start = float(window["slice_start"])
+    slice_end = float(window["slice_end"])
+    window_start = float(window["window_start"])
+    window_end = float(window["window_end"])
+    reported_clip_start = float(window["reported_clip_start"])
+    reported_clip_end = float(window["reported_clip_end"])
+    shift_offset = float(window["shift_offset"])
+    is_segment_clip = bool(window["is_segment_clip"])
+    clip_path = (
+        project_dir
+        / "work"
+        / "transcribe"
+        / "asr_channel_split_clips"
+        / f"{segment.id}_{channel}_{candidate_id}.wav"
+    )
+    if slice_end - slice_start <= 0.05:
+        return ASRChannelSplitCandidate(
+            channel=channel,
+            candidate_id=candidate_id,
+            clip_path=clip_path,
+            clip_start=reported_clip_start,
+            clip_end=reported_clip_end,
+            chunks=[],
+            text="",
+            confidence=None,
+            boundary_clipped=False,
+            dropped_word_count=0,
+            review_reasons=[],
+            reject_reason="empty_clip",
+        )
+    try:
+        ffmpeg.slice_audio_channel(
+            source_path,
+            slice_start,
+            slice_end,
+            clip_path,
+            channel=channel,
+            sample_rate=int(getattr(cfg, "gemma_sample_rate", 16_000)),
+        )
+        local_chunks = _transcribe_with_backend_options(
+            backend,
+            clip_path,
+            [],
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            vad_filter=bool(getattr(cfg, "asr_vad_filter", True)),
+            vad_parameters=dict(getattr(cfg, "asr_vad_parameters", {}) or {}) or None,
+        )
+    except Exception as exc:
+        return ASRChannelSplitCandidate(
+            channel=channel,
+            candidate_id=candidate_id,
+            clip_path=clip_path,
+            clip_start=reported_clip_start,
+            clip_end=reported_clip_end,
+            chunks=[],
+            text="",
+            confidence=None,
+            boundary_clipped=False,
+            dropped_word_count=0,
+            review_reasons=[],
+            reject_reason=f"channel_transcribe_error:{type(exc).__name__}",
+        )
+    boundary_result = _clip_asr_chunks_to_window(
+        local_chunks,
+        clip_start=slice_start,
+        clip_end=slice_end,
+        window_start=window_start,
+        window_end=window_end,
+        require_word_timestamps_for_boundary=padding_sec > 0.0 and not is_segment_clip,
+    )
+    if boundary_result.reject_reason is not None:
+        return ASRChannelSplitCandidate(
+            channel=channel,
+            candidate_id=candidate_id,
+            clip_path=clip_path,
+            clip_start=reported_clip_start,
+            clip_end=reported_clip_end,
+            chunks=[],
+            text="",
+            confidence=None,
+            boundary_clipped=boundary_result.boundary_clipped,
+            dropped_word_count=boundary_result.dropped_word_count,
+            review_reasons=[],
+            reject_reason=boundary_result.reject_reason,
+        )
+    chunks = _shift_asr_chunks(boundary_result.chunks, shift_offset) if shift_offset else boundary_result.chunks
+    text = _asr_candidate_text(chunks)
+    confidence = _asr_candidate_confidence(chunks)
+    source_script = SourceScript(
+        text=text,
+        language=next((chunk.language for chunk in chunks if chunk.language), getattr(cfg, "asr_language", "ja")),
+        confidence=confidence,
+        backend=f"{getattr(backend, 'name', 'asr')}:channel_split:{channel}:{candidate_id}",
+        start=float(segment.start),
+        end=float(segment.end),
+    )
+    review_reasons = _source_script_asr_review_reasons(source_script, cfg) if text else []
+    reject_reason = "empty_candidate" if not text else None
+    if text and _asr_candidate_looks_prompt_leaked(text, cfg):
+        reject_reason = "prompt_or_hallucination_leak"
+    texture_reason = _source_script_non_speech_texture_reason(source_script) if text else None
+    if texture_reason is not None:
+        reject_reason = texture_reason
+    return ASRChannelSplitCandidate(
+        channel=channel,
+        candidate_id=candidate_id,
+        clip_path=clip_path,
+        clip_start=reported_clip_start,
+        clip_end=reported_clip_end,
+        chunks=chunks,
+        text=text,
+        confidence=confidence,
+        boundary_clipped=boundary_result.boundary_clipped,
+        dropped_word_count=boundary_result.dropped_word_count,
+        review_reasons=review_reasons,
+        reject_reason=reject_reason,
+    )
+
+
+def _normalized_channel_text(text: str, cfg: Any) -> str:
+    return _normalize_asr_text_for_repair_equivalence(text, cfg)
+
+
+def _channel_lane_texts_are_distinct(
+    left: ASRChannelSplitCandidate,
+    right: ASRChannelSplitCandidate,
+    cfg: Any,
+) -> bool:
+    left_text = _normalized_channel_text(left.text, cfg)
+    right_text = _normalized_channel_text(right.text, cfg)
+    return bool(left_text and right_text and left_text != right_text)
+
+
+def _build_channel_lane_segment(
+    parent: Segment,
+    lane: SourceLaneTranscript,
+    candidate: ASRChannelSplitCandidate,
+) -> Segment:
+    return Segment(
+        id=lane.lane_id,
+        speaker_id=parent.speaker_id,
+        parent_segment_id=parent.id,
+        start=parent.start,
+        end=parent.end,
+        duration=parent.duration,
+        audio_for_gemma=str(candidate.clip_path),
+        audio_for_mix=parent.audio_for_mix,
+        estimated_pan=lane.pan,
+        keep_original_texture=False,
+        status="transcribed",
+        analysis={
+            "generated_by": "asr_channel_split",
+            "parent_segment_id": parent.id,
+            "spatial_style": lane.spatial_style,
+            "source_channel": lane.channel,
+        },
+        source_script=SourceScript(
+            text=lane.text,
+            language=lane.language,
+            confidence=lane.confidence,
+            backend=lane.backend,
+            start=parent.start,
+            end=parent.end,
+        ),
+        source_lane=lane,
+    )
+
+
+def _apply_channel_aware_asr_split(
+    manifest: PipelineManifest,
+    *,
+    backend: Any,
+    project_dir: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> dict[str, Any]:
+    removed = _reset_generated_channel_split_segments(manifest)
+    summary: dict[str, Any] = {
+        "enabled": bool(getattr(cfg, "asr_channel_split_enabled", True)),
+        "attempted": 0,
+        "split": 0,
+        "single_lane": 0,
+        "no_dialog_texture": 0,
+        "skipped": 0,
+        "removed_existing_generated_lanes": removed,
+        "items": [],
+    }
+    if not summary["enabled"]:
+        return summary
+    max_segments = int(getattr(cfg, "asr_channel_split_max_segments", 80))
+    if max_segments <= 0:
+        return summary
+    next_segments: list[Segment] = []
+    attempted = 0
+    for segment in manifest.segments:
+        next_segments.append(segment)
+        should_split, trigger_reasons = _segment_should_channel_split(segment, cfg)
+        if not should_split:
+            continue
+        item: dict[str, Any] = {
+            "segment_id": segment.id,
+            "trigger_reasons": trigger_reasons,
+            "candidates": [],
+            "created_lane_segment_ids": [],
+            "reject_reason": None,
+        }
+        if attempted >= max_segments:
+            summary["skipped"] += 1
+            item["reject_reason"] = "max_segments_exceeded"
+            summary["items"].append(item)
+            continue
+        attempted += 1
+        summary["attempted"] += 1
+        audio_path = Path(segment.audio_for_mix)
+        channel_count = _audio_channel_count(audio_path)
+        if channel_count is None or channel_count < 2:
+            summary["skipped"] += 1
+            item["reject_reason"] = "audio_not_stereo"
+            summary["items"].append(item)
+            continue
+        channel_candidates: dict[str, list[ASRChannelSplitCandidate]] = {
+            channel: [] for channel in ASR_CHANNEL_SPLIT_CHANNELS
+        }
+        for channel in ASR_CHANNEL_SPLIT_CHANNELS:
+            for candidate_id, padding_sec in _channel_split_candidate_specs(cfg):
+                candidate = _run_channel_split_candidate(
+                    segment=segment,
+                    channel=channel,
+                    candidate_id=candidate_id,
+                    padding_sec=padding_sec,
+                    backend=backend,
+                    project_dir=project_dir,
+                    audio_duration_sec=audio_duration_sec,
+                    cfg=cfg,
+                )
+                channel_candidates[channel].append(candidate)
+                item["candidates"].append(_channel_candidate_payload(candidate))
+        selected = {
+            channel: _select_channel_lane_candidate(channel_candidates[channel])
+            for channel in ASR_CHANNEL_SPLIT_LANE_CHANNELS
+        }
+        valid_lanes = {
+            channel: candidate
+            for channel, candidate in selected.items()
+            if candidate is not None
+        }
+        if not valid_lanes:
+            if _channel_split_confirms_no_dialog_texture(segment, item, cfg):
+                item["reject_reason"] = "no_dialog_texture"
+                _mark_segment_no_dialog_texture(segment, trigger_reasons=trigger_reasons)
+                summary["no_dialog_texture"] += 1
+            else:
+                summary["skipped"] += 1
+                item["reject_reason"] = "no_valid_lane_candidates"
+            summary["items"].append(item)
+            continue
+        if (
+            "left" in valid_lanes
+            and "right" in valid_lanes
+            and _channel_lane_texts_are_distinct(valid_lanes["left"], valid_lanes["right"], cfg)
+        ):
+            lanes = [
+                _lane_transcript_from_candidate(
+                    segment,
+                    valid_lanes[channel],
+                    backend_name=str(getattr(backend, "name", "asr")),
+                )
+                for channel in ASR_CHANNEL_SPLIT_LANE_CHANNELS
+            ]
+            lane_segments = [
+                _build_channel_lane_segment(segment, lane, valid_lanes[lane.channel])
+                for lane in lanes
+            ]
+            segment.status = "absorbed"
+            segment.source_lanes = lanes
+            segment.source_lane = None
+            segment.analysis["stereo_lane_split"] = {
+                "mode": "split",
+                "created_lane_segment_ids": [lane_segment.id for lane_segment in lane_segments],
+                "trigger_reasons": trigger_reasons,
+                "diagnostic_channels": ["mid", "side"],
+            }
+            item["created_lane_segment_ids"] = [lane_segment.id for lane_segment in lane_segments]
+            next_segments.extend(lane_segments)
+            summary["split"] += 1
+            summary["items"].append(item)
+            continue
+        channel, candidate = max(valid_lanes.items(), key=lambda entry: _channel_split_candidate_score(entry[1]))
+        lane = _lane_transcript_from_candidate(
+            segment,
+            candidate,
+            backend_name=str(getattr(backend, "name", "asr")),
+        )
+        segment.source_lane = lane
+        segment.source_lanes = [lane]
+        segment.source_script = _source_script_for_channel_candidate(
+            segment,
+            candidate,
+            backend_name=str(getattr(backend, "name", "asr")),
+        )
+        segment.status = "transcribed"
+        segment.analysis["spatial_style"] = lane.spatial_style
+        segment.analysis["stereo_lane_split"] = {
+            "mode": "single_lane",
+            "selected_channel": channel,
+            "trigger_reasons": trigger_reasons,
+            "diagnostic_channels": ["mid", "side"],
+        }
+        _clear_asr_quality_gate_errors(segment)
+        summary["single_lane"] += 1
+        summary["items"].append(item)
+    manifest.segments = next_segments
+    return summary
+
+
+def _transcribe_rows_from_segments(segments: Sequence[Segment]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for segment in segments:
+        quality_gate = segment.analysis.get("asr_quality_gate")
+        reasons: list[str] = []
+        if isinstance(quality_gate, dict):
+            reasons = [str(reason) for reason in quality_gate.get("reasons", []) if reason]
+        rows.append(
+            {
+                "segment_id": segment.id,
+                "status": segment.status,
+                "review_reasons": reasons,
+                "source_script": segment.source_script.model_dump(mode="json")
+                if segment.source_script
+                else None,
+            }
+        )
+    return rows
+
+
+def _transcribe_status_metrics(segments: Sequence[Segment]) -> dict[str, int]:
+    with_text = sum(
+        1
+        for segment in segments
+        if segment.source_script is not None
+        and segment.source_script.text.strip()
+        and segment.status not in {"absorbed", *NO_SPEECH_STATUSES}
+    )
+    manual_review = sum(1 for segment in segments if segment.status == "needs_manual_review")
+    no_speech = sum(1 for segment in segments if segment.status in NO_SPEECH_STATUSES)
+    non_speech_texture = sum(1 for segment in segments if segment.status == "non_speech_texture")
+    return {
+        "with_text": with_text,
+        "manual_review": manual_review,
+        "no_speech": no_speech,
+        "non_speech_texture": non_speech_texture,
+    }
 
 
 def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, confirm_rights: bool = False, asr_review: bool | None = None, asr_preset: str | None = None, asr_vad_off: bool | None = None, asr_diagnostics: bool | None = None, asr_device: str | None = None, asr_compute_type: str | None = None, asr_batched_inference: bool | None = None, asr_batch_size: int | None = None, asr_repair_enabled: bool | None = None, asr_backend_factory: Any | None = None) -> PipelineManifest:
@@ -217,9 +1185,16 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         mix_audio_path,
         write_audio_clips=write_seed_audio_clips,
     )
+    removed_channel_lanes = _reset_generated_channel_split_segments(manifest)
     total = len(manifest.segments)
     if seeded_for_transcribe:
         _log_stage_checkpoint("transcribe", "seed segment ready", f"segments={total}")
+    if removed_channel_lanes:
+        _log_stage_checkpoint(
+            "transcribe",
+            "removed generated channel lanes for rerun",
+            f"removed={removed_channel_lanes} segments={total}",
+        )
     backend_config = _asr_backend_config(cfg)
     _log_stage_checkpoint("transcribe", "creating ASR backend", f"backend={backend_kind}")
     backend = (
@@ -258,12 +1233,20 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         "skipped": 0,
         "items": [],
     }
+    segment_retry_summary: dict[str, Any] = {
+        "enabled": backend_kind != "mock" and bool(cfg.asr_repair_enabled),
+        "attempted": 0,
+        "repaired": 0,
+        "skipped": 0,
+        "items": [],
+    }
     asr_review_summary: dict[str, Any] = {
         "enabled": bool(cfg.asr_review_enabled),
         "backend": cfg.asr_review_backend,
         "attempted": 0,
         "reviewed": 0,
         "replaced": 0,
+        "guarded_auto_replaced": 0,
         "manual_review": 0,
         "skipped": 0,
         "generated_candidates": 0,
@@ -324,6 +1307,7 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
             review_audio_path=repair_audio_path,
             audio_duration_sec=audio_duration,
             cfg=cfg,
+            qwen_fallback_backend=qwen_fallback_backend,
         )
         _log_stage_checkpoint(
             "transcribe",
@@ -430,22 +1414,42 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
     no_speech_count = 0
     non_speech_texture_count = 0
     whole_input_no_speech = backend_kind != "mock" and not final_chunks
+    folder_parts = _asr_folder_input_parts(manifest)
     for index, segment in enumerate(manifest.segments, start=1):
         source_script = mapped.get(segment.id)
         segment.source_script = source_script
         source_has_text = bool(source_script and source_script.text.strip())
-        no_speech_segment = whole_input_no_speech and not source_has_text
+        folder_part = _asr_part_for_segment_start(folder_parts, float(segment.start))
+        folder_skip_reason = _asr_folder_part_skip_reason(folder_part)
+        skipped_folder_no_speech = folder_skip_reason is not None and not source_has_text
+        no_speech_segment = (whole_input_no_speech and not source_has_text) or skipped_folder_no_speech
         review_reasons = (
-            ["no_speech_detected"]
+            [f"asr_skipped_folder_part:{folder_skip_reason}"]
+            if skipped_folder_no_speech and folder_skip_reason
+            else ["no_speech_detected"]
             if no_speech_segment
             else _source_script_asr_review_reasons(source_script, cfg)
         )
         non_speech_texture_reason = (
             None if no_speech_segment else _source_script_non_speech_texture_reason(source_script)
         )
+        if non_speech_texture_reason is None and not no_speech_segment and source_script is not None:
+            non_speech_texture_reason = _source_script_keep_original_texture_override_reason(
+                segment,
+                source_script,
+                cfg,
+            )
+        keep_original_texture_candidate = (
+            None
+            if no_speech_segment
+            else _source_script_keep_original_texture_candidate(source_script)
+        )
+        if non_speech_texture_reason is None and keep_original_texture_candidate is not None:
+            non_speech_texture_reason = str(keep_original_texture_candidate["reason"])
         repair_review_reasons = _source_script_rejected_repair_reasons(
             source_script,
             repair_summary,
+            cfg=cfg,
         )
         asr_warning_reasons: list[str] = []
         if non_speech_texture_reason is None:
@@ -461,17 +1465,78 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
             )
         else:
             review_reasons = [non_speech_texture_reason]
+        if (
+            segment_retry_summary["enabled"]
+            and source_script is not None
+            and source_script.text.strip()
+            and review_reasons
+            and non_speech_texture_reason is None
+            and _asr_segment_retry_reasons(review_reasons)
+        ):
+            retry_source_script = _attempt_asr_segment_local_retry(
+                source_script,
+                segment=segment,
+                backend=backend,
+                project_dir=project_dir,
+                retry_audio_path=audio_path,
+                audio_duration_sec=audio_duration,
+                cfg=cfg,
+                review_reasons=review_reasons,
+                summary=segment_retry_summary,
+            )
+            if retry_source_script is not None:
+                source_script = retry_source_script
+                mapped[segment.id] = retry_source_script
+                segment.source_script = retry_source_script
+                review_reasons = _source_script_asr_review_reasons(source_script, cfg)
+                non_speech_texture_reason = _source_script_non_speech_texture_reason(source_script)
+                if non_speech_texture_reason is None:
+                    non_speech_texture_reason = _source_script_keep_original_texture_override_reason(
+                        segment,
+                        source_script,
+                        cfg,
+                    )
+                keep_original_texture_candidate = _source_script_keep_original_texture_candidate(
+                    source_script
+                )
+                if non_speech_texture_reason is None and keep_original_texture_candidate is not None:
+                    non_speech_texture_reason = str(keep_original_texture_candidate["reason"])
+                repair_review_reasons = _source_script_rejected_repair_reasons(
+                    source_script,
+                    repair_summary,
+                    cfg=cfg,
+                )
+                asr_warning_reasons = []
+                if non_speech_texture_reason is None:
+                    asr_warning_reasons = _source_script_asr_warning_reasons(source_script, cfg)
+                    repair_review_reasons = _filter_asr_repair_review_reasons(
+                        source_script,
+                        cfg,
+                        review_reasons=review_reasons,
+                        repair_review_reasons=repair_review_reasons,
+                    )
+                    review_reasons.extend(
+                        reason for reason in repair_review_reasons if reason not in review_reasons
+                    )
+                else:
+                    review_reasons = [non_speech_texture_reason]
+                source_has_text = bool(source_script and source_script.text.strip())
         _clear_asr_quality_gate_errors(segment)
+        segment.analysis.pop("candidate_keep_original_texture", None)
         for key in ASR_WARNING_ANALYSIS_KEYS:
             segment.analysis.pop(key, None)
         if no_speech_segment:
             segment.status = "no_speech_detected"
+            if skipped_folder_no_speech:
+                segment.keep_original_texture = True
             no_speech_count += 1
         elif non_speech_texture_reason is not None:
             segment.status = "non_speech_texture"
             segment.keep_original_texture = True
             no_speech_count += 1
             non_speech_texture_count += 1
+            if keep_original_texture_candidate is not None:
+                segment.analysis["candidate_keep_original_texture"] = keep_original_texture_candidate
             if non_speech_texture_reason not in segment.errors:
                 segment.errors.append(non_speech_texture_reason)
         elif review_reasons:
@@ -529,6 +1594,35 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         last_logged_at = _log_segment_progress(
             "transcribe", index, total, segment, manifest, started_at, last_logged_at
         )
+    channel_split_summary = _apply_channel_aware_asr_split(
+        manifest,
+        backend=backend,
+        project_dir=project_dir,
+        audio_duration_sec=audio_duration,
+        cfg=cfg,
+    )
+    if (
+        channel_split_summary.get("split", 0)
+        or channel_split_summary.get("single_lane", 0)
+        or channel_split_summary.get("no_dialog_texture", 0)
+        or channel_split_summary.get("removed_existing_generated_lanes", 0)
+    ):
+        rows = _transcribe_rows_from_segments(manifest.segments)
+        metrics = _transcribe_status_metrics(manifest.segments)
+        total = len(manifest.segments)
+        with_text = metrics["with_text"]
+        manual_review_count = metrics["manual_review"]
+        no_speech_count = metrics["no_speech"]
+        non_speech_texture_count = metrics["non_speech_texture"]
+        _log_stage_checkpoint(
+            "transcribe",
+            "channel-aware ASR split complete",
+            "split={split} single_lane={single_lane} segments={segments}".format(
+                split=channel_split_summary.get("split", 0),
+                single_lane=channel_split_summary.get("single_lane", 0),
+                segments=total,
+            ),
+        )
     _log_stage_checkpoint(
         "transcribe",
         "writing transcription artifacts",
@@ -542,6 +1636,12 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
     manifest.artifacts["segments_transcribed"] = str(out_path)
     if resegmented_from_chunks:
         manifest.artifacts["segments_asr_resegmented"] = str(out_path)
+    segment_retry_summary_path = project_dir / "work" / "transcribe" / "asr_segment_retry_summary.json"
+    write_json_atomic(segment_retry_summary_path, segment_retry_summary)
+    manifest.artifacts["asr_segment_retry_summary"] = str(segment_retry_summary_path)
+    channel_split_summary_path = project_dir / "work" / "transcribe" / "asr_channel_split_summary.json"
+    write_json_atomic(channel_split_summary_path, channel_split_summary)
+    manifest.artifacts["asr_channel_split_summary"] = str(channel_split_summary_path)
     _write_asr_diagnostics_artifacts(
         project_dir,
         manifest,
@@ -557,6 +1657,7 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         replacements_summary=asr_text_replacements_summary,
         filtered_summary=filtered_final_chunks,
         qwen_fallback_summary=qwen_fallback_summary,
+        segment_retry_summary=segment_retry_summary,
     )
     _log_stage_checkpoint(
         "transcribe",
@@ -607,8 +1708,14 @@ def run_transcribe_stage(ctx: PipelineContext, asr_backend: str | None = None, c
         asr_chunk_count=len(chunks),
         asr_repair_attempted=repair_summary.get("attempted", 0),
         asr_repair_repaired=repair_summary.get("repaired", 0),
+        asr_segment_retry_attempted=segment_retry_summary.get("attempted", 0),
+        asr_segment_retry_repaired=segment_retry_summary.get("repaired", 0),
+        asr_channel_split_attempted=channel_split_summary.get("attempted", 0),
+        asr_channel_split_split=channel_split_summary.get("split", 0),
+        asr_channel_split_single_lane=channel_split_summary.get("single_lane", 0),
         asr_review_attempted=asr_review_summary.get("attempted", 0),
         asr_review_replaced=asr_review_summary.get("replaced", 0),
+        asr_review_guarded_auto_replaced=asr_review_summary.get("guarded_auto_replaced", 0),
         asr_review_manual_review=asr_review_summary.get("manual_review", 0),
         asr_review_error=asr_review_summary.get("error"),
         asr_text_replacements=asr_text_replacement_count,

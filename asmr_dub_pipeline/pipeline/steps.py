@@ -23,6 +23,7 @@ from asmr_dub_pipeline.pipeline.stages.source_speakers import run_source_speaker
 from asmr_dub_pipeline.pipeline.stages.speaker_assignment import run_assign_speakers_stage
 from asmr_dub_pipeline.pipeline.stages.voice_refs import run_prepare_source_voice_refs_stage
 from asmr_dub_pipeline.pipeline.stages.gsv_few_shot import run_gsv_few_shot_stage
+from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_countdown_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_qwen import run_synth_qwen_stage
 from asmr_dub_pipeline.pipeline.stages.rvc_train import run_rvc_train_stage
@@ -84,9 +85,9 @@ def analyze_step(project_dir: Path, backend_kind: str, model_id: str | None = No
     ctx = PipelineContext.load(project_dir)
     return run_analyze_stage(ctx, backend_kind, model_id, confirm_rights)
 
-def audio_style_step(project_dir: Path, backend_kind: str, model_id: str | None = None, confirm_rights: bool = False, force: bool = False) -> PipelineManifest:
+def audio_style_step(project_dir: Path, backend_kind: str, model_id: str | None = None, confirm_rights: bool = False, force: bool = False, scope: str = "all") -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_audio_style_stage(ctx, backend_kind, model_id, confirm_rights, force)
+    return run_audio_style_stage(ctx, backend_kind, model_id, confirm_rights, force, scope)
 
 def script_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -96,9 +97,13 @@ def translate_ko_step(project_dir: Path, gemma_text_backend: str | None = None, 
     ctx = PipelineContext.load(project_dir)
     return run_translate_ko_stage(ctx, gemma_text_backend, confirm_rights, force_retranslate, retry_failed, repair_only, force_retranslate_failed)
 
-def korean_script_step(project_dir: Path, confirm_rights: bool = False) -> PipelineManifest:
+def korean_script_step(
+    project_dir: Path,
+    confirm_rights: bool = False,
+    only_segment_ids: set[str] | None = None,
+) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_korean_script_stage(ctx, confirm_rights)
+    return run_korean_script_stage(ctx, confirm_rights, only_segment_ids)
 
 def source_speakers_step(project_dir: Path, backend_kind: str | None = None, confirm_rights: bool = False, jobs: int = 4) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -116,9 +121,13 @@ def gsv_few_shot_step(project_dir: Path, confirm_rights: bool = False, force: bo
     ctx = PipelineContext.load(project_dir)
     return run_gsv_few_shot_stage(ctx, confirm_rights, force, gsv_url, gsv_server_command)
 
-def synth_step(project_dir: Path, gsv_url: str | None, refs_path: Path, mock: bool = False, confirm_rights: bool = False, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, use_trained_gpt: bool = False, only_segment_ids: set[str] | None = None, retry_failed: bool = False, force: bool = False) -> PipelineManifest:
+def synth_step(project_dir: Path, gsv_url: str | None, refs_path: Path, mock: bool = False, confirm_rights: bool = False, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, use_trained_gpt: bool = False, only_segment_ids: set[str] | None = None, retry_failed: bool = False, force: bool = False, render_countdowns: bool = True) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_synth_stage(ctx, gsv_url, refs_path, mock, confirm_rights, gpt_weights_path, sovits_weights_path, auto_gsv_server, gsv_server_command, use_trained_gpt, only_segment_ids, retry_failed, force)
+    return run_synth_stage(ctx, gsv_url, refs_path, mock, confirm_rights, gpt_weights_path, sovits_weights_path, auto_gsv_server, gsv_server_command, use_trained_gpt, only_segment_ids, retry_failed, force, render_countdowns=render_countdowns)
+
+def countdown_synth_step(project_dir: Path, gsv_url: str | None, refs_path: Path, mock: bool = False, confirm_rights: bool = False, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, use_trained_gpt: bool = False, only_segment_ids: set[str] | None = None, retry_failed: bool = False, force: bool = False) -> PipelineManifest:
+    ctx = PipelineContext.load(project_dir)
+    return run_countdown_synth_stage(ctx, gsv_url, refs_path, mock, confirm_rights, gpt_weights_path, sovits_weights_path, auto_gsv_server, gsv_server_command, use_trained_gpt, only_segment_ids, retry_failed, force)
 
 def synth_qwen_step(project_dir: Path, refs_path: Path, confirm_rights: bool = False, *, model_id: str | None = None, candidate_count: int | None = None, candidate_batch_size: int | None = None, segment_batch_size: int | None = None, target_vram_gb: float | None = None, promote: bool = False, local_files_only: bool | None = None, only_segment_ids: set[str] | None = None) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -132,9 +141,9 @@ def skip_rvc_train_for_voice_bank_step(project_dir: Path) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
     return run_skip_rvc_train_for_voice_bank_stage(ctx)
 
-def rvc_step(project_dir: Path, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None, only_segment_ids: set[str] | None = None) -> PipelineManifest:
+def rvc_step(project_dir: Path, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None, only_segment_ids: set[str] | None = None, retry_failed: bool = False) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_rvc_stage(ctx, confirm_rights, force, mock, runner, only_segment_ids)
+    return run_rvc_stage(ctx, confirm_rights, force, mock, runner, only_segment_ids, retry_failed)
 
 def qc_step(project_dir: Path, backend_kind: str, confirm_rights: bool = False, only_segment_ids: set[str] | None = None) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)

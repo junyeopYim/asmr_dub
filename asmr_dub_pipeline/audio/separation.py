@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -15,7 +14,6 @@ from .features import duration_sec, ensure_stereo, load_audio, resample_linear, 
 from .ffmpeg import FFmpegError, run_ffmpeg, wav_output_args
 
 SourceSeparationBackend = Literal["auto", "none", "demucs", "mock"]
-MAX_PARTWISE_SOURCE_SEPARATION_WORKERS = 2
 
 
 class SourceSeparationUnavailable(RuntimeError):
@@ -50,19 +48,44 @@ def demucs_available() -> bool:
 
 
 def _demucs_command(
-    input_audio_path: Path,
+    input_audio_path: Path | Sequence[Path],
     output_dir: Path,
     model: str,
     device: str | None,
 ) -> list[str]:
+    input_audio_paths = (
+        [input_audio_path]
+        if isinstance(input_audio_path, Path)
+        else list(input_audio_path)
+    )
     command = [shutil.which("demucs") or sys.executable]
     if command[0] == sys.executable:
         command.extend(["-m", "demucs.separate"])
     command.extend(["--two-stems", "vocals", "-n", model, "-o", str(output_dir)])
     if device:
         command.extend(["-d", device])
-    command.append(str(input_audio_path))
+    command.extend(str(path) for path in input_audio_paths)
     return command
+
+
+def _stage_demucs_batch_inputs(input_paths: Sequence[Path], batch_input_dir: Path) -> list[Path]:
+    batch_input_dir.mkdir(parents=True, exist_ok=True)
+    staged_paths: list[Path] = []
+    for index, input_path in enumerate(input_paths, start=1):
+        suffix = input_path.suffix or ".wav"
+        staged_path = batch_input_dir / f"part_{index:04d}{suffix.lower()}"
+        if staged_path.exists() or staged_path.is_symlink():
+            staged_path.unlink()
+        source_path = input_path.resolve()
+        try:
+            staged_path.symlink_to(source_path)
+        except OSError:
+            try:
+                staged_path.hardlink_to(source_path)
+            except OSError:
+                shutil.copy2(source_path, staged_path)
+        staged_paths.append(staged_path)
+    return staged_paths
 
 
 def _quote_ffmpeg_concat_path(path: Path) -> str:
@@ -354,17 +377,19 @@ def separate_source_audio(
                 part_vocals_mono: list[Path] = []
                 part_backgrounds: list[Path] = []
                 cursor_sec = 0.0
+                batch_demucs_dir = demucs_dir / "parts_batch"
+                batch_input_dir = separation_dir / "demucs_batch_inputs"
+                staged_parts = _stage_demucs_batch_inputs(input_parts, batch_input_dir)
+                batch_command = _demucs_command(staged_parts, batch_demucs_dir, model, device)
+                batch_demucs_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    runner(batch_command, check=True, text=True)
+                except subprocess.CalledProcessError as exc:
+                    raise SourceSeparationUnavailable(f"Demucs source separation failed: {exc}") from exc
 
-                def separate_part(index: int, part_path: Path) -> _PartwiseSeparationResult:
-                    part_demucs_dir = demucs_dir / "parts" / f"part_{index:04d}"
-                    command = _demucs_command(part_path, part_demucs_dir, model, device)
-                    part_demucs_dir.mkdir(parents=True, exist_ok=True)
-                    try:
-                        runner(command, check=True, text=True)
-                    except subprocess.CalledProcessError as exc:
-                        raise SourceSeparationUnavailable(f"Demucs source separation failed: {exc}") from exc
-                    raw_vocals = _find_demucs_stem(part_demucs_dir, model, part_path.stem, "vocals")
-                    raw_background = _find_demucs_stem(part_demucs_dir, model, part_path.stem, "no_vocals")
+                def collect_part(index: int, part_path: Path, staged_path: Path) -> _PartwiseSeparationResult:
+                    raw_vocals = _find_demucs_stem(batch_demucs_dir, model, staged_path.stem, "vocals")
+                    raw_background = _find_demucs_stem(batch_demucs_dir, model, staged_path.stem, "no_vocals")
                     normalized_dir = separation_dir / "partwise" / f"part_{index:04d}"
                     part_vocals_path = normalized_dir / "source_vocals_48k.wav"
                     part_vocals_mono_path = normalized_dir / "source_vocals_mono_16k.wav"
@@ -383,27 +408,20 @@ def separate_source_audio(
                     return _PartwiseSeparationResult(
                         part_index=index,
                         input_path=part_path,
-                        command=command,
+                        command=batch_command,
                         vocals_path=part_vocals_path,
                         vocals_mono_path=part_vocals_mono_path,
                         background_path=part_background_path,
                         duration_sec=part_duration,
                     )
 
-                worker_count = min(MAX_PARTWISE_SOURCE_SEPARATION_WORKERS, len(input_parts))
-                if worker_count <= 1:
-                    part_results = [
-                        separate_part(index, part_path)
-                        for index, part_path in enumerate(input_parts, start=1)
-                    ]
-                else:
-                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                        futures = [
-                            executor.submit(separate_part, index, part_path)
-                            for index, part_path in enumerate(input_parts, start=1)
-                        ]
-                        part_results = [future.result() for future in as_completed(futures)]
-                    part_results.sort(key=lambda part: part.part_index)
+                part_results = [
+                    collect_part(index, part_path, staged_path)
+                    for index, (part_path, staged_path) in enumerate(
+                        zip(input_parts, staged_parts, strict=True),
+                        start=1,
+                    )
+                ]
 
                 for part_result in part_results:
                     commands.append(part_result.command)
@@ -433,7 +451,7 @@ def separate_source_audio(
                     channels=1,
                 )
                 _concat_audio_files_streaming(part_backgrounds, background_path, sample_rate=sample_rate, channels=2)
-                postprocess_method = "partwise_ffmpeg_streaming"
+                postprocess_method = "partwise_batched_demucs_ffmpeg_streaming"
             else:
                 command = _demucs_command(input_audio_path, demucs_dir, model, device)
                 try:

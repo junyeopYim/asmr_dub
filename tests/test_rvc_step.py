@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+import asmr_dub_pipeline.cli as cli_module
+from asmr_dub_pipeline.cli import app
 from asmr_dub_pipeline.config import load_project_config, save_project_config
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
@@ -366,12 +368,16 @@ def test_real_rvc_train_dataset_rejects_overly_fast_source_speech(tmp_project_di
     assert [row["segment_id"] for row in rows] == [slow.id]
     assert {path.name for path in dataset_dir.iterdir()} == {f"{slow.id}.wav"}
     assert rows[0]["source_chars_per_sec"] == pytest.approx(1.75)
+    assert rows[0]["source_text"] == "ゆっくりはなすね"
+    assert rows[0]["source_text_original"] == "ゆっくり話すね"
     dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
     rejected = {
         item["segment_id"]: item
         for item in dataset_manifest["rejected_segments"]
     }
     assert rejected[fast.id]["source_chars_per_sec"] == pytest.approx(8.0)
+    assert rejected[fast.id]["source_text"] == "これわとてもはやくつめこまれたながいながいながいぜりふです"
+    assert rejected[fast.id]["source_text_original"] == "これはとても速く詰め込まれた長い長い長い台詞です"
     assert rejected[fast.id]["reject_reasons"] == [
         "source_chars_per_sec_above_max:8.000>5.200"
     ]
@@ -532,6 +538,202 @@ def test_duration_mismatch_triggers_next_retry_profile(tmp_project_dir: Path, mo
     assert len(segment.rvc.attempts) == 2
     assert segment.rvc.attempts[0]["accepted"] is False
     assert segment.rvc.attempts[1]["accepted"] is True
+
+
+def test_rvc_retries_failed_segments_twice_in_same_invocation(tmp_project_dir: Path, monkeypatch) -> None:
+    model_path = tmp_project_dir / "models" / "voice.pth"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model")
+    cfg = ProjectConfig(
+        rvc_backend="command",
+        rvc_command=["rvc", "{input}", "{output}", "{model}", "{profile_name}"],
+        rvc_model_path=str(model_path),
+        rvc_failure_policy="error",
+    )
+    _save_synth_manifest(tmp_project_dir, cfg)
+    calls: list[bool] = []
+
+    def flaky_convert(self, input_path: Path, output_path: Path, **kwargs: object) -> RVCCommandResult:
+        _ = self, input_path, kwargs
+        calls.append(bool(kwargs["force"]))
+        if len(calls) < 3:
+            raise RuntimeError(f"transient rvc failure {len(calls)}")
+        _write_exact_wav(output_path, duration=1.0)
+        return RVCCommandResult(output_path, ["fake"], "", "", 0, 0.0)
+
+    monkeypatch.setattr(pipeline_steps.RVCCommandClient, "convert", flaky_convert)
+
+    manifest = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True)
+
+    segment = manifest.segments[0]
+    assert calls == [False, True, True]
+    assert manifest.stage_state["rvc"]["status"] == "completed"
+    assert manifest.stage_state["rvc"]["retry_summary"]["retry_rounds"] == 2
+    assert segment.status == "rvc_converted"
+    assert segment.rvc is not None
+    assert segment.rvc.accepted is True
+    assert len(segment.rvc.attempts) == 3
+    assert [attempt["error"] for attempt in segment.rvc.attempts[:2]] == [
+        "transient rvc failure 1",
+        "transient rvc failure 2",
+    ]
+
+
+def test_rvc_retry_failed_option_requeues_only_failed_segments(tmp_project_dir: Path, monkeypatch) -> None:
+    model_path = tmp_project_dir / "models" / "voice.pth"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model")
+    cfg = ProjectConfig(
+        rvc_backend="command",
+        rvc_command=["rvc", "{input}", "{output}", "{model}", "{profile_name}"],
+        rvc_model_path=str(model_path),
+    )
+    failed = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    failed.status = "failed"
+    failed.errors = ["All RVC candidates failed or were rejected."]
+    assert failed.tts is not None
+    failed.rvc = RVCMetadata(
+        backend="command",
+        input_path=failed.tts.selected_candidate_path or "",
+        accepted=False,
+        error="All RVC candidates failed or were rejected.",
+        attempts=[{"profile_name": "previous", "accepted": False, "error": "previous failure"}],
+    )
+    completed = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    completed_output = _write_exact_wav(tmp_project_dir / "work" / "rvc" / "seg_0002_final.wav", duration=1.0)
+    completed.status = "rvc_converted"
+    assert completed.tts is not None
+    completed.rvc = RVCMetadata(
+        backend="command",
+        input_path=completed.tts.selected_candidate_path or "",
+        output_path=str(completed_output),
+        selected_profile_name="rmvpe_index045",
+        accepted=True,
+    )
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[failed, completed])
+    converted_segments: list[str] = []
+
+    def fake_convert(self, input_path: Path, output_path: Path, **kwargs: object) -> RVCCommandResult:
+        _ = self, input_path
+        converted_segments.append(str(kwargs["segment_id"]))
+        assert kwargs["force"] is True
+        _write_exact_wav(output_path, duration=1.0)
+        return RVCCommandResult(output_path, ["fake"], "", "", 0, 0.0)
+
+    monkeypatch.setattr(pipeline_steps.RVCCommandClient, "convert", fake_convert)
+
+    manifest = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True, retry_failed=True)
+
+    retried = manifest.segments[0]
+    assert converted_segments == ["seg_0001"]
+    assert manifest.stage_state["rvc"]["retry_failed"] is True
+    assert retried.status == "rvc_converted"
+    assert retried.errors == []
+    assert retried.rvc is not None
+    assert retried.rvc.accepted is True
+    assert retried.rvc.attempts[0]["profile_name"] == "previous"
+
+
+def test_rvc_force_restarts_failed_segment_from_scratch(tmp_project_dir: Path, monkeypatch) -> None:
+    model_path = tmp_project_dir / "models" / "voice.pth"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model")
+    cfg = ProjectConfig(
+        rvc_backend="command",
+        rvc_command=["rvc", "{input}", "{output}", "{model}", "{profile_name}"],
+        rvc_model_path=str(model_path),
+    )
+    failed = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    failed.status = "failed"
+    failed.errors = ["All RVC candidates failed or were rejected."]
+    assert failed.tts is not None
+    failed.rvc = RVCMetadata(
+        backend="command",
+        input_path=failed.tts.selected_candidate_path or "",
+        candidate_paths=["work/rvc/candidates/seg_0001/previous.wav"],
+        accepted=False,
+        error="All RVC candidates failed or were rejected.",
+        attempts=[{"profile_name": "previous", "accepted": False, "error": "previous failure"}],
+    )
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[failed])
+    converted_segments: list[str] = []
+
+    def fake_convert(self, input_path: Path, output_path: Path, **kwargs: object) -> RVCCommandResult:
+        _ = self, input_path
+        converted_segments.append(str(kwargs["segment_id"]))
+        assert kwargs["force"] is True
+        _write_exact_wav(output_path, duration=1.0)
+        return RVCCommandResult(output_path, ["fake"], "", "", 0, 0.0)
+
+    monkeypatch.setattr(pipeline_steps.RVCCommandClient, "convert", fake_convert)
+
+    manifest = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True, force=True)
+
+    restarted = manifest.segments[0]
+    assert converted_segments == ["seg_0001"]
+    assert restarted.status == "rvc_converted"
+    assert restarted.errors == []
+    assert restarted.rvc is not None
+    assert restarted.rvc.accepted is True
+    assert len(restarted.rvc.attempts) == 1
+    assert restarted.rvc.attempts[0]["profile_name"] == "rmvpe_index045"
+    assert "work/rvc/candidates/seg_0001/previous.wav" not in restarted.rvc.candidate_paths
+    assert manifest.stage_state["rvc"]["force"] is True
+
+
+def test_rvc_cli_accepts_retry_failed(cli_runner, tmp_project_dir: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_rvc_step(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest()
+
+    monkeypatch.setattr(cli_module, "rvc_step", fake_rvc_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "rvc",
+            "-p",
+            str(tmp_project_dir),
+            "--confirm-rights",
+            "--retry-failed",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["retry_failed"] is True
+
+
+def test_rvc_cli_accepts_retry_failed_alias(cli_runner, tmp_project_dir: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_rvc_step(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest()
+
+    monkeypatch.setattr(cli_module, "rvc_step", fake_rvc_step)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "rvc",
+            "-p",
+            str(tmp_project_dir),
+            "--confirm-rights",
+            "--retry",
+            "failed",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["retry_failed"] is True
 
 
 def test_rvc_command_concurrency_runs_segments_in_parallel(tmp_project_dir: Path, monkeypatch) -> None:

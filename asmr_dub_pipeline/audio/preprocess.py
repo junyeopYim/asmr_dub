@@ -59,6 +59,26 @@ _FOLDER_EFFECT_VARIANT_PATH_TOKENS = (
     "効果音あり",
     "効果音有",
 )
+_FOLDER_ASR_EFFECT_ONLY_TOKENS = (
+    "効果音のみ",
+    "効果音だけ",
+    "効果音オンリー",
+    "効果音トラック",
+    "効果音素材",
+    "効果音抜粋",
+    "seのみ",
+    "seだけ",
+    "seオンリー",
+    "se素材",
+    "sfx only",
+    "sfx_only",
+    "sound effects only",
+    "sound_effects_only",
+    "effect only",
+    "effect_only",
+    "effects only",
+    "effects_only",
+)
 _FOLDER_EFFECT_VARIANT_SUFFIX_RE = re.compile(
     r"(?:[_\-\s]*(?:"
     r"off[_\-\s]*se|se[_\-\s]*off|no[_\-\s]*se|without[_\-\s]*se|"
@@ -194,6 +214,16 @@ def _path_text(path: Path) -> str:
 def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
     normalized = unicodedata.normalize("NFKC", text.lower())
     return any(token.lower() in normalized for token in tokens)
+
+
+def folder_asr_part_skip_reason(path: Path | str) -> str | None:
+    """Return why a folder media part should be silenced for ASR-like speech stages."""
+    text = _path_text(Path(path))
+    if _contains_any(text, _FOLDER_ASR_CLEAN_TOKENS):
+        return None
+    if _contains_any(text, _FOLDER_ASR_EFFECT_ONLY_TOKENS):
+        return "effect_only"
+    return None
 
 
 def _is_media_file(path: Path) -> bool:
@@ -430,9 +460,20 @@ def plan_folder_input(input_path: Path) -> FolderInputPlan:
                 ),
                 asr_source_status="separate_asr_parts",
             )
-    asr_silent_parts = _folder_asr_silent_duplicate_parts(input_path, mix_parts)
+    duplicate_silent_parts = _folder_asr_silent_duplicate_parts(input_path, mix_parts)
+    effect_only_silent_parts = tuple(
+        path for path in mix_parts if folder_asr_part_skip_reason(path) == "effect_only"
+    )
+    asr_silent_parts = tuple(
+        sorted({*duplicate_silent_parts, *effect_only_silent_parts}, key=_natural_path_key)
+    )
     if asr_silent_parts:
         labels = ", ".join(f"'{_folder_group_label(key)}'" for key, _ in mix_groups)
+        asr_source_status = (
+            "mix_parts_silenced_for_asr"
+            if effect_only_silent_parts
+            else "mix_parts_silenced_duplicates"
+        )
         return FolderInputPlan(
             requested_path=input_path,
             mix_parts=mix_parts,
@@ -440,9 +481,9 @@ def plan_folder_input(input_path: Path) -> FolderInputPlan:
             status="planned",
             reason=(
                 f"Selected {len(mix_groups)} mix group(s) and silenced "
-                f"{len(asr_silent_parts)} duplicate/effect variant(s) for ASR: {labels}."
+                f"{len(asr_silent_parts)} duplicate/effect-only part(s) for ASR: {labels}."
             ),
-            asr_source_status="mix_parts_silenced_duplicates",
+            asr_source_status=asr_source_status,
             asr_silent_parts=asr_silent_parts,
         )
     labels = ", ".join(f"'{_folder_group_label(key)}'" for key, _ in mix_groups)
@@ -470,27 +511,29 @@ def translate_media_stem_to_korean(stem: str) -> str:
 def _part_metadata(parts: tuple[Path, ...], *, silent_parts: tuple[Path, ...] = ()) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     cursor = 0.0
-    silent_set = {path.resolve() for path in silent_parts}
+    silent_reasons = {path.resolve(): "duplicate_effect_variant" for path in silent_parts}
     for index, path in enumerate(parts, start=1):
         info = probe_with_fallback(path)
         duration = float(info.duration_sec)
         end = cursor + duration
-        records.append(
-            {
-                "part_index": index,
-                "path": str(path),
-                "duration_sec": duration,
-                "start_sec": cursor,
-                "end_sec": end,
-                "stem": path.stem,
-                "translated_stem_ko": translate_media_stem_to_korean(path.stem),
-                "has_video": info.has_video,
-                "sample_rate": info.sample_rate,
-                "channels": info.channels,
-                "codec": info.codec,
-                "asr_silenced": path.resolve() in silent_set,
-            }
-        )
+        skip_reason = folder_asr_part_skip_reason(path) or silent_reasons.get(path.resolve())
+        record = {
+            "part_index": index,
+            "path": str(path),
+            "duration_sec": duration,
+            "start_sec": cursor,
+            "end_sec": end,
+            "stem": path.stem,
+            "translated_stem_ko": translate_media_stem_to_korean(path.stem),
+            "has_video": info.has_video,
+            "sample_rate": info.sample_rate,
+            "channels": info.channels,
+            "codec": info.codec,
+            "asr_silenced": skip_reason is not None,
+        }
+        if skip_reason is not None:
+            record["asr_skip_reason"] = skip_reason
+        records.append(record)
         cursor = end
     return records
 
@@ -504,6 +547,7 @@ def folder_input_metadata(
     mix_parts = _part_metadata(plan.mix_parts)
     asr_parts = _part_metadata(plan.asr_parts, silent_parts=plan.asr_silent_parts)
     total_duration = mix_parts[-1]["end_sec"] if mix_parts else 0.0
+    asr_silent_parts = [part for part in asr_parts if part.get("asr_silenced")]
     return {
         "requested": True,
         "input_kind": "folder",
@@ -516,7 +560,7 @@ def folder_input_metadata(
         "part_count": len(mix_parts),
         "mix_parts": mix_parts,
         "asr_parts": asr_parts,
-        "asr_silent_part_count": len(plan.asr_silent_parts),
+        "asr_silent_part_count": len(asr_silent_parts),
         "asr_silent_parts": [str(path) for path in plan.asr_silent_parts],
         "total_part_duration_sec": total_duration,
     }

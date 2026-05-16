@@ -31,6 +31,11 @@ def run_script_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bo
                 backend.generate_script(Path(segment.audio_for_gemma), segment, context),
             )
             segment.script = normalize_script_payload(payload)
+            if segment.source_lane is not None:
+                segment.script.spatial_style = segment.source_lane.spatial_style
+                segment.analysis["spatial_style"] = segment.source_lane.spatial_style
+                if segment.script.style is not None:
+                    segment.script.style.spatial_style = segment.source_lane.spatial_style
             segment.status = "scripted"
         except Exception as exc:
             segment.errors.append(str(exc))

@@ -212,6 +212,46 @@ def slice_audio(
     return output_path
 
 
+def slice_audio_channel(
+    input_path: Path,
+    start_sec: float,
+    end_sec: float,
+    output_path: Path,
+    *,
+    channel: str,
+    sample_rate: int | None = None,
+) -> Path:
+    ensure_not_same_path(input_path, output_path)
+    filters = {
+        "left": "pan=mono|c0=c0",
+        "right": "pan=mono|c0=c1",
+        "mid": "pan=mono|c0=0.5*c0+0.5*c1",
+        "side": "pan=mono|c0=0.5*c0-0.5*c1",
+        "mono": "pan=mono|c0=0.5*c0+0.5*c1",
+    }
+    if channel not in filters:
+        raise FFmpegError(f"Unsupported audio channel selection: {channel}")
+    args = [
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-to",
+        f"{end_sec:.3f}",
+        "-i",
+        str(input_path),
+        "-af",
+        filters[channel],
+        "-ac",
+        "1",
+    ]
+    if sample_rate:
+        args += ["-ar", str(sample_rate)]
+    args += wav_output_args(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(args)
+    return output_path
+
+
 def _atempo_chain(tempo: float) -> str:
     if tempo <= 0:
         raise FFmpegError("atempo tempo must be greater than zero.")

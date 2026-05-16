@@ -83,6 +83,28 @@ def test_ref_audio_paths_are_normalized_inside_project(tmp_path) -> None:
     assert loaded["ok"].aux_ref_audio_paths == [str((project / "refs/aux.wav").resolve())]
 
 
+def test_refs_prompt_text_is_kana_normalized_for_japanese_refs(tmp_path) -> None:
+    project = tmp_path / "project"
+    create_project_structure(project)
+    refs = project / "refs" / "ok.json"
+    refs.write_text(
+        json.dumps(
+            {
+                "whisper_close": {
+                    "ref_audio_path": "refs/voice.wav",
+                    "prompt_text": "耳元で囁きますね。",
+                    "prompt_lang": "ja",
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    loaded = load_refs(refs, project_dir=project)
+
+    assert loaded["whisper_close"].prompt_text == "みみもとでささやきますね。"
+
+
 def test_http_gemma_requires_existing_rights_audit(tmp_project_dir) -> None:
     create_project_structure(tmp_project_dir)
     config = tmp_project_dir / "pipeline.yaml"

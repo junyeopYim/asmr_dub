@@ -7,6 +7,12 @@ import pytest
 from asmr_dub_pipeline.asr.base import ASRChunk
 from asmr_dub_pipeline.pipeline import steps as pipeline_steps
 from asmr_dub_pipeline.schemas import KoreanTranslation, ProjectConfig, Segment, SourceScript
+from asmr_dub_pipeline.script.duration_rewrite import korean_tts_speech_char_count
+from asmr_dub_pipeline.script.korean_tts_fit import (
+    fit_korean_tts_budget,
+    salvage_korean_translation,
+    sanitize_korean_tts_text,
+)
 
 pytestmark = pytest.mark.contract
 
@@ -42,6 +48,56 @@ def _segment_with_translation(
         batch_id="batch_0001",
     )
     return segment
+
+
+def test_korean_tts_sanitizer_normalizes_digits_acronyms_and_symbols() -> None:
+    sanitized, notes = sanitize_korean_tts_text("ASMR 5/OK—TTS")
+
+    assert sanitized == "에이에스엠알 오 오케이 티티에스"
+    assert notes == ["korean_tts_sanitized"]
+
+
+def test_korean_tts_budget_fitter_reduces_over_budget_text() -> None:
+    fitted, notes = fit_korean_tts_budget("좋아요 반드시 그렇게 돼요", max_speech_chars=10)
+
+    assert korean_tts_speech_char_count(fitted) <= 10
+    assert fitted
+    assert notes == ["korean_tts_budget_fit"]
+
+
+def test_salvage_korean_translation_prefers_valid_shorter_tts_text() -> None:
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=2.98,
+        duration=2.98,
+        audio_for_gemma="gemma.wav",
+        audio_for_mix="mix.wav",
+        source_script=SourceScript(
+            text="いいね 必ずそうなる",
+            language="ja",
+            confidence=0.99,
+            backend="mock",
+            start=0.0,
+            end=2.98,
+        ),
+        translation_ko=KoreanTranslation(
+            ko_literal="좋아요 반드시 그렇게 돼요",
+            ko_natural="좋아요 반드시 그렇게 돼요",
+            notes=[],
+            confidence=0.9,
+            model="mock",
+            batch_id="batch_0001",
+        ),
+    )
+
+    result = salvage_korean_translation(segment, segment.translation_ko)
+
+    assert result is not None
+    salvaged, notes = result
+    assert korean_tts_speech_char_count(salvaged.ko_natural) <= 10
+    assert "korean_tts_budget_fit" in notes
+    assert "korean_tts_budget_fit" in salvaged.notes
 
 
 def test_asr_prompt_leak_contract_rejects_prompts_but_keeps_dialogue() -> None:

@@ -106,7 +106,7 @@ def _run_pre_rvc_fallback_stage(
     return manifest
 
 
-def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None, only_segment_ids: set[str] | None = None) -> PipelineManifest:
+def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None, only_segment_ids: set[str] | None = None, retry_failed: bool = False) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
     _load_config_into_manifest(project_dir, manifest)
@@ -167,6 +167,9 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         client = RVCMockClient()
 
     failed_segments: list[str] = []
+    max_failed_retry_rounds = 2
+    internal_retry_segment_ids: set[str] = set()
+    retry_rounds: list[dict[str, Any]] = []
     started_at = monotonic()
     last_logged_at = started_at
     total = len(manifest.segments)
@@ -180,11 +183,57 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         f"concurrency={batch_lane_count if use_batch_rvc else rvc_lane_count}"
     )
 
+    def unique_segment_ids(segment_ids: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for segment_id in segment_ids:
+            if segment_id in seen:
+                continue
+            seen.add(segment_id)
+            ordered.append(segment_id)
+        return ordered
+
+    def has_rvc_retry_input(segment: Segment) -> bool:
+        return bool(segment.status == "failed" and segment.tts and segment.tts.selected_candidate_path)
+
+    def should_force_restart_segment(segment: Segment) -> bool:
+        return bool(
+            force
+            and segment.tts
+            and segment.tts.selected_candidate_path
+            and (segment.status not in SKIP_STATUSES or segment.status == "failed")
+        )
+
+    def should_retry_failed_segment(segment: Segment) -> bool:
+        return has_rvc_retry_input(segment) and (
+            retry_failed or segment.id in internal_retry_segment_ids
+        )
+
+    def is_rvc_retry_error(error: str) -> bool:
+        return (
+            error == "All RVC candidates failed or were rejected."
+            or error == "RVC requires segment.tts.selected_candidate_path from synth."
+            or error == "RVC requires the model artifact produced by train-rvc."
+            or error.startswith("RVC input does not exist:")
+        )
+
+    def clear_rvc_retry_errors(segment: Segment) -> None:
+        segment.errors = [error for error in segment.errors if not is_rvc_retry_error(error)]
+
     def prepare_segment(
         segment: Segment,
     ) -> tuple[tuple[Path, Path | None, Path | None] | None, str | None]:
-        if segment.status in SKIP_STATUSES:
+        retrying_failed_segment = should_retry_failed_segment(segment)
+        force_restarting_segment = should_force_restart_segment(segment)
+        if segment.status in SKIP_STATUSES and not (retrying_failed_segment or force_restarting_segment):
             return None, None
+        if force_restarting_segment:
+            clear_rvc_retry_errors(segment)
+            segment.rvc = None
+            if segment.status == "failed":
+                segment.status = "synthesized"
+        elif retrying_failed_segment:
+            clear_rvc_retry_errors(segment)
         if not segment.tts or not segment.tts.selected_candidate_path:
             message = "RVC requires segment.tts.selected_candidate_path from synth."
             segment.status = "failed"
@@ -220,8 +269,10 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         if prepared is None:
             return index, segment, failed_segment_id
         input_path, model_path, index_path = prepared
-        attempts: list[dict[str, Any]] = []
-        candidate_paths: list[str] = []
+        retrying_failed_segment = should_retry_failed_segment(segment)
+        previous_rvc = segment.rvc if retrying_failed_segment else None
+        attempts: list[dict[str, Any]] = list(previous_rvc.attempts) if previous_rvc else []
+        candidate_paths: list[str] = list(previous_rvc.candidate_paths) if previous_rvc else []
         accepted_attempt: dict[str, Any] | None = None
         selected_candidate_path: Path | None = None
         profiles = cfg.rvc_auto_profiles
@@ -237,7 +288,9 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
                 / segment.id
                 / f"{effective_profile.name}.wav"
             )
-            candidate_paths.append(str(candidate_path))
+            candidate_path_str = str(candidate_path)
+            if candidate_path_str not in candidate_paths:
+                candidate_paths.append(candidate_path_str)
             command: list[str] | None = None
             try:
                 console.print(
@@ -264,7 +317,7 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
                     profile=effective_profile,
                     segment_id=segment.id,
                     sid=segment.speaker_id or "",
-                    force=force,
+                    force=force or retrying_failed_segment,
                 )
                 command = result.command or command
                 metrics = _rvc_metrics(input_path, candidate_path, segment, cfg)
@@ -421,10 +474,16 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
             prepared_segments.append((index, segment, input_path, model_path, index_path))
 
         attempts_by_segment: dict[str, list[dict[str, Any]]] = {
-            segment.id: [] for _, segment, *_ in prepared_segments
+            segment.id: list(segment.rvc.attempts)
+            if should_retry_failed_segment(segment) and segment.rvc
+            else []
+            for _, segment, *_ in prepared_segments
         }
         candidate_paths_by_segment: dict[str, list[str]] = {
-            segment.id: [] for _, segment, *_ in prepared_segments
+            segment.id: list(segment.rvc.candidate_paths)
+            if should_retry_failed_segment(segment) and segment.rvc
+            else []
+            for _, segment, *_ in prepared_segments
         }
         profiles = cfg.rvc_auto_profiles
         if cfg.rvc_failure_policy == "error":
@@ -542,7 +601,9 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
                     / segment.id
                     / f"{effective_profile.name}.wav"
                 )
-                candidate_paths_by_segment[segment.id].append(str(candidate_path))
+                candidate_path_str = str(candidate_path)
+                if candidate_path_str not in candidate_paths_by_segment[segment.id]:
+                    candidate_paths_by_segment[segment.id].append(candidate_path_str)
                 console.print(
                     f"[dim]rvc candidate: {index}/{total} segment={escape(segment.id)} "
                     f"profile={escape(effective_profile.name)} output={escape(str(candidate_path))}[/dim]"
@@ -570,6 +631,10 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
                     batch_id = batch_counter
                 first = entries[0]
                 _, _, _, model_path, index_path, effective_profile, _ = first
+                batch_force = force or any(
+                    should_retry_failed_segment(segment)
+                    for _, segment, *_ in entries
+                )
                 jobs = [
                     RVCBatchJob(
                         segment_id=segment.id,
@@ -596,7 +661,7 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
                     index_path=index_path,
                     cfg=cfg,
                     profile=effective_profile,
-                    force=force,
+                    force=batch_force,
                 )
 
             if batch_lane_count > 1 and len(batch_tasks) > 1:
@@ -665,39 +730,105 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         for index, segment in enumerate(manifest.segments, start=1)
         if only_segment_ids is None or segment.id in only_segment_ids
     ]
-    skipped_completed = sum(1 for _, segment in indexed_segments if rvc_output_exists(segment))
-    segment_jobs = [
-        (index, segment)
-        for index, segment in indexed_segments
-        if segment.status not in SKIP_STATUSES and not rvc_output_exists(segment)
-    ]
-    if skipped_completed:
-        console.print(f"[dim]rvc skipped {skipped_completed} already converted segment(s)[/dim]")
-    if use_batch_rvc and len(segment_jobs) > 1:
-        convert_segments_batched(segment_jobs)
-    elif backend == "command" and rvc_lane_count > 1 and len(segment_jobs) > 1:
-        with ThreadPoolExecutor(max_workers=rvc_lane_count) as executor:
-            futures = [executor.submit(convert_segment, index, segment) for index, segment in segment_jobs]
-            for future in as_completed(futures):
-                index, segment, failed_segment_id = future.result()
+
+    segment_by_id = {segment.id: segment for _, segment in indexed_segments}
+
+    def should_queue_rvc_job(segment: Segment) -> bool:
+        if force:
+            return should_force_restart_segment(segment)
+        if retry_failed and not force:
+            return should_retry_failed_segment(segment)
+        if segment.status in SKIP_STATUSES:
+            return should_retry_failed_segment(segment)
+        return not rvc_output_exists(segment)
+
+    def run_rvc_jobs(jobs: list[tuple[int, Segment]]) -> None:
+        nonlocal last_logged_at
+        if use_batch_rvc and len(jobs) > 1:
+            convert_segments_batched(jobs)
+        elif backend == "command" and rvc_lane_count > 1 and len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=rvc_lane_count) as executor:
+                futures = [executor.submit(convert_segment, index, segment) for index, segment in jobs]
+                for future in as_completed(futures):
+                    index, segment, failed_segment_id = future.result()
+                    if failed_segment_id:
+                        failed_segments.append(failed_segment_id)
+                    last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
+                    save_manifest(project_dir, manifest)
+        else:
+            for index, segment in jobs:
+                index, segment, failed_segment_id = convert_segment(index, segment)
                 if failed_segment_id:
                     failed_segments.append(failed_segment_id)
                 last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
                 save_manifest(project_dir, manifest)
-    else:
-        for index, segment in segment_jobs:
-            index, segment, failed_segment_id = convert_segment(index, segment)
-            if failed_segment_id:
-                failed_segments.append(failed_segment_id)
-            last_logged_at = _log_segment_progress("rvc", index, total, segment, manifest, started_at, last_logged_at)
-            save_manifest(project_dir, manifest)
+
+    skipped_completed = sum(1 for _, segment in indexed_segments if rvc_output_exists(segment))
+    segment_jobs = [
+        (index, segment)
+        for index, segment in indexed_segments
+        if should_queue_rvc_job(segment)
+    ]
+    if skipped_completed:
+        console.print(f"[dim]rvc skipped {skipped_completed} already converted segment(s)[/dim]")
+    run_rvc_jobs(segment_jobs)
+
+    for retry_round in range(1, max_failed_retry_rounds + 1):
+        current_failed_segments = unique_segment_ids(failed_segments)
+        retry_segment_ids = [
+            segment_id
+            for segment_id in current_failed_segments
+            if (segment := segment_by_id.get(segment_id)) is not None and has_rvc_retry_input(segment)
+        ]
+        terminal_failed_segments = [
+            segment_id for segment_id in current_failed_segments if segment_id not in retry_segment_ids
+        ]
+        if not retry_segment_ids:
+            failed_segments = current_failed_segments
+            break
+        internal_retry_segment_ids = set(retry_segment_ids)
+        failed_segments = terminal_failed_segments
+        retry_jobs = [
+            (index, segment)
+            for index, segment in indexed_segments
+            if segment.id in internal_retry_segment_ids
+        ]
+        console.print(
+            f"[yellow]rvc retry {retry_round}/{max_failed_retry_rounds}[/yellow] "
+            f"segments={len(retry_jobs)}"
+        )
+        run_rvc_jobs(retry_jobs)
+        round_failed_segments = [
+            segment_id
+            for segment_id in unique_segment_ids(failed_segments)
+            if segment_id in internal_retry_segment_ids
+        ]
+        retry_rounds.append(
+            {
+                "round": retry_round,
+                "attempted_segments": retry_segment_ids,
+                "failed_segments": round_failed_segments,
+            }
+        )
+        if not round_failed_segments:
+            break
+    internal_retry_segment_ids = set()
 
     out_path = project_dir / "work" / "rvc" / "rvc_manifest.json"
+    failed_segments = unique_segment_ids(failed_segments)
+    retry_summary = {
+        "retry_failed": retry_failed,
+        "force": force,
+        "max_failed_retries": max_failed_retry_rounds,
+        "retry_rounds": len(retry_rounds),
+        "rounds": retry_rounds,
+    }
     write_json_atomic(
         out_path,
         {
             "backend": backend,
             "execution_mode": "batch" if use_batch_rvc else "per_segment",
+            "retry_summary": retry_summary,
             "segments": [
                 {"id": segment.id, "rvc": segment.rvc.model_dump(mode="json") if segment.rvc else None}
                 for segment in manifest.segments
@@ -716,6 +847,9 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
             rvc_manifest=str(out_path),
             concurrency=effective_concurrency,
             execution_mode="batch" if use_batch_rvc else "per_segment",
+            force=force,
+            retry_failed=retry_failed,
+            retry_summary=retry_summary,
             segment_counts=_segment_counts(manifest),
         )
         save_manifest(project_dir, manifest)
@@ -732,6 +866,9 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         rvc_manifest=str(out_path),
         concurrency=effective_concurrency,
         execution_mode="batch" if use_batch_rvc else "per_segment",
+        force=force,
+        retry_failed=retry_failed,
+        retry_summary=retry_summary,
         segment_counts=_segment_counts(manifest),
     )
     save_manifest(project_dir, manifest)

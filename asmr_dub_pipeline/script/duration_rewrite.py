@@ -109,6 +109,24 @@ def korean_tts_timing_budget(
     }
 
 
+def korean_tts_slot_timing_budget(target_sec: float) -> dict[str, float | int | str | None]:
+    target_chars = max(4, int(max(0.0, target_sec) * KOREAN_TTS_CHARS_PER_SECOND))
+    max_chars = max(target_chars + 2, int(target_chars * KOREAN_TTS_MAX_SPEED_ALLOWANCE), 6)
+    min_chars = max(4, int(target_chars * 0.55))
+    return {
+        "target_duration_sec": round(max(0.0, target_sec), 3),
+        "estimated_chars_per_sec": KOREAN_TTS_CHARS_PER_SECOND,
+        "target_speech_chars": target_chars,
+        "min_speech_chars": min(min_chars, max_chars),
+        "max_speech_chars": max_chars,
+        "budget_basis": "duration_slot",
+        "counting_rule": (
+            "Korean slot timing budget counts Unicode letters and numbers only; it is "
+            "based on the available dubbed segment duration rather than source text length."
+        ),
+    }
+
+
 def estimate_tts_duration(text: str, language: str = "ja") -> float:
     return max(0.4, _speech_char_count(text) / _chars_per_second(language))
 

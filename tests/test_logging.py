@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import json
 import logging as py_logging
 from io import StringIO
+from pathlib import Path
 
+from conftest import write_tiny_wav
 from rich.console import Console
 
+from asmr_dub_pipeline.config import save_project_config
 from asmr_dub_pipeline.logging import configure_logging
+from asmr_dub_pipeline.pipeline.manifest_io import save_manifest
 from asmr_dub_pipeline.pipeline.stages import common, synth_gpt_sovits
-from asmr_dub_pipeline.schemas import JapaneseScript, PipelineManifest, Segment
+from asmr_dub_pipeline.pipeline.steps import countdown_synth_step, init_project
+from asmr_dub_pipeline.schemas import (
+    JapaneseScript,
+    PipelineManifest,
+    ProjectConfig,
+    Segment,
+    SourceScript,
+)
 
 
 def test_configure_logging_suppresses_httpx_request_info(caplog) -> None:
@@ -88,6 +100,99 @@ def test_segment_progress_can_distinguish_completed_jobs_from_segment_index(monk
     assert "latest=seg_0250 segment_index=250 status=synthesized" in rendered
     assert "status_counts=failed:1, scripted:1, synthesized:1" in rendered
     assert " counts=" not in rendered
+
+
+def test_countdown_synth_logs_countdown_span_progress(
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        common,
+        "console",
+        Console(file=output, force_terminal=False, color_system=None, width=240),
+    )
+    init_project(tmp_project_dir)
+    save_project_config(
+        ProjectConfig(
+            project_name="test",
+            duration_tolerance=0.2,
+            gsv_countdown_renderer="compact",
+            gsv_countdown_candidate_count=1,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+    refs_dir = tmp_project_dir / "refs"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    write_tiny_wav(refs_dir / "whisper_close.wav", duration=3.0)
+    (refs_dir / "refs.json").write_text(
+        json.dumps(
+            {
+                "whisper_close": {
+                    "prompt_lang": "ja",
+                    "prompt_text": "ソレジャー、ユックリカゾエマスネ。",
+                    "ref_audio_path": "refs/whisper_close.wav",
+                }
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "utf-8",
+    )
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    write_tiny_wav(audio, duration=3.0)
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            segments=[
+                Segment(
+                    id="seg_0001",
+                    start=0.0,
+                    end=3.0,
+                    duration=3.0,
+                    audio_for_gemma=str(audio),
+                    audio_for_mix=str(audio),
+                    source_script=SourceScript(
+                        text="3 2 1",
+                        language="ja",
+                        backend="mock",
+                        start=0.0,
+                        end=3.0,
+                    ),
+                    script=JapaneseScript(
+                        ja_text="3 2 1",
+                        tts_text="삼, 이, 일",
+                        tts_language="ko",
+                        source_language="ja",
+                        target_language="ko",
+                        expected_tts_duration_sec=3.0,
+                        ref_style="whisper_close",
+                    ),
+                    analysis={
+                        "countdown_event": {
+                            "kind": "descending_countdown",
+                            "values": [3, 2, 1],
+                        }
+                    },
+                    status="scripted",
+                )
+            ]
+        ),
+    )
+
+    countdown_synth_step(
+        tmp_project_dir,
+        gsv_url=None,
+        refs_path=refs_dir / "refs.json",
+        mock=True,
+        confirm_rights=True,
+        force=True,
+    )
+
+    rendered = output.getvalue()
+    assert "countdown-synth: spans=1/1 (100.0%)" in rendered
+    assert "latest=seg_0001 segment_index=1 status=synthesized" in rendered
+    assert "status_counts=synthesized:1" in rendered
 
 
 def test_duration_rewrite_logging_shows_model_rewrite(monkeypatch) -> None:

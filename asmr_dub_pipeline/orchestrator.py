@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .config import load_project_config, save_project_config
+from .gpu_memory import clear_gpu_vram
 from .pipeline.manifest_io import save_manifest
 from .pipeline.steps import (
     analyze_step,
     assign_speakers_step,
     audio_style_step,
+    countdown_synth_step,
     export_step,
     extract_step,
     gsv_few_shot_step,
@@ -33,6 +36,22 @@ from .pipeline.steps import (
 )
 from .rvc import validate_rvc_config, validate_rvc_training_config
 from .schemas import PipelineManifest
+
+T = TypeVar("T")
+
+
+def _run_with_optional_gpu_cleanup(
+    stage_name: str,
+    cleanup_gpu: bool,
+    func: Callable[..., T],
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if cleanup_gpu:
+            clear_gpu_vram(stage_name)
 
 
 def _asr_source_separation_fallback_recommendation(
@@ -78,6 +97,7 @@ def _transcribe_with_optional_source_separation_fallback(
     project_dir: Path,
     *,
     confirm_rights: bool,
+    cleanup_gpu: bool = False,
     asr_backend: str | None,
     asr_preset: str | None,
     asr_vad_off: bool | None,
@@ -97,19 +117,38 @@ def _transcribe_with_optional_source_separation_fallback(
         "asr_batched_inference": asr_batched_inference,
         "asr_batch_size": asr_batch_size,
     }
-    manifest = transcribe_step(project_dir, **transcribe_kwargs)
+    manifest = _run_with_optional_gpu_cleanup(
+        "transcribe",
+        cleanup_gpu,
+        transcribe_step,
+        project_dir,
+        **transcribe_kwargs,
+    )
     recommendation = _asr_source_separation_fallback_recommendation(manifest)
     if recommendation is None:
         return manifest
 
     previous_source_separation_backend = _set_source_separation_backend(project_dir, "demucs")
     try:
-        source_separation_step(project_dir, confirm_rights=confirm_rights, force=True)
+        _run_with_optional_gpu_cleanup(
+            "source-separation",
+            cleanup_gpu,
+            source_separation_step,
+            project_dir,
+            confirm_rights=confirm_rights,
+            force=True,
+        )
     except Exception:
         if previous_source_separation_backend != "demucs":
             _set_source_separation_backend(project_dir, previous_source_separation_backend)
         raise
-    rerun_manifest = transcribe_step(project_dir, **transcribe_kwargs)
+    rerun_manifest = _run_with_optional_gpu_cleanup(
+        "transcribe",
+        cleanup_gpu,
+        transcribe_step,
+        project_dir,
+        **transcribe_kwargs,
+    )
     rerun_manifest.stage_state["asr-source-separation-fallback"] = {
         "status": "completed",
         "backend": "demucs",
@@ -134,6 +173,7 @@ def run_pipeline(
     gsv_server_command: str | list[str] | None = None,
     few_shot: bool | None = None,
     gsv_few_shot_force: bool | None = None,
+    rvc_train_force: bool = False,
     use_trained_gpt: bool = False,
     target_language: str | None = None,
     asr_backend: str | None = None,
@@ -188,18 +228,32 @@ def run_pipeline(
         validate_rvc_config(project_dir, cfg, real=True, allow_trained_artifact=True)
     use_korean_text_lane = cfg.target_language == "ko"
     use_few_shot = False if mock or use_voice_bank else cfg.gsv_few_shot_enabled if few_shot is None else few_shot
-    extract_step(input_path, project_dir, confirm_rights, merge_parts=merge_input_parts)
+    cleanup_gpu_after_stage = not mock
+
+    def run_stage(stage_name: str, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        return _run_with_optional_gpu_cleanup(
+            stage_name,
+            cleanup_gpu_after_stage,
+            func,
+            *args,
+            **kwargs,
+        )
+
+    run_stage("extract", extract_step, input_path, project_dir, confirm_rights, merge_parts=merge_input_parts)
     if source_separation_cache_project is not None and not merge_input_parts:
-        import_voice_bank_source_separation_cache_step(
+        run_stage(
+            "source-separation-cache",
+            import_voice_bank_source_separation_cache_step,
             project_dir,
             input_path,
             source_separation_cache_project,
         )
-    source_separation_step(project_dir, confirm_rights)
+    run_stage("source-separation", source_separation_step, project_dir, confirm_rights)
     if use_korean_text_lane:
         _transcribe_with_optional_source_separation_fallback(
             project_dir,
             confirm_rights=confirm_rights,
+            cleanup_gpu=cleanup_gpu_after_stage,
             asr_backend=normalized_asr_backend,
             asr_preset=asr_preset,
             asr_vad_off=asr_vad_off,
@@ -209,16 +263,24 @@ def run_pipeline(
             asr_batched_inference=asr_batched_inference,
             asr_batch_size=asr_batch_size,
         )
-        segment_step(project_dir)
+        run_stage("segment", segment_step, project_dir)
         if use_voice_bank:
-            assign_speakers_step(
+            run_stage(
+                "speaker-assign",
+                assign_speakers_step,
                 project_dir,
                 voice_bank_path=voice_bank_path,
                 backend_kind=None,
                 require_all=True,
             )
         elif not mock:
-            source_speakers_step(project_dir, backend_kind="pyannote", confirm_rights=confirm_rights)
+            run_stage(
+                "source-speakers",
+                source_speakers_step,
+                project_dir,
+                backend_kind="pyannote",
+                confirm_rights=confirm_rights,
+            )
         audio_style_backend = (
             "mock"
             if mock
@@ -226,15 +288,29 @@ def run_pipeline(
             if normalized_gemma_backend == "llama_cpp"
             else gemma_backend
         )
-        audio_style_step(project_dir, audio_style_backend, confirm_rights=confirm_rights)
-        translate_ko_step(project_dir, "mock" if mock else "llama_server")
-        korean_script_step(project_dir)
+        run_stage(
+            "audio-style",
+            audio_style_step,
+            project_dir,
+            audio_style_backend,
+            confirm_rights=confirm_rights,
+            scope=cfg.gemma_audio_style_scope,
+        )
+        run_stage("translate-ko", translate_ko_step, project_dir, "mock" if mock else "llama_server")
+        run_stage("korean-script", korean_script_step, project_dir)
         if not mock and not use_voice_bank:
-            prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
+            run_stage(
+                "prepare-refs",
+                prepare_source_voice_refs_step,
+                project_dir,
+                refs_path or Path("refs/refs.json"),
+            )
     else:
-        segment_step(project_dir)
+        run_stage("segment", segment_step, project_dir)
         if use_voice_bank:
-            assign_speakers_step(
+            run_stage(
+                "speaker-assign",
+                assign_speakers_step,
                 project_dir,
                 voice_bank_path=voice_bank_path,
                 backend_kind=None,
@@ -244,6 +320,7 @@ def run_pipeline(
             _transcribe_with_optional_source_separation_fallback(
                 project_dir,
                 confirm_rights=confirm_rights,
+                cleanup_gpu=cleanup_gpu_after_stage,
                 asr_backend=normalized_asr_backend,
                 asr_preset=asr_preset,
                 asr_vad_off=asr_vad_off,
@@ -254,20 +331,50 @@ def run_pipeline(
                 asr_batch_size=asr_batch_size,
             )
         if not use_voice_bank and not mock:
-            source_speakers_step(project_dir, backend_kind="pyannote", confirm_rights=confirm_rights)
-        analyze_step(project_dir, gemma_backend)
-        script_step(project_dir, gemma_backend)
+            run_stage(
+                "source-speakers",
+                source_speakers_step,
+                project_dir,
+                backend_kind="pyannote",
+                confirm_rights=confirm_rights,
+            )
+        run_stage("analyze", analyze_step, project_dir, gemma_backend)
+        run_stage("script", script_step, project_dir, gemma_backend)
         if use_few_shot:
-            prepare_source_voice_refs_step(project_dir, refs_path or Path("refs/refs.json"))
+            run_stage(
+                "prepare-refs",
+                prepare_source_voice_refs_step,
+                project_dir,
+                refs_path or Path("refs/refs.json"),
+            )
     if use_few_shot and not (gpt_weights_path and sovits_weights_path):
-        gsv_few_shot_step(
+        run_stage(
+            "gsv-few-shot",
+            gsv_few_shot_step,
             project_dir,
             confirm_rights=confirm_rights,
             force=gsv_few_shot_force,
             gsv_url=gsv_url,
             gsv_server_command=gsv_server_command,
         )
-    synth_step(
+    run_stage(
+        "synth",
+        synth_step,
+        project_dir,
+        gsv_url=gsv_url,
+        refs_path=refs_path or Path("refs/refs.json"),
+        mock=mock,
+        confirm_rights=confirm_rights,
+        gpt_weights_path=gpt_weights_path,
+        sovits_weights_path=sovits_weights_path,
+        auto_gsv_server=auto_gsv_server,
+        gsv_server_command=gsv_server_command,
+        use_trained_gpt=use_trained_gpt,
+        render_countdowns=False,
+    )
+    run_stage(
+        "countdown-synth",
+        countdown_synth_step,
         project_dir,
         gsv_url=gsv_url,
         refs_path=refs_path or Path("refs/refs.json"),
@@ -280,14 +387,23 @@ def run_pipeline(
         use_trained_gpt=use_trained_gpt,
     )
     if use_voice_bank:
-        skip_rvc_train_for_voice_bank_step(project_dir)
+        run_stage("train-rvc", skip_rvc_train_for_voice_bank_step, project_dir)
     else:
-        rvc_train_step(project_dir, confirm_rights=confirm_rights, mock=mock)
-    rvc_step(project_dir, confirm_rights=confirm_rights, mock=mock)
+        run_stage(
+            "train-rvc",
+            rvc_train_step,
+            project_dir,
+            confirm_rights=confirm_rights,
+            force=rvc_train_force,
+            mock=mock,
+        )
+    run_stage("rvc", rvc_step, project_dir, confirm_rights=confirm_rights, mock=mock)
     qc_backend = "mock" if use_korean_text_lane else gemma_backend
-    qc_step(project_dir, qc_backend)
+    run_stage("qc", qc_step, project_dir, qc_backend)
     if regenerate_before_mix:
-        regenerate_needs_step(
+        run_stage(
+            "regenerate",
+            regenerate_needs_step,
             project_dir,
             refs_path=refs_path or Path("refs/refs.json"),
             confirm_rights=confirm_rights,
@@ -300,5 +416,5 @@ def run_pipeline(
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
         )
-    mix_step(project_dir, confirm_rights)
-    return export_step(input_path, project_dir, confirm_rights)
+    run_stage("mix", mix_step, project_dir, confirm_rights)
+    return run_stage("export", export_step, input_path, project_dir, confirm_rights)

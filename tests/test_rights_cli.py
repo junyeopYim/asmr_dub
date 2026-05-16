@@ -91,6 +91,7 @@ def test_other_real_media_commands_require_rights(cli_runner, tiny_wav_path, tmp
         ["mix", "--project", str(tmp_project_dir)],
         ["export", str(tiny_wav_path), "--project", str(tmp_project_dir)],
         ["synth", "--project", str(tmp_project_dir)],
+        ["countdown-synth", "--project", str(tmp_project_dir)],
         ["train-gsv", "--project", str(tmp_project_dir)],
     ):
         result = cli_runner.invoke(app, args)

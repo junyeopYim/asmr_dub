@@ -7,7 +7,12 @@ from asmr_dub_pipeline.gemma.prompts import analysis_prompt, audio_style_prompt
 from asmr_dub_pipeline.gemma.schemas import validate_gemma_task_response
 from asmr_dub_pipeline.gemma.text_translate import LlamaServerTranslationClient
 from asmr_dub_pipeline.schemas import JapaneseScript, Segment
-from asmr_dub_pipeline.script.normalizer import normalize_script_payload, normalize_tts_text
+from asmr_dub_pipeline.script.normalizer import (
+    JapaneseKanaNormalizationError,
+    normalize_japanese_kana_text,
+    normalize_script_payload,
+    normalize_tts_text,
+)
 from asmr_dub_pipeline.script.text_qc import preflight_tts_text
 
 
@@ -72,6 +77,41 @@ def test_korean_normalizer_strips_leading_japanese_sentence_fragment() -> None:
 
     assert result.text == "징, 징…"
     assert "normalized_tts_text" in result.risk_flags
+
+
+def test_japanese_kana_normalizer_converts_kanji_latin_and_digits() -> None:
+    result = normalize_japanese_kana_text("ASMR OK 3分、耳元で囁きますね。")
+
+    assert result.text == "えーえすえむあーる おーけい さんぷん、みみもとでささやきますね。"
+    assert result.original_text == "ASMR OK 3分、耳元で囁きますね。"
+    assert result.changed
+    assert "normalized_japanese_kana_text" in result.risk_flags
+
+
+def test_japanese_kana_normalizer_allows_remaining_kanji_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "asmr_dub_pipeline.script.normalizer._pyopenjtalk_kana",
+        lambda text: text,
+    )
+
+    result = normalize_japanese_kana_text("耳元で囁きますね。")
+
+    assert result.text == "耳元で囁きますね。"
+    assert "remaining_non_kana_japanese_text" in result.risk_flags
+
+
+def test_japanese_kana_normalizer_can_reject_remaining_kanji_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "asmr_dub_pipeline.script.normalizer._pyopenjtalk_kana",
+        lambda text: text,
+    )
+
+    with pytest.raises(JapaneseKanaNormalizationError, match="remaining non-kana Japanese text"):
+        normalize_japanese_kana_text("耳元で囁きますね。", strict=True)
 
 
 def test_korean_normalizer_spells_risky_tokens_and_splits_long_clauses() -> None:

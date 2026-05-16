@@ -24,6 +24,14 @@ _AUDIO_STYLE_ANALYSIS_KEYS = {
 
 _AUDIO_STYLE_EFFECT_TAGS = ("telephone", "radio", "robot", "distortion", "reverb", "echo")
 _AUDIO_STYLE_EFFECT_TAG_SET = set(_AUDIO_STYLE_EFFECT_TAGS)
+_AUDIO_STYLE_SCOPE_ALL = "all"
+_AUDIO_STYLE_SCOPE_SPEAKER_SUSPICIOUS = "speaker_suspicious"
+_AUDIO_STYLE_SCOPES = {_AUDIO_STYLE_SCOPE_ALL, _AUDIO_STYLE_SCOPE_SPEAKER_SUSPICIOUS}
+_AUDIO_STYLE_LOW_SPEAKER_OVERLAP_RATIO = 0.6
+_AUDIO_STYLE_LOW_CENTROID_SIMILARITY = 0.65
+_AUDIO_STYLE_MINOR_SPEAKER_MAX_DURATION_SEC = 30.0
+_AUDIO_STYLE_MINOR_SPEAKER_MAX_COUNT = 5
+_AUDIO_STYLE_MINOR_SPEAKER_MAX_DOMINANT_RATIO = 0.1
 _AUDIO_STYLE_EFFECT_ALIASES = {
     "phone": "telephone",
     "telephone_filter": "telephone",
@@ -38,6 +46,16 @@ _AUDIO_STYLE_EVENT_TARGETS = {"voice", "background", "sfx", "mixed"}
 
 def _normalize_audio_style_token(value: Any) -> str:
     return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _normalize_audio_style_scope(value: Any) -> str:
+    scope = _normalize_audio_style_token(value or _AUDIO_STYLE_SCOPE_ALL)
+    if scope in {"speaker", "speaker_suspicious", "speaker_suspect"}:
+        scope = _AUDIO_STYLE_SCOPE_SPEAKER_SUSPICIOUS
+    if scope not in _AUDIO_STYLE_SCOPES:
+        allowed = ", ".join(sorted(_AUDIO_STYLE_SCOPES))
+        raise ValueError(f"Unsupported audio-style scope '{value}'. Expected one of: {allowed}.")
+    return scope
 
 
 def _clamp_audio_style_float(value: Any, default: float, low: float, high: float) -> float:
@@ -189,6 +207,126 @@ def _segment_has_audio_style_effect(segment: Segment) -> bool:
     return any(str(tag) != "none" for tag in effect_tags)
 
 
+def _audio_style_float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _audio_style_minor_speaker_ids(segments: list[Segment]) -> set[str]:
+    stats: dict[str, dict[str, float]] = {}
+    for segment in segments:
+        if not segment.speaker_id:
+            continue
+        item = stats.setdefault(segment.speaker_id, {"count": 0.0, "duration": 0.0})
+        item["count"] += 1.0
+        item["duration"] += max(0.0, float(segment.duration))
+    if len(stats) < 2:
+        return set()
+    dominant_duration = max(item["duration"] for item in stats.values())
+    if dominant_duration <= 0:
+        return set()
+    minor_ids: set[str] = set()
+    for speaker_id, item in stats.items():
+        is_small = (
+            item["duration"] < _AUDIO_STYLE_MINOR_SPEAKER_MAX_DURATION_SEC
+            or item["count"] <= _AUDIO_STYLE_MINOR_SPEAKER_MAX_COUNT
+        )
+        is_minor_relative_to_dominant = (
+            item["duration"] <= dominant_duration * _AUDIO_STYLE_MINOR_SPEAKER_MAX_DOMINANT_RATIO
+        )
+        if is_small and is_minor_relative_to_dominant:
+            minor_ids.add(speaker_id)
+    return minor_ids
+
+
+def _audio_style_speaker_suspicion(
+    segment: Segment,
+    *,
+    minor_speaker_ids: set[str],
+) -> tuple[int, float, list[str]]:
+    analysis = segment.analysis or {}
+    reasons: list[str] = []
+    score = 0
+    rank_distance = 1.0
+
+    normalization = analysis.get("source_speaker_bucket_normalization")
+    if isinstance(normalization, Mapping):
+        reasons.append("source_speaker_bucket_normalization")
+        score += 3
+        if _normalize_audio_style_token(normalization.get("merge_confidence")) == "low":
+            reasons.append("low_confidence_bucket_merge")
+            score += 3
+        centroid_similarity = _audio_style_float_or_none(normalization.get("centroid_similarity"))
+        if centroid_similarity is not None:
+            rank_distance = min(rank_distance, centroid_similarity)
+            if centroid_similarity < _AUDIO_STYLE_LOW_CENTROID_SIMILARITY:
+                reasons.append("low_centroid_similarity")
+                score += 2
+        clean_duration = _audio_style_float_or_none(normalization.get("clean_training_duration_sec"))
+        if (
+            clean_duration is not None
+            and clean_duration < _AUDIO_STYLE_MINOR_SPEAKER_MAX_DURATION_SEC
+        ):
+            reasons.append("minor_bucket_clean_duration")
+            score += 2
+
+    assignment = analysis.get("source_speaker_assignment")
+    if isinstance(assignment, Mapping):
+        dominant_overlap_ratio = _audio_style_float_or_none(
+            assignment.get("dominant_overlap_ratio")
+        )
+        if dominant_overlap_ratio is not None:
+            rank_distance = min(rank_distance, dominant_overlap_ratio)
+        if not segment.speaker_id and dominant_overlap_ratio is not None:
+            reasons.append("missing_speaker_id")
+            score += 2
+            if dominant_overlap_ratio < _AUDIO_STYLE_LOW_SPEAKER_OVERLAP_RATIO:
+                reasons.append("low_dominant_overlap")
+                score += 1
+        speaker_count = assignment.get("speaker_count")
+        if isinstance(speaker_count, int) and speaker_count > 1:
+            reasons.append("overlapping_speakers")
+            score += 2
+    elif not segment.speaker_id:
+        reasons.append("missing_speaker_assignment")
+        score += 2
+
+    if segment.speaker_id and segment.speaker_id in minor_speaker_ids:
+        reasons.append("minor_speaker_bucket")
+        score += 2
+
+    fallback = analysis.get("source_speaker_model_fallback")
+    if isinstance(fallback, Mapping):
+        reasons.append("source_speaker_model_fallback")
+        score += 2
+
+    return score, rank_distance, reasons
+
+
+def _audio_style_speaker_suspicious_segments(
+    segments: list[Segment],
+) -> tuple[set[str], list[str], dict[str, list[str]]]:
+    minor_speaker_ids = _audio_style_minor_speaker_ids(segments)
+    selected: list[tuple[int, float, int, str, list[str]]] = []
+    reasons_by_id: dict[str, list[str]] = {}
+    for index, segment in enumerate(segments):
+        if segment.status in SKIP_STATUSES:
+            continue
+        score, rank_distance, reasons = _audio_style_speaker_suspicion(
+            segment,
+            minor_speaker_ids=minor_speaker_ids,
+        )
+        if not reasons:
+            continue
+        selected.append((score, rank_distance, index, segment.id, reasons))
+        reasons_by_id[segment.id] = reasons
+    selected.sort(key=lambda item: (-item[0], item[1], item[2]))
+    selected_ids = [segment_id for _score, _rank_distance, _index, segment_id, _reasons in selected]
+    return set(selected_ids), selected_ids, reasons_by_id
+
+
 def _audio_style_backend_config(cfg: Any, model_id: str | None) -> dict[str, Any]:
     config = _gemma_backend_config(cfg, model_id)
     config["llama_cpp_n_predict"] = min(int(config.get("llama_cpp_n_predict", 1024)), 384)
@@ -202,13 +340,23 @@ def run_audio_style_stage(
     model_id: str | None = None,
     confirm_rights: bool = False,
     force: bool = False,
+    scope: str = _AUDIO_STYLE_SCOPE_ALL,
 ) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
     _load_config_into_manifest(project_dir, manifest)
     backend_kind = backend_kind.replace("-", "_")
+    scope = _normalize_audio_style_scope(scope)
+    selected_segment_ids: set[str] | None = None
+    selected_segments: list[str] = []
+    selected_reasons: dict[str, list[str]] = {}
+    if scope == _AUDIO_STYLE_SCOPE_SPEAKER_SUSPICIOUS:
+        selected_segment_ids, selected_segments, selected_reasons = (
+            _audio_style_speaker_suspicious_segments(manifest.segments)
+        )
     total = len(manifest.segments)
-    _log_stage_start("audio-style", f"backend={backend_kind}, segments={total}")
+    candidate_total = len(selected_segment_ids) if selected_segment_ids is not None else total
+    _log_stage_start("audio-style", f"backend={backend_kind}, scope={scope}, segments={total}")
     _require_audio_stage_rights(manifest, "audio-style", confirm_rights, metadata={"backend": backend_kind})
     cfg = manifest.project_config
     backend = None
@@ -216,8 +364,8 @@ def run_audio_style_stage(
     server_manager = None
     server_metadata = None
     audio_style_worker_count = (
-        _effective_lane_count(cfg.gemma_audio_style_concurrency, total)
-        if backend_kind == "llama_server_audio" and total
+        _effective_lane_count(cfg.gemma_audio_style_concurrency, candidate_total)
+        if backend_kind == "llama_server_audio" and candidate_total
         else 1
     )
 
@@ -263,6 +411,7 @@ def run_audio_style_stage(
     failed = 0
     no_speech_detected = 0
     skipped_existing = 0
+    skipped_scope = 0
     started_at = monotonic()
     last_logged_at = started_at
 
@@ -296,6 +445,8 @@ def run_audio_style_stage(
             candidate = manifest.segments[scan_cursor]
             if candidate.status in SKIP_STATUSES:
                 break
+            if selected_segment_ids is not None and candidate.id not in selected_segment_ids:
+                break
             if not force and _has_reusable_audio_style_analysis(candidate):
                 break
             try:
@@ -327,6 +478,13 @@ def run_audio_style_stage(
                 cursor += 1
                 continue
             if segment.status in SKIP_STATUSES:
+                last_logged_at = _log_segment_progress(
+                    "audio-style", index, total, segment, manifest, started_at, last_logged_at
+                )
+                cursor += 1
+                continue
+            if selected_segment_ids is not None and segment.id not in selected_segment_ids:
+                skipped_scope += 1
                 last_logged_at = _log_segment_progress(
                     "audio-style", index, total, segment, manifest, started_at, last_logged_at
                 )
@@ -428,6 +586,10 @@ def run_audio_style_stage(
         failed=failed,
         no_speech_detected=no_speech_detected,
         skipped_existing=skipped_existing,
+        skipped_scope=skipped_scope,
+        scope=scope,
+        selected_segments=selected_segments,
+        selected_segment_reasons=selected_reasons,
         concurrency=audio_style_worker_count,
         server=server_metadata,
         segment_counts=_segment_counts(manifest),

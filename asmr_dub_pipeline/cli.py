@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, TypeVar
 
 import typer
 from rich.table import Table
@@ -17,12 +20,14 @@ from asmr_dub_pipeline.gemma.llama_cpp_client import (
 )
 
 from .config import load_project_config, save_project_config
+from .gpu_memory import clear_gpu_vram
 from .logging import console
 from .orchestrator import run_pipeline
-from .pipeline.manifest_io import manifest_path
+from .pipeline.manifest_io import manifest_path, write_json_atomic
 from .pipeline.steps import (
     analyze_step,
     audio_style_step,
+    countdown_synth_step,
     export_step,
     extract_step,
     gsv_few_shot_step,
@@ -60,6 +65,7 @@ TRAINED_GPT_HELP = (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".mp4", ".mkv", ".mov"}
 DEFAULT_VOICE_BANK_PROJECT_NAME = "voice_bank_all"
+T = TypeVar("T")
 FULL_REAL_QUALITY_PRESET = {
     "source_language": "ja",
     "asr_preset": "whisper",
@@ -67,7 +73,7 @@ FULL_REAL_QUALITY_PRESET = {
     "asr_batch_size": 16,
     "asr_word_timestamps": True,
     "asr_diagnostics_enabled": True,
-    "asr_resegment_max_sec": 14.0,
+    "asr_resegment_max_sec": 10.0,
     "asr_qwen_repair_fallback_enabled": True,
     "asr_review_enabled": True,
     "asr_review_generate_candidates": True,
@@ -87,9 +93,11 @@ FULL_REAL_QUALITY_PRESET = {
     "gemma_text_span_max_gap_sec": 5.0,
     "gemma_text_timeout_sec": 900.0,
     "gemma_text_server_startup_timeout_sec": 900.0,
+    "gemma_audio_style_scope": "speaker_suspicious",
     "gsv_timeout_sec": 240.0,
     "gsv_retries": 3,
-    "gsv_concurrency": 6,
+    "gsv_concurrency": 2,
+    "gsv_pronunciation_qc_workers": 2,
     "gsv_few_shot_min_total_sec": 60.0,
     "gsv_few_shot_min_clip_sec": 2.0,
     "gsv_few_shot_max_clip_sec": 8.0,
@@ -99,7 +107,11 @@ FULL_REAL_QUALITY_PRESET = {
     "gsv_few_shot_max_side_to_mid_db": -6.0,
     "gsv_few_shot_preferred_chars_per_sec": 4.5,
     "gsv_few_shot_max_chars_per_sec": 5.2,
-    "gsv_few_shot_prefer_plain_text": True,
+    "gsv_few_shot_min_selection_score": 0.50,
+    "gsv_few_shot_max_total_sec": 240.0,
+    "gsv_few_shot_asr_risk_filter": True,
+    "gsv_few_shot_prefer_plain_text": False,
+    "gsv_few_shot_enabled": True,
     "gsv_ref_mode": "segment",
     "gsv_ref_min_sec": 3.0,
     "gsv_ref_max_sec": 10.0,
@@ -125,15 +137,20 @@ FULL_REAL_QUALITY_PRESET = {
     "gsv_sample_steps": 32,
     "gsv_super_sampling": True,
     "gsv_min_chunk_length": 8,
-    "gsv_gpt_weights_policy": "auto",
-    "gsv_sovits_weights_policy": "auto",
+    "gsv_numeric_cadence_periods_enabled": True,
+    "gsv_numeric_cadence_min_values": 3,
+    "gsv_numeric_sequence_qc_enabled": True,
+    "gsv_numeric_sequence_qc_require_contiguous": True,
+    "gsv_numeric_sequence_qc_failure_blocks_mix": True,
+    "gsv_gpt_weights_policy": "base_for_korean",
+    "gsv_sovits_weights_policy": "unchanged",
     "mix_allow_korean_timing_draft": False,
     "rvc_required": True,
     "rvc_backend": "command",
     "rvc_train_required": True,
     "rvc_train_backend": "command",
     "rvc_train_sample_rate": 48_000,
-    "rvc_train_epochs": 20,
+    "rvc_train_epochs": 100,
     "rvc_train_batch_size": 0,
     "rvc_train_preferred_chars_per_sec": 4.5,
     "rvc_train_max_chars_per_sec": 5.2,
@@ -144,7 +161,7 @@ FULL_REAL_QUALITY_PRESET = {
     "rvc_train_preprocess_processes": 0,
     "rvc_train_f0_workers": 0,
     "rvc_train_feature_workers": 0,
-    "rvc_train_save_every_epoch": 5,
+    "rvc_train_save_every_epoch": 10,
     "rvc_train_reuse_intermediate_cache": True,
     "rvc_concurrency": 4,
     "rvc_batch_infer": True,
@@ -166,6 +183,26 @@ app = typer.Typer(
 def _handle_error(exc: Exception) -> None:
     console.print(f"[red]{exc}[/red]")
     raise typer.Exit(code=1) from exc
+
+
+def _backend_may_use_gpu(backend: str | None) -> bool:
+    if backend is None:
+        return False
+    return backend.replace("-", "_").strip().lower() not in {"", "mock", "none"}
+
+
+def _run_cli_stage(
+    stage_name: str,
+    cleanup_gpu: bool,
+    func: Callable[..., T],
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if cleanup_gpu:
+            clear_gpu_vram(stage_name)
 
 
 def _parse_only_segment_ids(value: str | None) -> set[str] | None:
@@ -260,6 +297,140 @@ def _discover_audio_inputs(audio_dir: Path) -> list[Path]:
         for path in root.iterdir()
         if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
     )
+
+
+def _folder_contains_supported_media(folder: Path) -> bool:
+    return any(
+        path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS for path in folder.rglob("*")
+    )
+
+
+def _discover_audio_work_dirs(audio_dir: Path) -> list[Path]:
+    root = audio_dir.expanduser().resolve()
+    if not root.exists():
+        raise ValueError(f"Audio directory does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Audio path is not a directory: {root}")
+    return sorted(
+        path.resolve()
+        for path in root.iterdir()
+        if path.is_dir() and not path.name.startswith(".") and _folder_contains_supported_media(path)
+    )
+
+
+def _default_full_audio_batch_dir() -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return REPO_ROOT / "runs" / f"{timestamp}_audio_full_real_batch"
+
+
+def _remove_tree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _copy_export_result(export_path: str | None, result_dir: Path) -> list[str]:
+    if not export_path:
+        raise ValueError("Pipeline completed without an export artifact.")
+    source = Path(export_path).expanduser().resolve()
+    if not source.exists():
+        raise ValueError(f"Pipeline export artifact is missing: {source}")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    if source.is_dir():
+        for child in sorted(source.iterdir()):
+            target = result_dir / child.name
+            if child.is_dir():
+                shutil.copytree(child, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(child, target)
+            copied.append(str(target))
+        return copied
+    target = result_dir / source.name
+    shutil.copy2(source, target)
+    copied.append(str(target))
+    return copied
+
+
+def _resolve_existing_project_file(project_dir: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    path = path.resolve()
+    if not path.is_file():
+        return None
+    return path
+
+
+def _manual_review_file_refs(segment) -> list[tuple[str, str | None]]:
+    refs: list[tuple[str, str | None]] = [
+        ("audio_for_gemma", segment.audio_for_gemma),
+        ("audio_for_mix", segment.audio_for_mix),
+    ]
+    if segment.tts is not None:
+        refs.append(("tts_selected", segment.tts.selected_candidate_path))
+        refs.extend(
+            (f"tts_candidate_{candidate.candidate_index:02d}", candidate.output_path)
+            for candidate in segment.tts.candidates
+        )
+    if segment.rvc is not None:
+        refs.append(("rvc_input", segment.rvc.input_path))
+        refs.append(("rvc_output", segment.rvc.output_path))
+        refs.extend(
+            (f"rvc_candidate_{index:02d}", path)
+            for index, path in enumerate(segment.rvc.candidate_paths, start=1)
+        )
+    return refs
+
+
+def _copy_manual_review_bundle(
+    *,
+    input_path: Path,
+    project_dir: Path,
+    review_dir: Path,
+    manifest,
+) -> list[str]:
+    manual_segments = [
+        segment for segment in manifest.segments if segment.status == "needs_manual_review"
+    ]
+    review_dir.mkdir(parents=True, exist_ok=True)
+    copied_files: list[dict[str, str]] = []
+    for segment in manual_segments:
+        segment_dir = review_dir / "segments" / segment.id
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        for label, source_value in _manual_review_file_refs(segment):
+            source = _resolve_existing_project_file(project_dir, source_value)
+            if source is None:
+                continue
+            suffix = source.suffix or ".bin"
+            target = segment_dir / f"{label}{suffix}"
+            counter = 2
+            while target.exists():
+                target = segment_dir / f"{label}_{counter}{suffix}"
+                counter += 1
+            shutil.copy2(source, target)
+            copied_files.append(
+                {
+                    "segment_id": segment.id,
+                    "label": label,
+                    "source": str(source),
+                    "path": str(target),
+                }
+            )
+    write_json_atomic(
+        review_dir / "manual_review_segments.json",
+        {
+            "input": str(input_path),
+            "project": str(project_dir),
+            "manual_review_count": len(manual_segments),
+            "segments": [segment.model_dump(mode="json") for segment in manual_segments],
+            "copied_files": copied_files,
+            "stage_state": manifest.stage_state,
+            "warnings": manifest.warnings,
+        },
+    )
+    return [item["path"] for item in copied_files]
 
 
 def _apply_personal_voice_bank_defaults(project_dir: Path) -> None:
@@ -405,11 +576,21 @@ def _apply_full_real_quality_preset(
     project_dir: Path,
     target_language: str,
     source_path: Path | None = None,
+    *,
+    few_shot: bool = True,
 ) -> None:
     init_project(project_dir)
     cfg = load_project_config(project_dir)
     payload = cfg.model_dump(mode="json")
     payload.update(FULL_REAL_QUALITY_PRESET)
+    if few_shot:
+        payload["gsv_few_shot_enabled"] = True
+        payload["gsv_gpt_weights_policy"] = "auto"
+        payload["gsv_sovits_weights_policy"] = "auto"
+    else:
+        payload["gsv_few_shot_enabled"] = False
+        payload["gsv_gpt_weights_policy"] = "base_for_korean"
+        payload["gsv_sovits_weights_policy"] = "unchanged"
     for key, value in _local_rvc_webui_defaults(project_dir, source_path).items():
         if key in {"rvc_train_command", "rvc_command", "rvc_batch_command"} and payload.get(key):
             continue
@@ -483,7 +664,10 @@ def separate_background(
 ) -> None:
     """Separate source voice from background before segmentation, ASR, few-shot, and mix."""
     try:
-        manifest = source_separation_step(
+        manifest = _run_cli_stage(
+            "source-separation",
+            True,
+            source_separation_step,
             project.expanduser().resolve(),
             confirm_rights=confirm_rights,
             force=force,
@@ -518,7 +702,15 @@ def analyze(
 ) -> None:
     """Run Gemma-style segment analysis."""
     try:
-        analyze_step(project.expanduser().resolve(), gemma_backend, model_id, confirm_rights=confirm_rights)
+        _run_cli_stage(
+            "analyze",
+            _backend_may_use_gpu(gemma_backend),
+            analyze_step,
+            project.expanduser().resolve(),
+            gemma_backend,
+            model_id,
+            confirm_rights=confirm_rights,
+        )
     except Exception as exc:
         _handle_error(exc)
     console.print("Analysis complete.")
@@ -531,10 +723,21 @@ def audio_style_cmd(
     model_id: str = typer.Option("google/gemma-4-E4B-it", "--model-id"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
     force: bool = typer.Option(False, "--force", help="Re-run audio style analysis even when segment results already exist."),
+    scope: str = typer.Option("all", "--scope", help="all|speaker-suspicious"),
 ) -> None:
     """Analyze source audio style metadata for translated lanes."""
     try:
-        audio_style_step(project.expanduser().resolve(), gemma_backend, model_id, confirm_rights=confirm_rights, force=force)
+        _run_cli_stage(
+            "audio-style",
+            _backend_may_use_gpu(gemma_backend),
+            audio_style_step,
+            project.expanduser().resolve(),
+            gemma_backend,
+            model_id,
+            confirm_rights=confirm_rights,
+            force=force,
+            scope=scope,
+        )
     except Exception as exc:
         _handle_error(exc)
     console.print("Audio style analysis complete.")
@@ -593,7 +796,10 @@ def transcribe(
 ) -> None:
     """Create segment-level source scripts with local ASR."""
     try:
-        transcribe_step(
+        _run_cli_stage(
+            "transcribe",
+            _backend_may_use_gpu(asr_backend),
+            transcribe_step,
             project.expanduser().resolve(),
             asr_backend,
             confirm_rights=confirm_rights,
@@ -644,7 +850,10 @@ def translate_ko_cmd(
 ) -> None:
     """Translate source scripts to Korean with text-only Gemma."""
     try:
-        translate_ko_step(
+        _run_cli_stage(
+            "translate-ko",
+            _backend_may_use_gpu(gemma_text_backend),
+            translate_ko_step,
             project.expanduser().resolve(),
             gemma_text_backend,
             confirm_rights=confirm_rights,
@@ -662,10 +871,19 @@ def translate_ko_cmd(
 def korean_script_cmd(
     project: Path = typer.Option(..., "--project", "-p"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    only_segments: str | None = typer.Option(
+        None,
+        "--only-segments",
+        help="Comma- or whitespace-separated segment IDs to script, e.g. seg_0001,seg_0020.",
+    ),
 ) -> None:
     """Build Korean TTS script metadata from completed translate-ko output."""
     try:
-        korean_script_step(project.expanduser().resolve(), confirm_rights=confirm_rights)
+        korean_script_step(
+            project.expanduser().resolve(),
+            confirm_rights=confirm_rights,
+            only_segment_ids=_parse_only_segment_ids(only_segments),
+        )
     except Exception as exc:
         _handle_error(exc)
     console.print("Korean script complete.")
@@ -679,7 +897,14 @@ def script_cmd(
 ) -> None:
     """Generate Japanese ASMR script metadata and normalize TTS text."""
     try:
-        script_step(project.expanduser().resolve(), gemma_backend, confirm_rights=confirm_rights)
+        _run_cli_stage(
+            "script",
+            _backend_may_use_gpu(gemma_backend),
+            script_step,
+            project.expanduser().resolve(),
+            gemma_backend,
+            confirm_rights=confirm_rights,
+        )
     except Exception as exc:
         _handle_error(exc)
     console.print("Script generation complete.")
@@ -723,7 +948,74 @@ def synth(
 ) -> None:
     """Generate TTS candidates per segment."""
     try:
-        synth_step(
+        _run_cli_stage(
+            "synth",
+            not mock,
+            synth_step,
+            project.expanduser().resolve(),
+            gsv_url,
+            refs,
+            mock=mock,
+            confirm_rights=confirm_rights,
+            gpt_weights_path=gpt_weights,
+            sovits_weights_path=sovits_weights,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+            retry_failed=retry_failed,
+            force=force,
+            render_countdowns=False,
+            only_segment_ids=_parse_only_segment_ids(only_segments),
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print("Synthesis complete.")
+
+
+@app.command(name="countdown-synth")
+def countdown_synth(
+    project: Path = typer.Option(..., "--project", "-p"),
+    gsv_url: str | None = typer.Option(None, "--gsv-url"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    mock: bool = typer.Option(False, "--mock", help="Generate deterministic synthetic countdown WAV files."),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
+    sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
+    auto_gsv_server: bool = typer.Option(
+        False,
+        "--auto-gsv-server/--no-auto-gsv-server",
+        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already HTTP-ready.",
+    ),
+    gsv_server_command: str | None = typer.Option(
+        None,
+        "--gsv-server-command",
+        help="Shell-style command used when --auto-gsv-server needs to start api_v2.",
+    ),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Retry countdown segments already marked failed when script metadata exists.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Discard existing countdown TTS metadata and regenerate selected countdown segments.",
+    ),
+    only_segments: str | None = typer.Option(
+        None,
+        "--only-segments",
+        help="Comma- or whitespace-separated segment IDs to synthesize, e.g. seg_0001,seg_0020.",
+    ),
+) -> None:
+    """Generate only countdown TTS tokens and assemble countdown segment audio."""
+    try:
+        _run_cli_stage(
+            "countdown-synth",
+            not mock,
+            countdown_synth_step,
             project.expanduser().resolve(),
             gsv_url,
             refs,
@@ -742,7 +1034,7 @@ def synth(
         _handle_error(exc)
     except Exception as exc:
         _handle_error(exc)
-    console.print("Synthesis complete.")
+    console.print("Countdown synthesis complete.")
 
 
 @app.command(name="synth-qwen")
@@ -791,7 +1083,10 @@ def synth_qwen(
 ) -> None:
     """Generate Qwen TTS candidates from an existing scripted manifest."""
     try:
-        manifest = synth_qwen_step(
+        manifest = _run_cli_stage(
+            "synth-qwen",
+            True,
+            synth_qwen_step,
             project.expanduser().resolve(),
             refs,
             confirm_rights=confirm_rights,
@@ -933,7 +1228,10 @@ def regenerate(
 ) -> None:
     """Regenerate QC-flagged segments, then rerun RVC and QC before mix."""
     try:
-        manifest = regenerate_needs_step(
+        manifest = _run_cli_stage(
+            "regenerate",
+            _backend_may_use_gpu(tts_backend) or _backend_may_use_gpu(gemma_backend),
+            regenerate_needs_step,
             project.expanduser().resolve(),
             refs_path=refs,
             confirm_rights=confirm_rights,
@@ -966,7 +1264,14 @@ def train_rvc(
 ) -> None:
     """Train the required RVC voice model from source-derived segment audio."""
     try:
-        manifest = rvc_train_step(project.expanduser().resolve(), confirm_rights=confirm_rights, force=force)
+        manifest = _run_cli_stage(
+            "train-rvc",
+            True,
+            rvc_train_step,
+            project.expanduser().resolve(),
+            confirm_rights=confirm_rights,
+            force=force,
+        )
     except RightsError as exc:
         _handle_error(exc)
     except Exception as exc:
@@ -999,10 +1304,34 @@ def rvc(
     project: Path = typer.Option(..., "--project", "-p"),
     confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
     force: bool = typer.Option(False, "--force", help="Re-run RVC even if candidate outputs exist."),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Retry only segments currently marked failed when selected TTS audio exists.",
+    ),
+    retry: str | None = typer.Option(
+        None,
+        "--retry",
+        help="Retry mode alias. Currently supports: failed.",
+    ),
 ) -> None:
     """Run mandatory RVC timbre correction on selected TTS outputs."""
     try:
-        manifest = rvc_step(project.expanduser().resolve(), confirm_rights=confirm_rights, force=force)
+        retry_failed_mode = retry_failed
+        if retry is not None:
+            retry_mode = retry.strip().lower().replace("_", "-")
+            if retry_mode != "failed":
+                raise ValueError("--retry currently supports only 'failed'.")
+            retry_failed_mode = True
+        manifest = _run_cli_stage(
+            "rvc",
+            True,
+            rvc_step,
+            project.expanduser().resolve(),
+            confirm_rights=confirm_rights,
+            force=force,
+            retry_failed=retry_failed_mode,
+        )
     except RightsError as exc:
         _handle_error(exc)
     except Exception as exc:
@@ -1048,7 +1377,10 @@ def voice_bank_build(
         project_dir = project.expanduser().resolve()
         _apply_personal_voice_bank_defaults(project_dir)
         backend = "mock" if mock else diarization_backend or "pyannote"
-        bank = build_voice_bank(
+        bank = _run_cli_stage(
+            "voice-bank-build",
+            not mock,
+            build_voice_bank,
             [path.expanduser().resolve() for path in inputs],
             project_dir,
             confirm_rights=confirm_rights,
@@ -1092,7 +1424,10 @@ def voice_bank_build_audio(
             raise ValueError(f"No supported audio/video files found in {audio_dir}.")
         backend = "mock" if mock else diarization_backend or "pyannote"
         console.print(f"[cyan]voice-bank[/cyan] discovered {len(inputs)} file(s) in {audio_dir}")
-        bank = build_voice_bank(
+        bank = _run_cli_stage(
+            "voice-bank-build-audio",
+            not mock,
+            build_voice_bank,
             inputs,
             project_dir,
             confirm_rights=confirm_rights,
@@ -1121,7 +1456,10 @@ def train_gsv(
 ) -> None:
     """Prepare source-derived data and fine-tune GPT-SoVITS weights."""
     try:
-        manifest = gsv_few_shot_step(
+        manifest = _run_cli_stage(
+            "train-gsv",
+            True,
+            gsv_few_shot_step,
             project.expanduser().resolve(),
             confirm_rights=confirm_rights,
             force=force,
@@ -1149,7 +1487,10 @@ def source_speakers(
 ) -> None:
     """Assign project-local speaker IDs from source diarization."""
     try:
-        manifest = source_speakers_step(
+        manifest = _run_cli_stage(
+            "source-speakers",
+            _backend_may_use_gpu(backend),
+            source_speakers_step,
             project.expanduser().resolve(),
             backend_kind=backend,
             confirm_rights=confirm_rights,
@@ -1170,7 +1511,14 @@ def qc(
 ) -> None:
     """Run audio and Gemma-style QC."""
     try:
-        qc_step(project.expanduser().resolve(), gemma_backend, confirm_rights=confirm_rights)
+        _run_cli_stage(
+            "qc",
+            _backend_may_use_gpu(gemma_backend),
+            qc_step,
+            project.expanduser().resolve(),
+            gemma_backend,
+            confirm_rights=confirm_rights,
+        )
     except Exception as exc:
         _handle_error(exc)
     console.print("QC complete.")
@@ -1236,14 +1584,19 @@ def run(
         help="Shell-style command used when --auto-gsv-server needs to start api_v2.",
     ),
     few_shot: bool = typer.Option(
-        True,
+        False,
         "--few-shot/--zero-shot",
-        help="Fine-tune GPT-SoVITS from source segments before real synthesis.",
+        help="Fine-tune GPT-SoVITS from source segments before synthesis. Default is zero-shot.",
     ),
     gsv_few_shot_force: bool = typer.Option(
         False,
         "--force-few-shot",
         help="Re-run GPT-SoVITS few-shot training even when cached weights match.",
+    ),
+    rvc_train_force: bool = typer.Option(
+        False,
+        "--force-rvc-train",
+        help="Re-run RVC training even when model artifacts exist.",
     ),
     voice_bank: Path | None = typer.Option(
         None,
@@ -1278,6 +1631,7 @@ def run(
             use_trained_gpt=use_trained_gpt if not mock else False,
             few_shot=few_shot if not mock else False,
             gsv_few_shot_force=gsv_few_shot_force,
+            rvc_train_force=rvc_train_force,
             voice_bank_path=voice_bank,
             require_voice_bank=require_voice_bank,
             merge_input_parts=merge_parts,
@@ -1371,12 +1725,17 @@ def full(
     few_shot: bool = typer.Option(
         True,
         "--few-shot/--zero-shot",
-        help="Fine-tune GPT-SoVITS from source segments when --real is set.",
+        help="Fine-tune GPT-SoVITS from source segments when --real is set. Use --zero-shot to opt out.",
     ),
     gsv_few_shot_force: bool = typer.Option(
         True,
         "--force-few-shot/--reuse-few-shot",
         help="Re-run GPT-SoVITS few-shot training for maximum quality, or reuse cached weights.",
+    ),
+    rvc_train_force: bool = typer.Option(
+        True,
+        "--force-rvc-train/--reuse-rvc-train",
+        help="Re-run RVC training for maximum quality, or reuse existing model artifacts.",
     ),
     cache_status: bool = typer.Option(True, "--cache-status/--no-cache-status"),
     source_separation_cache: Path | None = typer.Option(
@@ -1413,7 +1772,7 @@ def full(
         for line in cache_lines:
             console.print(f"[dim]{line}[/dim]")
     if real:
-        _apply_full_real_quality_preset(project_dir, target_language, input_path)
+        _apply_full_real_quality_preset(project_dir, target_language, input_path, few_shot=few_shot)
         console.print("[dim]Applied full --real high-quality preset to pipeline.yaml[/dim]")
     source_separation_cache_project = None
     if reuse_source_separation_cache:
@@ -1448,6 +1807,7 @@ def full(
             use_trained_gpt=use_trained_gpt if real else False,
             few_shot=few_shot if real else False,
             gsv_few_shot_force=gsv_few_shot_force,
+            rvc_train_force=rvc_train_force if real else False,
             voice_bank_path=voice_bank,
             require_voice_bank=require_voice_bank,
             source_separation_cache_project=source_separation_cache_project,
@@ -1458,6 +1818,273 @@ def full(
         _handle_error(exc)
     console.print(f"Pipeline complete: {manifest.artifacts.get('export')}")
     console.print(f"Project: {project_dir}")
+
+
+@app.command(name="full-audio-batch")
+def full_audio_batch(
+    audio_dir: Path = typer.Option(
+        Path("audio"),
+        "--audio-dir",
+        help="Directory whose immediate subfolders are treated as works.",
+    ),
+    batch_dir: Path | None = typer.Option(
+        None,
+        "--batch-dir",
+        "-o",
+        help="Batch result directory. Defaults to runs/<timestamp>_audio_full_real_batch.",
+    ),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    gemma_backend: str = typer.Option(
+        "llama_cpp",
+        "--gemma-backend",
+        help="hf|http|llama_cpp.",
+    ),
+    asr_backend: str | None = typer.Option(
+        None,
+        "--asr-backend",
+        help="Override ASR backend for the transcribe stage: faster_whisper|qwen_asr|mock.",
+    ),
+    asr_preset: str | None = typer.Option(
+        None,
+        "--asr-preset",
+        help="Runtime ASR preset for the transcribe stage: default|conservative|whisper|no_vad_repair.",
+    ),
+    asr_vad_off: bool = typer.Option(
+        False,
+        "--asr-vad-off",
+        help="Disable VAD for the main ASR pass.",
+    ),
+    asr_diagnostics: bool | None = typer.Option(
+        None,
+        "--asr-diagnostics/--no-asr-diagnostics",
+        help="Write unified ASR diagnostics artifacts during each full run.",
+    ),
+    asr_device: str | None = typer.Option(
+        None,
+        "--asr-device",
+        help="Override faster-whisper device, e.g. auto|cuda|cpu.",
+    ),
+    asr_compute_type: str | None = typer.Option(
+        None,
+        "--asr-compute-type",
+        help="Override faster-whisper compute type.",
+    ),
+    asr_batched: bool | None = typer.Option(
+        None,
+        "--asr-batched/--no-asr-batched",
+        help="Use faster-whisper BatchedInferencePipeline.",
+    ),
+    asr_batch_size: int | None = typer.Option(
+        None,
+        "--asr-batch-size",
+        help="Batch size for faster-whisper batched inference.",
+    ),
+    target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
+    gsv_url: str | None = typer.Option(None, "--gsv-url"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
+    sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
+    auto_gsv_server: bool = typer.Option(
+        True,
+        "--auto-gsv-server/--no-auto-gsv-server",
+        help="Start a local GPT-SoVITS api_v2 server if gsv_url is not already HTTP-ready.",
+    ),
+    gsv_server_command: str | None = typer.Option(
+        None,
+        "--gsv-server-command",
+        help="Shell-style command used when --auto-gsv-server needs to start api_v2.",
+    ),
+    few_shot: bool = typer.Option(
+        True,
+        "--few-shot/--zero-shot",
+        help="Fine-tune GPT-SoVITS from source segments. Use --zero-shot to opt out.",
+    ),
+    gsv_few_shot_force: bool = typer.Option(
+        True,
+        "--force-few-shot/--reuse-few-shot",
+        help="Re-run GPT-SoVITS few-shot training for maximum quality, or reuse cached weights.",
+    ),
+    rvc_train_force: bool = typer.Option(
+        True,
+        "--force-rvc-train/--reuse-rvc-train",
+        help="Re-run RVC training for maximum quality, or reuse existing model artifacts.",
+    ),
+    cache_status: bool = typer.Option(True, "--cache-status/--no-cache-status"),
+    source_separation_cache: Path | None = typer.Option(
+        None,
+        "--source-separation-cache",
+        help=(
+            "Voice-bank project to reuse cached source-separated stems from. "
+            "Defaults to runs/voice_bank_all when it exists."
+        ),
+    ),
+    reuse_source_separation_cache: bool = typer.Option(
+        True,
+        "--reuse-source-separation-cache/--no-source-separation-cache",
+        help="Import matching voice-bank source separation stems before running Demucs.",
+    ),
+    voice_bank: Path | None = typer.Option(
+        None,
+        "--voice-bank",
+        help="Voice bank manifest path. Defaults to project voice_bank/voice_bank_manifest.json when required.",
+    ),
+    require_voice_bank: bool = typer.Option(
+        False,
+        "--require-voice-bank",
+        help="Require speaker assignment and per-speaker SoVITS/RVC models before synthesis.",
+    ),
+) -> None:
+    """Run full --real for every work folder under ./audio and keep only final/review outputs."""
+    if not confirm_rights:
+        _handle_error(RightsError(RIGHTS_MESSAGE))
+    try:
+        inputs = _discover_audio_work_dirs(audio_dir)
+        if not inputs:
+            raise ValueError(f"No supported work folders found in {audio_dir}.")
+    except Exception as exc:
+        _handle_error(exc)
+
+    batch_root = batch_dir.expanduser().resolve() if batch_dir else _default_full_audio_batch_dir()
+    batch_root.mkdir(parents=True, exist_ok=True)
+    cache_lines = _configure_local_model_cache()
+    if cache_status:
+        for line in cache_lines:
+            console.print(f"[dim]{line}[/dim]")
+
+    source_separation_cache_project = None
+    if reuse_source_separation_cache:
+        if source_separation_cache is not None:
+            source_separation_cache_project = source_separation_cache.expanduser().resolve()
+        else:
+            default_cache_project = _default_voice_bank_project_dir()
+            if default_cache_project.exists():
+                source_separation_cache_project = default_cache_project.resolve()
+
+    items: list[dict[str, object]] = []
+    summary: dict[str, object] = {
+        "audio_dir": str(audio_dir.expanduser().resolve()),
+        "batch_dir": str(batch_root),
+        "started_at": datetime.now(UTC).isoformat(),
+        "items": items,
+    }
+
+    def write_summary() -> None:
+        summary["updated_at"] = datetime.now(UTC).isoformat()
+        write_json_atomic(batch_root / "batch_summary.json", summary)
+
+    console.print(f"[cyan]full-audio-batch[/cyan] discovered {len(inputs)} work folder(s).")
+    failed_count = 0
+    for index, input_path in enumerate(inputs, start=1):
+        run_name = f"{index:03d}_{_safe_run_name(input_path)}"
+        project_dir = batch_root / "_projects" / run_name
+        item: dict[str, object] = {
+            "index": index,
+            "input": str(input_path),
+            "run_name": run_name,
+            "project": str(project_dir),
+            "started_at": datetime.now(UTC).isoformat(),
+        }
+        items.append(item)
+        console.print(f"[cyan]full-audio-batch[/cyan] {index}/{len(inputs)} {input_path.name}")
+        try:
+            _apply_full_real_quality_preset(project_dir, target_language, input_path, few_shot=few_shot)
+            manifest = run_pipeline(
+                input_path,
+                project_dir,
+                confirm_rights=confirm_rights,
+                mock=False,
+                gemma_backend=gemma_backend,
+                asr_backend=asr_backend,
+                asr_preset=asr_preset,
+                asr_vad_off=True if asr_vad_off else None,
+                asr_diagnostics=asr_diagnostics,
+                asr_device=asr_device,
+                asr_compute_type=asr_compute_type,
+                asr_batched_inference=asr_batched,
+                asr_batch_size=asr_batch_size,
+                target_language=target_language,
+                gsv_url=gsv_url,
+                refs_path=refs,
+                gpt_weights_path=gpt_weights,
+                sovits_weights_path=sovits_weights,
+                auto_gsv_server=auto_gsv_server,
+                gsv_server_command=gsv_server_command,
+                use_trained_gpt=use_trained_gpt,
+                few_shot=few_shot,
+                gsv_few_shot_force=gsv_few_shot_force,
+                rvc_train_force=rvc_train_force,
+                voice_bank_path=voice_bank,
+                require_voice_bank=require_voice_bank,
+                source_separation_cache_project=source_separation_cache_project,
+                regenerate_before_mix=True,
+                merge_input_parts=False,
+            )
+            manual_review_count = sum(
+                1 for segment in manifest.segments if segment.status == "needs_manual_review"
+            )
+            if manual_review_count:
+                review_dir = batch_root / "needs_manual_review" / run_name
+                copied = _copy_manual_review_bundle(
+                    input_path=input_path,
+                    project_dir=project_dir,
+                    review_dir=review_dir,
+                    manifest=manifest,
+                )
+                item.update(
+                    {
+                        "status": "needs_manual_review",
+                        "manual_review_count": manual_review_count,
+                        "result_dir": str(review_dir),
+                        "copied_files": copied,
+                        "completed_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                console.print(
+                    f"[yellow]needs_manual_review[/yellow] {input_path.name}: "
+                    f"{manual_review_count} segment(s). Kept {review_dir}"
+                )
+            else:
+                result_dir = batch_root / "completed" / run_name
+                copied = _copy_export_result(manifest.artifacts.get("export"), result_dir)
+                item.update(
+                    {
+                        "status": "completed",
+                        "result_dir": str(result_dir),
+                        "copied_files": copied,
+                        "completed_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                console.print(f"[green]completed[/green] {input_path.name}: kept {result_dir}")
+        except Exception as exc:
+            failed_count += 1
+            failure_dir = batch_root / "failed" / run_name
+            failure_dir.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(
+                failure_dir / "error.json",
+                {
+                    "input": str(input_path),
+                    "project": str(project_dir),
+                    "error": str(exc),
+                    "failed_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            item.update(
+                {
+                    "status": "failed",
+                    "result_dir": str(failure_dir),
+                    "error": str(exc),
+                    "completed_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            console.print(f"[red]failed[/red] {input_path.name}: {exc}")
+        finally:
+            _remove_tree(project_dir)
+            write_summary()
+
+    console.print(f"Batch summary: {batch_root / 'batch_summary.json'}")
+    if failed_count:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

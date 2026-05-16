@@ -22,7 +22,7 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
     for index, segment in enumerate(manifest.segments, start=1):
         if only_segment_ids is not None and segment.id not in only_segment_ids:
             continue
-        if segment.status in {"needs_manual_review", "failed"}:
+        if segment.status in SKIP_STATUSES:
             last_logged_at = _log_segment_progress(
                 "qc", index, total, segment, manifest, started_at, last_logged_at
             )

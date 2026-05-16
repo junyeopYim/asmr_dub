@@ -151,6 +151,7 @@ text_replacements:
   尾薬: 媚薬
   女体科: 女体化
   生還体: 性感帯
+  静観体: 性感帯
   君の志士: 君の四肢
   君の獅子: 君の四肢
   エネルギー速化しています: エネルギー不足しています
@@ -378,6 +379,9 @@ review_suspicious_text_patterns:
   - 絶叫系悪夢女優
   - 助走
   - 口岸
+  - 生体コアの高校
+  - 高校に放出
+  - 静観体
   - 気筒
   - 処生
   - フェラチを
@@ -537,6 +541,9 @@ review_candidate_replacements:
   ネイジー: イメージ
   シャクラ: さくら
   ツアメ: ザーメン
+  生体コアの高校: 生体コアの口腔
+  高校に放出: 口腔に放出
+  静観体: 性感帯
   インラン: 淫乱
   おじさまのツアー: おじさまのザーメン
   先走り駅: 先走り液
@@ -603,6 +610,18 @@ review_candidate_replacements:
   なめ打ち: 波打ち
   精素ぶって: 清楚ぶって
   清掃ぶって: 清楚ぶって
+review_auto_resolution_rules:
+  - id: koukou_to_oral_release
+    source: 高校に放出
+    target: 口腔に放出
+    required_all:
+      - 生体コア
+      - ザーメン
+    negative_any:
+      - 高校生
+      - 学校
+      - 授業
+      - 校舎
 translation_backcheck_source_patterns:
   - 釣りが来
   - 手帳

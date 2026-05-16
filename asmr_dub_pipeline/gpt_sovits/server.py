@@ -162,7 +162,7 @@ def _default_gsv_command(base_url: str) -> list[str]:
         return []
     command = [_default_gsv_python(), str(api_path), "-a", host, "-p", str(port)]
     _repair_pretrained_model_links(api_path.parent)
-    config_path = _local_tts_config(api_path.parent) or api_path.parent / "GPT_SoVITS/configs/tts_infer.yaml"
+    config_path = _local_tts_config(api_path.parent, port=port) or api_path.parent / "GPT_SoVITS/configs/tts_infer.yaml"
     if config_path.exists():
         command.extend(["-c", str(config_path)])
     return command
@@ -193,7 +193,7 @@ def _repair_pretrained_model_links(install_dir: Path) -> None:
             target_path.symlink_to(source_path.resolve())
 
 
-def _local_tts_config(install_dir: Path) -> Path | None:
+def _local_tts_config(install_dir: Path, *, port: int | None = None) -> Path | None:
     pretrained = REPO_ROOT / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models"
     required = {
         "t2s_weights_path": pretrained / "s1v3.ckpt",
@@ -203,7 +203,8 @@ def _local_tts_config(install_dir: Path) -> Path | None:
     }
     if not all(path.exists() for path in required.values()):
         return None
-    config_path = REPO_ROOT / ".cache" / "gpt_sovits" / "tts_infer.local.yaml"
+    config_name = "tts_infer.local.yaml" if port is None else f"tts_infer.local.{port}.yaml"
+    config_path = REPO_ROOT / ".cache" / "gpt_sovits" / config_name
     custom = {
         "device": "cuda",
         "is_half": True,
@@ -212,7 +213,16 @@ def _local_tts_config(install_dir: Path) -> Path | None:
     }
     payload = {"custom": custom}
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=True), "utf-8")
+    tmp_path = config_path.with_name(f"{config_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(
+            yaml.safe_dump(payload, allow_unicode=True, sort_keys=True),
+            "utf-8",
+        )
+        os.replace(tmp_path, config_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
     return config_path
 
 
@@ -430,12 +440,11 @@ class ManagedGPTSoVITSServer:
         if self.process is None:
             self._close_log()
             return
-        if self.process.poll() is None:
-            terminate_process_group(
-                self.process,
-                terminate_timeout_sec=self.shutdown_timeout_sec,
-                kill_timeout_sec=5,
-            )
+        terminate_process_group(
+            self.process,
+            terminate_timeout_sec=self.shutdown_timeout_sec,
+            kill_timeout_sec=5,
+        )
         self._close_log()
 
     def _close_log(self) -> None:

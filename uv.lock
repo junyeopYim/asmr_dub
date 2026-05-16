@@ -226,6 +226,7 @@ dependencies = [
     { name = "numpy" },
     { name = "opencc" },
     { name = "pydantic" },
+    { name = "pyopenjtalk" },
     { name = "pypinyin" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -282,6 +283,7 @@ requires-dist = [
     { name = "opencc", specifier = ">=1.3.0" },
     { name = "pyannote-audio", marker = "extra == 'diarization'", specifier = ">=4,<5" },
     { name = "pydantic", specifier = ">=2" },
+    { name = "pyopenjtalk", specifier = ">=0.4.1" },
     { name = "pypinyin", specifier = ">=0.55.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
@@ -3596,6 +3598,16 @@ sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
 ]
+
+[[package]]
+name = "pyopenjtalk"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/58/74/ccd31c696f047ba381f9b11a504bf1199756c3f30f3de64e3eeb83e10b4a/pyopenjtalk-0.4.1.tar.gz", hash = "sha256:d5ada46f7fc2b52c1c79c273eb9668ff6ad7ab276a8db9d8be119ef93440f0dc", size = 1397999, upload-time = "2025-04-08T06:27:46.528Z" }
 
 [[package]]
 name = "pyparsing"

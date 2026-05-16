@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from asmr_dub_pipeline.script.normalizer import normalize_japanese_kana_text
+
 from .schemas import GPTSoVITSRef
 
 
@@ -36,6 +38,31 @@ def _resolve_ref_audio_path(project_root: Path, style: str, raw_path: str, field
     return str(resolved)
 
 
+def _canonical_language(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"ja", "jp", "jpn", "japanese"}:
+        return "ja"
+    if normalized in {"ko", "kr", "kor", "korean"}:
+        return "ko"
+    return normalized
+
+
+def _normalize_ref_prompt_text(_style: str, ref: GPTSoVITSRef) -> GPTSoVITSRef:
+    if _canonical_language(ref.prompt_lang) != "ja":
+        return ref
+    normalized = normalize_japanese_kana_text(ref.prompt_text)
+    return ref.model_copy(
+        update={
+            "prompt_text": normalized.text,
+            "prompt_text_original": ref.prompt_text_original or normalized.original_text,
+            "text_normalization": {
+                "policy": "ja_hiragana",
+                "risk_flags": normalized.risk_flags,
+            },
+        }
+    )
+
+
 def load_refs(path: Path, project_dir: Path | None = None) -> dict[str, GPTSoVITSRef]:
     actual = resolve_refs_json_path(path, project_dir)
     data = json.loads(actual.read_text("utf-8"))
@@ -54,6 +81,7 @@ def load_refs(path: Path, project_dir: Path | None = None) -> dict[str, GPTSoVIT
                     ],
                 }
             )
+    refs = {key: _normalize_ref_prompt_text(key, ref) for key, ref in refs.items()}
     return refs
 
 

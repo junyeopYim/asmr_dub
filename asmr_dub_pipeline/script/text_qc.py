@@ -84,6 +84,16 @@ def has_suspicious_truncated_sentence(text: str) -> bool:
     return bool(re.search(r"(?:그리고|그런데|하지만|또는|혹은|말고|다음)$", last_clause))
 
 
+def repair_suspicious_truncated_korean_tts_text(text: str) -> tuple[str, bool]:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized or not has_suspicious_truncated_sentence(normalized):
+        return text.strip(), False
+    repaired = normalized.rstrip(" ,，、")
+    if not repaired:
+        return text.strip(), False
+    return f"{repaired}...", True
+
+
 def hangul_ratio(text: str) -> float:
     speech_chars = [char for char in text if not char.isspace() and not char.isdigit()]
     if not speech_chars:

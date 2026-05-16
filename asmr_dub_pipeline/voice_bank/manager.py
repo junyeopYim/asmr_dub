@@ -21,12 +21,16 @@ import yaml
 from asmr_dub_pipeline.asr import create_asr_backend, map_chunks_to_segments
 from asmr_dub_pipeline.audio import ffmpeg
 from asmr_dub_pipeline.audio.features import (
+    AudioProcessingError,
     duration_sec,
     ensure_stereo,
     load_audio,
+    peak_dbfs,
     resample_linear,
+    rms_dbfs,
     write_audio,
 )
+from asmr_dub_pipeline.audio.preprocess import folder_asr_part_skip_reason
 from asmr_dub_pipeline.audio.quality import measure_source_voice_quality
 from asmr_dub_pipeline.audio.separation import SourceSeparationUnavailable, separate_source_audio
 from asmr_dub_pipeline.audio.training_filter import evaluate_voice_training_candidate
@@ -59,6 +63,7 @@ from asmr_dub_pipeline.schemas import (
     VoiceBankSpeaker,
     validate_file_safe_id,
 )
+from asmr_dub_pipeline.script.normalizer import normalize_japanese_kana_text
 
 
 class VoiceBankError(RuntimeError):
@@ -69,11 +74,56 @@ _MIN_EMBEDDING_AUDIO_SEC = 0.05
 _MIN_EMBEDDING_CROP_SEC = 0.50
 _SOURCE_SPEAKER_MIN_OVERLAP_RATIO = 0.50
 _SOURCE_SPEAKER_MULTI_OVERLAP_RATIO = 0.20
+_SOURCE_SPEAKER_BORDERLINE_OVERLAP_RATIO = 0.45
+_SOURCE_SPEAKER_CONTEXT_OVERLAP_RATIO = 0.30
+_SOURCE_SPEAKER_CONTEXT_MAX_GAP_SEC = 3.0
+_SOURCE_SPEAKER_NEIGHBOR_MAX_SEGMENT_SEC = 12.0
+_SOURCE_SPEAKER_SHORT_TEXTURE_MAX_SEC = 1.2
 _SOURCE_DIARIZATION_CACHE_VERSION = 2
 _SOURCE_EFFECT_AUGMENTED_MAX_SEGMENTS_PER_SPEAKER = 2
 _SOURCE_EFFECT_AUGMENTED_MIN_MATCH_THRESHOLD = 0.60
 _SOURCE_EFFECT_AUGMENTED_PROFILES = ("sfx_center", "sfx_left", "sfx_right", "echo")
 _SOURCE_DISTINCT_MINOR_MAX_CENTROID_SIMILARITY = 0.35
+_SOURCE_DIARIZATION_SILENT_RMS_DBFS = -85.0
+_SOURCE_DIARIZATION_SILENT_PEAK_DBFS = -75.0
+_SOURCE_SPEAKER_SKIP_STATUSES = {
+    "absorbed",
+    "failed",
+    "needs_manual_review",
+    "no_speech_detected",
+    "non_speech_texture",
+}
+_SOURCE_SPEAKER_SHORT_TEXTURE_TOKENS = frozenset(
+    (
+        "あ",
+        "あー",
+        "ああ",
+        "あっ",
+        "あれ",
+        "え",
+        "えー",
+        "ええ",
+        "えっ",
+        "うふ",
+        "うふふ",
+        "ふふ",
+        "ふふふ",
+        "ん",
+        "んー",
+        "んふ",
+        "んふふ",
+        "はぁ",
+        "はあ",
+        "へへ",
+        "ほ",
+        "ほら",
+        "まあ",
+        "ね",
+        "ねえ",
+        "そう",
+        "そうそう",
+    )
+)
 _MISSING = object()
 _T = TypeVar("_T")
 
@@ -107,6 +157,7 @@ class SourceDiarizationPart:
     end: float
     clip_path: Path
     cache_path: Path
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -754,6 +805,19 @@ def assign_source_speakers_to_manifest(
         turns = [turn for result in part_results for turn in result.turns]
         cache_status = _combined_cache_status([result.cache_status for result in part_results])
         cache_path = project_dir / "work" / "diarization" / "source_parts"
+        skipped_silent_parts = sum(1 for result in part_results if result.cache_status == "skipped_silent")
+        skipped_effect_only_parts = sum(
+            1 for result in part_results if result.cache_status == "skipped_effect_only"
+        )
+        skipped_no_diarization_parts = sum(
+            1 for result in part_results if result.cache_status == "skipped_no_diarization"
+        )
+        skipped_asr_silenced_parts = sum(
+            1 for result in part_results if result.cache_status == "skipped_asr_silenced"
+        )
+        skipped_part_count = sum(
+            1 for result in part_results if result.cache_status.startswith("skipped_")
+        )
     else:
         cache_path = _source_diarization_cache_path(project_dir)
         cache_signature = _source_diarization_cache_signature(
@@ -768,11 +832,16 @@ def assign_source_speakers_to_manifest(
             backend = _create_source_diarization_backend(backend_kind, cfg)
             turns = _diarize_source_audio(backend, audio_path, cfg)
             _write_source_diarization_cache(cache_path, cache_signature, turns)
+        skipped_silent_parts = 0
+        skipped_effect_only_parts = 0
+        skipped_no_diarization_parts = 0
+        skipped_asr_silenced_parts = 0
+        skipped_part_count = 0
     _cluster_source_turns(turns, threshold=cfg.diarization_embedding_match_threshold)
     assigned = 0
     excluded = 0
     for segment in manifest.segments:
-        if segment.status in {"failed", "needs_manual_review"}:
+        if segment.status in _SOURCE_SPEAKER_SKIP_STATUSES:
             continue
         assignment = _source_speaker_assignment(segment, turns)
         segment.analysis["speaker_count"] = assignment["speaker_count"]
@@ -780,11 +849,16 @@ def assign_source_speakers_to_manifest(
         if assignment["speaker_count"] == 1 and assignment["speaker_id"]:
             segment.speaker_id = str(assignment["speaker_id"])
             assigned += 1
+            training_exclusion_reason = _source_speaker_training_exclusion_reason(segment, cfg)
             voice_training = dict(segment.analysis.get("voice_training") or {})
-            if voice_training.get("reason") in {
+            if training_exclusion_reason:
+                voice_training["exclude"] = True
+                voice_training["reason"] = training_exclusion_reason
+            elif voice_training.get("reason") in {
                 "multi_speaker_overlap",
                 "no_source_speaker_match",
                 "minor_bucket_auto_merged",
+                "low_dominant_source_speaker_overlap",
             }:
                 voice_training.pop("exclude", None)
                 voice_training.pop("reason", None)
@@ -813,10 +887,15 @@ def assign_source_speakers_to_manifest(
         turns,
         embedding_backend_factory=embedding_backend_factory,
     )
+    speaker_routing = _resolve_source_speaker_null_segments(manifest, bucket_normalization)
     manifest.artifacts["source_speaker_audio"] = str(audio_path)
     bucket_qc_path = project_dir / "work" / "diarization" / "source_speaker_bucket_qc.json"
     write_json_atomic(bucket_qc_path, bucket_normalization)
     manifest.artifacts["source_speaker_bucket_qc"] = str(bucket_qc_path)
+    training_qc = _source_speaker_training_qc_payload(project_dir, manifest, cfg)
+    training_qc_path = project_dir / "work" / "diarization" / "source_speaker_training_qc.json"
+    write_json_atomic(training_qc_path, training_qc)
+    manifest.artifacts["source_speaker_training_qc"] = str(training_qc_path)
     manifest.stage_state["source-speakers"] = {
         "status": "completed",
         "backend": backend_kind,
@@ -824,10 +903,19 @@ def assign_source_speakers_to_manifest(
         "diarization_cache_path": str(cache_path),
         "parallel_jobs": normalized_jobs,
         "parallel_tracks": len(part_specs),
+        "skipped_part_count": skipped_part_count,
+        "skipped_silent_parts": skipped_silent_parts,
+        "skipped_effect_only_parts": skipped_effect_only_parts,
+        "skipped_asr_silenced_parts": skipped_asr_silenced_parts,
+        "skipped_no_diarization_parts": skipped_no_diarization_parts,
         "turn_count": len(turns),
         "assigned_segments": assigned,
         "excluded_segments": excluded,
         "bucket_normalization": bucket_normalization["summary"],
+        "speaker_routing": speaker_routing,
+        "training_eligible_counts": training_qc["summary"]["training_eligible_counts"],
+        "training_excluded_counts": training_qc["summary"]["training_excluded_counts"],
+        "possible_overlap_counts": training_qc["summary"]["possible_overlap_counts"],
     }
     return manifest
 
@@ -930,6 +1018,7 @@ def _source_diarization_part_specs(
         if part_index in seen_indices:
             part_index = fallback_index
         seen_indices.add(part_index)
+        skip_reason = _source_diarization_part_skip_reason(raw_part)
         part_dir = ensure_inside_project(project_dir, project_dir / "work" / "diarization" / "source_parts")
         specs.append(
             SourceDiarizationPart(
@@ -939,9 +1028,19 @@ def _source_diarization_part_specs(
                 end=end,
                 clip_path=part_dir / f"part_{part_index:04d}.wav",
                 cache_path=part_dir / f"part_{part_index:04d}_turns.json",
+                skip_reason=skip_reason,
             )
         )
     return sorted(specs, key=lambda part: (part.start, part.part_index)) if len(specs) >= 2 else []
+
+
+def _source_diarization_part_skip_reason(raw_part: dict[str, Any]) -> str | None:
+    raw_reason = str(raw_part.get("asr_skip_reason") or "").strip()
+    path_text = str(raw_part.get("path") or raw_part.get("stem") or "")
+    detected_reason = folder_asr_part_skip_reason(path_text) if path_text else None
+    if bool(raw_part.get("asr_silenced")):
+        return raw_reason or detected_reason or "asr_silenced"
+    return detected_reason
 
 
 def _diarize_source_parts(
@@ -977,21 +1076,57 @@ def _diarize_source_parts(
             part=part,
             include_embeddings=include_embeddings,
         )
+        if part.skip_reason:
+            _write_source_diarization_cache(
+                part.cache_path,
+                signature,
+                [],
+                empty_reason=part.skip_reason,
+            )
+            return SourceDiarizationPartResult(
+                part=part,
+                turns=[],
+                cache_status=f"skipped_{part.skip_reason}",
+            )
         cached = _load_source_diarization_cache(part.cache_path, signature, part.clip_path)
         if cached is not None:
+            cache_status = "hit"
+            if not cached:
+                cache_status = _source_diarization_empty_cache_status(part.cache_path, signature) or cache_status
             return SourceDiarizationPartResult(
                 part=part,
                 turns=_offset_source_part_turns(cached, part, audio_path),
-                cache_status="hit",
+                cache_status=cache_status,
             )
         _write_source_part_audio(audio_path, part)
-        turns = _diarize_source_audio(
-            backend_for_thread(),
-            part.clip_path,
-            cfg,
-            source_id=part.source_id,
-            include_embeddings=include_embeddings,
-        )
+        if _source_diarization_part_is_silent(part.clip_path):
+            return SourceDiarizationPartResult(
+                part=part,
+                turns=[],
+                cache_status="skipped_silent",
+            )
+        try:
+            turns = _diarize_source_audio(
+                backend_for_thread(),
+                part.clip_path,
+                cfg,
+                source_id=part.source_id,
+                include_embeddings=include_embeddings,
+            )
+        except VoiceBankError as exc:
+            if _is_no_diarization_turns_error(exc):
+                _write_source_diarization_cache(
+                    part.cache_path,
+                    signature,
+                    [],
+                    empty_reason="no_diarization",
+                )
+                return SourceDiarizationPartResult(
+                    part=part,
+                    turns=[],
+                    cache_status="skipped_no_diarization",
+                )
+            raise
         _write_source_diarization_cache(part.cache_path, signature, turns)
         return SourceDiarizationPartResult(
             part=part,
@@ -1007,6 +1142,38 @@ def _diarize_source_parts(
         for future in as_completed(futures):
             results.append(future.result())
     return sorted(results, key=lambda result: (result.part.start, result.part.part_index))
+
+
+def _is_no_diarization_turns_error(exc: Exception) -> bool:
+    return "pyannote produced no diarization turns" in str(exc)
+
+
+def _source_diarization_empty_cache_status(
+    cache_path: Path,
+    signature: dict[str, Any],
+) -> str | None:
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text("utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if data.get("signature") != signature or data.get("turns") != []:
+        return None
+    reason = str(data.get("empty_reason") or "").strip()
+    if reason == "no_diarization_turns":
+        reason = "no_diarization"
+    return f"skipped_{reason}" if reason else None
+
+
+def _source_diarization_part_is_silent(audio_path: Path) -> bool:
+    try:
+        return (
+            rms_dbfs(audio_path) <= _SOURCE_DIARIZATION_SILENT_RMS_DBFS
+            and peak_dbfs(audio_path) <= _SOURCE_DIARIZATION_SILENT_PEAK_DBFS
+        )
+    except AudioProcessingError:
+        return False
 
 
 def _write_source_part_audio(audio_path: Path, part: SourceDiarizationPart) -> None:
@@ -1111,21 +1278,23 @@ def _load_source_diarization_cache(
         turns = [_source_turn_from_cache(item, audio_path) for item in raw_turns]
     except (KeyError, TypeError, ValueError):
         return None
-    return turns or None
+    return turns
 
 
 def _write_source_diarization_cache(
     cache_path: Path,
     signature: dict[str, Any],
     turns: list[DiarizationTurn],
+    *,
+    empty_reason: str | None = None,
 ) -> None:
-    write_json_atomic(
-        cache_path,
-        {
-            "signature": signature,
-            "turns": [_source_turn_to_cache(turn) for turn in turns],
-        },
-    )
+    payload: dict[str, Any] = {
+        "signature": signature,
+        "turns": [_source_turn_to_cache(turn) for turn in turns],
+    }
+    if empty_reason is not None:
+        payload["empty_reason"] = empty_reason
+    write_json_atomic(cache_path, payload)
 
 
 def _source_turn_to_cache(turn: DiarizationTurn) -> dict[str, Any]:
@@ -1194,6 +1363,363 @@ def _source_speaker_assignment(segment: Segment, turns: list[DiarizationTurn]) -
         "speaker_count": speaker_count,
         "overlaps": {key: round(value, 6) for key, value in sorted(active.items())},
         "dominant_overlap_ratio": round(ratio, 6),
+    }
+
+
+def _source_speaker_training_exclusion_reason(segment: Segment, cfg: ProjectConfig) -> str | None:
+    assignment = segment.analysis.get("source_speaker_assignment")
+    if not isinstance(assignment, dict):
+        return None
+    if int(assignment.get("speaker_count") or 0) != 1:
+        return None
+    ratio = _source_speaker_float(assignment.get("dominant_overlap_ratio"))
+    threshold = cfg.voice_bank.source_speaker_training_min_dominant_overlap_ratio
+    if ratio is None or ratio < threshold:
+        return "low_dominant_source_speaker_overlap"
+    return None
+
+
+def _source_speaker_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (float, int)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_source_speaker_null_segments(
+    manifest: PipelineManifest,
+    bucket_normalization: dict[str, Any],
+) -> dict[str, Any]:
+    merge_map = _source_speaker_merge_map(bucket_normalization)
+    routed = 0
+    textures = 0
+    keep_original = 0
+    unresolved = 0
+    reason_counts: dict[str, int] = {}
+
+    def record_reason(reason: str) -> None:
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    for index, segment in enumerate(manifest.segments):
+        if segment.status in _SOURCE_SPEAKER_SKIP_STATUSES or segment.speaker_id:
+            continue
+        assignment = segment.analysis.get("source_speaker_assignment")
+        if not isinstance(assignment, dict):
+            continue
+        speaker_count = int(assignment.get("speaker_count") or 0)
+        routed_speaker_id: str | None = None
+        reason: str | None = None
+        overlap_ratio: float | None = None
+        if speaker_count == 1:
+            candidate_id, overlap_ratio = _source_speaker_single_overlap_candidate(assignment)
+            candidate_id = _source_speaker_model_id(candidate_id, merge_map)
+            if candidate_id and overlap_ratio is not None:
+                if overlap_ratio >= _SOURCE_SPEAKER_BORDERLINE_OVERLAP_RATIO:
+                    routed_speaker_id = candidate_id
+                    reason = "borderline_single_speaker_overlap"
+                elif overlap_ratio >= _SOURCE_SPEAKER_CONTEXT_OVERLAP_RATIO:
+                    context_speaker_id = _source_speaker_neighbor_context(
+                        manifest.segments,
+                        index,
+                    )
+                    if context_speaker_id == candidate_id:
+                        routed_speaker_id = candidate_id
+                        reason = "neighbor_confirmed_single_speaker_overlap"
+                    else:
+                        routed_speaker_id = candidate_id
+                        reason = "single_speaker_overlap_tts_routing"
+                elif overlap_ratio >= _SOURCE_SPEAKER_MULTI_OVERLAP_RATIO:
+                    routed_speaker_id = candidate_id
+                    reason = "single_speaker_overlap_tts_routing"
+        elif speaker_count == 0:
+            if _source_segment_is_short_no_overlap_texture(segment):
+                _mark_source_segment_texture(segment, "source_speaker_no_overlap_short_texture")
+                textures += 1
+                record_reason("source_speaker_no_overlap_short_texture")
+                continue
+        elif speaker_count > 1:
+            routed_speaker_id, overlap_ratio, reason = _source_speaker_multi_overlap_route(
+                assignment,
+                merge_map,
+                segment.duration,
+            )
+            if not routed_speaker_id:
+                context_speaker_id = _source_speaker_neighbor_context(manifest.segments, index)
+                if context_speaker_id:
+                    routed_speaker_id = context_speaker_id
+                    reason = "neighbor_confirmed_multi_speaker_overlap"
+                else:
+                    _mark_source_segment_keep_original_overlap(segment, "multi_speaker_overlap")
+                    keep_original += 1
+                    record_reason("multi_speaker_overlap")
+                    continue
+        if routed_speaker_id and reason:
+            _route_source_segment_to_speaker(
+                segment,
+                routed_speaker_id,
+                reason=reason,
+                overlap_ratio=overlap_ratio,
+            )
+            routed += 1
+            record_reason(reason)
+
+    for index, segment in enumerate(manifest.segments):
+        if segment.status in _SOURCE_SPEAKER_SKIP_STATUSES or segment.speaker_id:
+            continue
+        assignment = segment.analysis.get("source_speaker_assignment")
+        if not isinstance(assignment, dict):
+            unresolved += 1
+            continue
+        speaker_count = int(assignment.get("speaker_count") or 0)
+        if speaker_count == 0:
+            context_speaker_id = _source_speaker_neighbor_context(
+                manifest.segments,
+                index,
+                require_close_gap=False,
+            )
+            if context_speaker_id and _source_segment_can_inherit_neighbor_speaker(segment):
+                _route_source_segment_to_speaker(
+                    segment,
+                    context_speaker_id,
+                    reason="neighbor_same_speaker_context",
+                    overlap_ratio=0.0,
+                )
+                routed += 1
+                record_reason("neighbor_same_speaker_context")
+                continue
+        unresolved += 1
+    return {
+        "routed_segments": routed,
+        "texture_segments": textures,
+        "keep_original_segments": keep_original,
+        "unresolved_segments": unresolved,
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _source_speaker_merge_map(bucket_normalization: dict[str, Any]) -> dict[str, str]:
+    merge_map: dict[str, str] = {}
+    merges = bucket_normalization.get("merges")
+    if not isinstance(merges, list):
+        return merge_map
+    for merge in merges:
+        if not isinstance(merge, dict):
+            continue
+        original = merge.get("original_speaker_id")
+        target = merge.get("merged_into_speaker_id")
+        if original and target:
+            merge_map[str(original)] = str(target)
+    return merge_map
+
+
+def _source_speaker_model_id(speaker_id: str | None, merge_map: dict[str, str]) -> str | None:
+    if not speaker_id:
+        return None
+    seen: set[str] = set()
+    current = speaker_id
+    while current in merge_map and current not in seen:
+        seen.add(current)
+        current = merge_map[current]
+    return current
+
+
+def _source_speaker_single_overlap_candidate(assignment: dict[str, Any]) -> tuple[str | None, float | None]:
+    overlaps = assignment.get("overlaps")
+    if not isinstance(overlaps, dict) or len(overlaps) != 1:
+        return None, None
+    speaker_id, overlap = next(iter(overlaps.items()))
+    try:
+        overlap_value = float(overlap)
+    except (TypeError, ValueError):
+        return str(speaker_id), None
+    ratio = assignment.get("dominant_overlap_ratio")
+    try:
+        return str(speaker_id), float(ratio)
+    except (TypeError, ValueError):
+        return str(speaker_id), overlap_value
+
+
+def _source_speaker_multi_overlap_route(
+    assignment: dict[str, Any],
+    merge_map: dict[str, str],
+    duration: float,
+) -> tuple[str | None, float | None, str | None]:
+    normalized_overlaps = _source_speaker_normalized_overlaps(assignment, merge_map)
+    if not normalized_overlaps:
+        return None, None, None
+    if len(normalized_overlaps) == 1:
+        speaker_id, overlap = next(iter(normalized_overlaps.items()))
+        return (
+            speaker_id,
+            overlap / max(duration, 0.001),
+            "merged_overlap_candidates_tts_routing",
+        )
+    speaker_id, overlap = max(normalized_overlaps.items(), key=lambda item: (item[1], item[0]))
+    ratio = overlap / max(duration, 0.001)
+    if ratio >= 0.60:
+        return speaker_id, ratio, "dominant_multi_speaker_overlap_tts_routing"
+    return None, ratio, None
+
+
+def _source_speaker_normalized_overlaps(
+    assignment: dict[str, Any],
+    merge_map: dict[str, str],
+) -> dict[str, float]:
+    overlaps = assignment.get("overlaps")
+    if not isinstance(overlaps, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for raw_speaker_id, raw_overlap in overlaps.items():
+        speaker_id = _source_speaker_model_id(str(raw_speaker_id), merge_map)
+        if not speaker_id:
+            continue
+        try:
+            overlap = float(raw_overlap)
+        except (TypeError, ValueError):
+            continue
+        normalized[speaker_id] = normalized.get(speaker_id, 0.0) + overlap
+    return normalized
+
+
+def _source_speaker_neighbor_context(
+    segments: list[Segment],
+    index: int,
+    *,
+    require_close_gap: bool = True,
+) -> str | None:
+    current = segments[index]
+    previous = _nearest_routed_source_neighbor(segments, index, step=-1)
+    following = _nearest_routed_source_neighbor(segments, index, step=1)
+    if previous is None or following is None:
+        return None
+    if previous.speaker_id != following.speaker_id:
+        return None
+    if require_close_gap:
+        if current.start - previous.end > _SOURCE_SPEAKER_CONTEXT_MAX_GAP_SEC:
+            return None
+        if following.start - current.end > _SOURCE_SPEAKER_CONTEXT_MAX_GAP_SEC:
+            return None
+    return previous.speaker_id
+
+
+def _nearest_routed_source_neighbor(segments: list[Segment], index: int, *, step: int) -> Segment | None:
+    cursor = index + step
+    while 0 <= cursor < len(segments):
+        candidate = segments[cursor]
+        if candidate.status not in _SOURCE_SPEAKER_SKIP_STATUSES and candidate.speaker_id:
+            return candidate
+        if candidate.status not in _SOURCE_SPEAKER_SKIP_STATUSES and not candidate.speaker_id:
+            return None
+        cursor += step
+    return None
+
+
+def _source_segment_can_inherit_neighbor_speaker(segment: Segment) -> bool:
+    if segment.duration > _SOURCE_SPEAKER_NEIGHBOR_MAX_SEGMENT_SEC:
+        return False
+    if segment.source_script is None or not segment.source_script.text.strip():
+        return False
+    return not _source_segment_is_short_no_overlap_texture(segment)
+
+
+def _source_segment_is_short_no_overlap_texture(segment: Segment) -> bool:
+    if segment.duration > _SOURCE_SPEAKER_SHORT_TEXTURE_MAX_SEC:
+        return False
+    source_script = segment.source_script
+    if source_script is None:
+        return False
+    compact = _compact_source_speaker_short_text(source_script.text)
+    if not compact:
+        return bool(segment.keep_original_texture)
+    if compact in _SOURCE_SPEAKER_SHORT_TEXTURE_TOKENS:
+        return True
+    return _source_speaker_repeated_short_texture(compact)
+
+
+def _compact_source_speaker_short_text(text: str) -> str:
+    return re.sub(r"[\s　、。,.，．!！?？…・♪♡❤「」『』（）()［］\[\]【】:：;；\"'`]+", "", text.strip())
+
+
+def _source_speaker_repeated_short_texture(compact: str) -> bool:
+    for token in _SOURCE_SPEAKER_SHORT_TEXTURE_TOKENS:
+        if len(token) == 0 or len(compact) <= len(token) or len(compact) % len(token) != 0:
+            continue
+        if token * (len(compact) // len(token)) == compact:
+            return True
+    return False
+
+
+def _mark_source_segment_texture(segment: Segment, reason: str) -> None:
+    segment.status = "non_speech_texture"
+    segment.speaker_id = None
+    segment.keep_original_texture = True
+    segment.script = None
+    segment.tts = None
+    if reason not in segment.errors:
+        segment.errors.append(reason)
+    segment.analysis["source_speaker_routing"] = {
+        "decision": "texture",
+        "reason": reason,
+    }
+    segment.analysis["asr_quality_gate"] = {
+        "decision": "texture",
+        "reasons": [reason],
+        "tts_blocked": True,
+    }
+    segment.analysis["voice_training"] = {
+        "exclude": True,
+        "reason": reason,
+    }
+
+
+def _mark_source_segment_keep_original_overlap(segment: Segment, reason: str) -> None:
+    segment.status = "absorbed"
+    segment.speaker_id = None
+    segment.keep_original_texture = True
+    segment.script = None
+    segment.tts = None
+    segment.analysis["source_speaker_routing"] = {
+        "decision": "keep_original_texture",
+        "reason": reason,
+        "tts_blocked": True,
+    }
+    segment.analysis["voice_training"] = {
+        "exclude": True,
+        "reason": reason,
+    }
+
+
+def _route_source_segment_to_speaker(
+    segment: Segment,
+    speaker_id: str,
+    *,
+    reason: str,
+    overlap_ratio: float | None,
+) -> None:
+    segment.speaker_id = speaker_id
+    assignment = segment.analysis.get("source_speaker_assignment")
+    if isinstance(assignment, dict):
+        assignment["routing_speaker_id"] = speaker_id
+        assignment["routing_reason"] = reason
+        if overlap_ratio is not None:
+            assignment["routing_overlap_ratio"] = round(float(overlap_ratio), 6)
+    routing = {
+        "decision": "speaker_routed_training_excluded",
+        "speaker_id": speaker_id,
+        "reason": reason,
+    }
+    if overlap_ratio is not None:
+        routing["overlap_ratio"] = round(float(overlap_ratio), 6)
+    segment.analysis["source_speaker_routing"] = routing
+    segment.analysis["voice_training"] = {
+        "exclude": True,
+        "reason": reason,
     }
 
 
@@ -1335,6 +1861,148 @@ def _source_speaker_bucket_stats(
         row["duration_sec"] = round(float(row["duration_sec"]), 6)
         row["clean_training_duration_sec"] = round(float(row["clean_training_duration_sec"]), 6)
     return dict(sorted(stats.items()))
+
+
+def _source_speaker_training_qc_payload(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    cfg: ProjectConfig,
+) -> dict[str, Any]:
+    rows: dict[str, dict[str, Any]] = {}
+    keep_original_segment_ids: list[str] = []
+    for segment in manifest.segments:
+        routing = segment.analysis.get("source_speaker_routing")
+        if isinstance(routing, dict) and routing.get("decision") == "keep_original_texture":
+            keep_original_segment_ids.append(segment.id)
+        speaker_id = segment.speaker_id
+        if not speaker_id or segment.status in {"failed", "needs_manual_review"}:
+            continue
+        row = rows.setdefault(
+            speaker_id,
+            {
+                "speaker_id": speaker_id,
+                "eligible_training_segment_ids": [],
+                "excluded_segment_ids": [],
+                "exclude_reason_counts": {},
+                "representative_wav_candidates": [],
+            },
+        )
+        duration_reasons = _source_speaker_training_qc_duration_reasons(segment, cfg)
+        check = evaluate_voice_training_candidate(
+            project_dir,
+            segment,
+            cfg,
+            min_quality_score=cfg.gsv_few_shot_min_quality_score,
+            require_source_script=True,
+            require_speaker_id=True,
+            source_language=cfg.source_language,
+        )
+        if not duration_reasons and check.accepted:
+            row["eligible_training_segment_ids"].append(segment.id)
+            if len(row["representative_wav_candidates"]) < 8:
+                row["representative_wav_candidates"].append(
+                    {
+                        "segment_id": segment.id,
+                        "audio_for_mix": segment.audio_for_mix,
+                        "duration_sec": round(float(segment.duration), 6),
+                    }
+                )
+            continue
+        row["excluded_segment_ids"].append(segment.id)
+        reasons = _source_speaker_training_qc_reject_reasons(segment, check.reject_reasons, duration_reasons)
+        reason_counts = row["exclude_reason_counts"]
+        for reason in reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    speakers = []
+    for row in rows.values():
+        row["exclude_reason_counts"] = dict(sorted(row["exclude_reason_counts"].items()))
+        speakers.append(row)
+    speakers.sort(key=lambda item: item["speaker_id"])
+    training_eligible_counts = {
+        row["speaker_id"]: len(row["eligible_training_segment_ids"])
+        for row in speakers
+        if row["eligible_training_segment_ids"]
+    }
+    training_excluded_counts = {
+        row["speaker_id"]: len(row["excluded_segment_ids"])
+        for row in speakers
+        if row["excluded_segment_ids"]
+    }
+    possible_overlap_counts = {
+        row["speaker_id"]: sum(
+            1
+            for segment_id in row["excluded_segment_ids"]
+            if _source_speaker_segment_has_possible_overlap_reason(manifest, segment_id)
+        )
+        for row in speakers
+    }
+    possible_overlap_counts = {
+        speaker_id: count for speaker_id, count in possible_overlap_counts.items() if count
+    }
+    return {
+        "speakers": speakers,
+        "keep_original_segment_ids": keep_original_segment_ids,
+        "summary": {
+            "speaker_count": len(speakers),
+            "eligible_training_segment_count": sum(training_eligible_counts.values()),
+            "excluded_training_segment_count": sum(training_excluded_counts.values()),
+            "keep_original_segment_count": len(keep_original_segment_ids),
+            "training_eligible_counts": dict(sorted(training_eligible_counts.items())),
+            "training_excluded_counts": dict(sorted(training_excluded_counts.items())),
+            "possible_overlap_counts": dict(sorted(possible_overlap_counts.items())),
+        },
+    }
+
+
+def _source_speaker_training_qc_duration_reasons(segment: Segment, cfg: ProjectConfig) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if segment.duration < cfg.gsv_few_shot_min_clip_sec:
+        reasons.append(f"duration_below_min:{segment.duration:.3f}<{cfg.gsv_few_shot_min_clip_sec:.3f}")
+    if segment.duration > cfg.gsv_few_shot_max_clip_sec:
+        reasons.append(f"duration_above_max:{segment.duration:.3f}>{cfg.gsv_few_shot_max_clip_sec:.3f}")
+    return tuple(reasons)
+
+
+def _source_speaker_training_qc_reject_reasons(
+    segment: Segment,
+    check_reasons: tuple[str, ...],
+    duration_reasons: tuple[str, ...],
+) -> tuple[str, ...]:
+    reasons = [*duration_reasons, *check_reasons]
+    voice_training = segment.analysis.get("voice_training")
+    if isinstance(voice_training, dict):
+        voice_reason = str(voice_training.get("reason") or "").strip()
+        if voice_training.get("exclude") is True and voice_reason:
+            replaced = False
+            normalized: list[str] = []
+            for reason in reasons:
+                if reason == "manual_training_exclude":
+                    normalized.append(voice_reason)
+                    replaced = True
+                else:
+                    normalized.append(reason)
+            if not replaced:
+                normalized.insert(0, voice_reason)
+            reasons = normalized
+    if not reasons:
+        reasons = ["not_clean_training_candidate"]
+    return tuple(dict.fromkeys(reasons))
+
+
+def _source_speaker_segment_has_possible_overlap_reason(
+    manifest: PipelineManifest,
+    segment_id: str,
+) -> bool:
+    segment = next((item for item in manifest.segments if item.id == segment_id), None)
+    if segment is None:
+        return False
+    voice_training = segment.analysis.get("voice_training")
+    reason = ""
+    if isinstance(voice_training, dict):
+        reason = str(voice_training.get("reason") or "")
+    routing = segment.analysis.get("source_speaker_routing")
+    routing_reason = str(routing.get("reason") or "") if isinstance(routing, dict) else ""
+    return "overlap" in reason or "overlap" in routing_reason
 
 
 def _source_segment_is_clean_training_candidate(
@@ -1576,10 +2244,7 @@ def _apply_source_bucket_merge(manifest: PipelineManifest, merge: dict[str, Any]
             continue
         segment.speaker_id = target
         segment.analysis["source_speaker_bucket_normalization"] = dict(merge)
-        voice_training = dict(segment.analysis.get("voice_training") or {})
-        voice_training["exclude"] = True
-        voice_training["reason"] = "minor_bucket_auto_merged"
-        segment.analysis["voice_training"] = voice_training
+        _set_source_speaker_voice_training_exclusion(segment, "minor_bucket_auto_merged")
 
 
 def _apply_source_bucket_model_fallback(manifest: PipelineManifest, preserve: dict[str, Any]) -> None:
@@ -1595,10 +2260,20 @@ def _apply_source_bucket_model_fallback(manifest: PipelineManifest, preserve: di
             "match_basis": preserve["match_basis"],
             "centroid_similarity": preserve["centroid_similarity"],
         }
-        voice_training = dict(segment.analysis.get("voice_training") or {})
-        voice_training["exclude"] = True
-        voice_training["reason"] = "insufficient_distinct_speaker_training_data"
-        segment.analysis["voice_training"] = voice_training
+        _set_source_speaker_voice_training_exclusion(segment, "insufficient_distinct_speaker_training_data")
+
+
+def _set_source_speaker_voice_training_exclusion(segment: Segment, reason: str) -> None:
+    voice_training = dict(segment.analysis.get("voice_training") or {})
+    existing_reason = str(voice_training.get("reason") or "")
+    voice_training["exclude"] = True
+    if not _source_speaker_preserve_training_exclusion_reason(existing_reason):
+        voice_training["reason"] = reason
+    segment.analysis["voice_training"] = voice_training
+
+
+def _source_speaker_preserve_training_exclusion_reason(reason: str) -> bool:
+    return "overlap" in reason
 
 
 def _source_speaker_bucket_qc_payload(
@@ -1996,7 +2671,15 @@ def _write_speaker_refs(project_dir: Path, speaker_dir: Path, turns: list[Diariz
     refs_dir.mkdir(parents=True, exist_ok=True)
     ref_audio = refs_dir / "whisper_close.wav"
     shutil.copy2(turns[0].audio_path, ref_audio)
-    prompt_text = " ".join(turn.text or "" for turn in turns if turn.text).strip() or "voice reference"
+    prompt_text_original = " ".join(turn.text or "" for turn in turns if turn.text).strip() or "voice reference"
+    prompt_lang = turns[0].language or cfg.source_language
+    if str(prompt_lang or "").strip().lower().replace("-", "_") in {"ja", "jp", "jpn", "japanese"}:
+        normalized = normalize_japanese_kana_text(prompt_text_original)
+        prompt_text = normalized.text
+        text_normalization = {"policy": "ja_hiragana", "risk_flags": normalized.risk_flags}
+    else:
+        prompt_text = prompt_text_original
+        text_normalization = {"policy": "none", "risk_flags": []}
     refs_json = refs_dir / "refs.json"
     write_json_atomic(
         refs_json,
@@ -2004,7 +2687,9 @@ def _write_speaker_refs(project_dir: Path, speaker_dir: Path, turns: list[Diariz
             "whisper_close": {
                 "ref_audio_path": str(_relative_to_project(project_dir, ref_audio)),
                 "prompt_text": prompt_text,
-                "prompt_lang": turns[0].language or cfg.source_language,
+                "prompt_text_original": prompt_text_original,
+                "prompt_lang": prompt_lang,
+                "text_normalization": text_normalization,
             }
         },
     )

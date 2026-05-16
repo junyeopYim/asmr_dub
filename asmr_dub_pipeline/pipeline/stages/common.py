@@ -56,6 +56,7 @@ from asmr_dub_pipeline.audio.mixing import (
 )
 from asmr_dub_pipeline.audio.preprocess import (
     extract_project_audio,
+    folder_asr_part_skip_reason,
     folder_input_metadata,
     merge_numbered_parts_to_audio,
     plan_folder_input,
@@ -128,6 +129,10 @@ from asmr_dub_pipeline.logging import console
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest, write_json_atomic
 from asmr_dub_pipeline.pipeline.state import mark_stage
 from asmr_dub_pipeline.qc.audio_qc import measure_audio_qc
+from asmr_dub_pipeline.qc.pronunciation_qc import (
+    evaluate_pronunciation_chunks,
+    evaluate_pronunciation_text,
+)
 from asmr_dub_pipeline.qc.scoring import score_qc
 from asmr_dub_pipeline.qwen_tts import QwenTTSClient, QwenTTSError, QwenTTSRequest, qwen_language
 from asmr_dub_pipeline.rights import (
@@ -165,7 +170,9 @@ from asmr_dub_pipeline.schemas import (
     RVCProfile,
     RVCSpeakerConfig,
     Segment,
+    SourceLaneTranscript,
     SourceScript,
+    TranscriptWord,
     TTSCandidate,
     TTSMetadata,
 )
@@ -183,6 +190,7 @@ from asmr_dub_pipeline.script.countdown import (
 )
 from asmr_dub_pipeline.script.duration_rewrite import (
     estimate_tts_duration,
+    korean_tts_slot_timing_budget,
     korean_tts_speech_char_count,
     korean_tts_timing_budget,
     rewrite_for_duration,
@@ -191,8 +199,15 @@ from asmr_dub_pipeline.script.korean_colloquial import (
     COLLOQUIAL_REWRITE_NOTE,
     colloquialize_korean_translation,
 )
-from asmr_dub_pipeline.script.normalizer import normalize_korean_tts_text, normalize_script_payload
-from asmr_dub_pipeline.script.text_qc import preflight_tts_text
+from asmr_dub_pipeline.script.normalizer import (
+    normalize_japanese_kana_text,
+    normalize_korean_tts_text,
+    normalize_script_payload,
+)
+from asmr_dub_pipeline.script.text_qc import (
+    preflight_tts_text,
+    repair_suspicious_truncated_korean_tts_text,
+)
 from asmr_dub_pipeline.voice_bank import (
     apply_voice_bank_to_config,
     assign_source_speakers_to_manifest,
@@ -203,7 +218,7 @@ from asmr_dub_pipeline.voice_bank import (
 )
 
 NO_SPEECH_STATUSES = {"no_speech_detected", "non_speech_texture"}
-SKIP_STATUSES = {"needs_manual_review", "failed", *NO_SPEECH_STATUSES}
+SKIP_STATUSES = {"needs_manual_review", "absorbed", "failed", *NO_SPEECH_STATUSES}
 ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_RATE = 0.02
 ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_COUNT = 3
 ASR_SOURCE_SEPARATION_FALLBACK_SEPARATED_SOURCES = {"source_vocals_mono_16k"}
@@ -225,6 +240,75 @@ NUMERIC_ONLY_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 NUMERIC_SEQUENCE_SOURCE_RE = re.compile(r"^\s*\d+(?:[\s,，、]+\d+)+\s*$")
 NUMERIC_TOKEN_RE = re.compile(r"\d+")
 REPEATED_CHAR_RUNAWAY_RE = re.compile(r"(.)\1{24,}")
+ASR_SHORT_FILLER_KEEP_ORIGINAL_REASON = "asr_short_filler_keep_original_texture"
+ASR_SHORT_FILLER_KEEP_ORIGINAL_POLICY = "conservative_short_filler"
+ASR_SHORT_FILLER_KEEP_ORIGINAL_MAX_SEC = 1.2
+ASR_SHORT_CLEAN_FRAGMENT_WARNING_REASON = "asr_short_clean_fragment_auto_accepted"
+ASR_SHORT_CLEAN_FRAGMENT_DROP_RE = re.compile(r"[\s　、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+")
+ASR_SHORT_CLEAN_FRAGMENT_TOKENS = frozenset(
+    (
+        "これ",
+        "あの",
+        "うん",
+        "さ",
+        "はい",
+        "ね",
+        "そう",
+        "あ",
+        "え",
+        "ん",
+        "いや",
+        "そうそう",
+        "まあ",
+    )
+)
+ASR_SHORT_FILLER_KEEP_ORIGINAL_TOKENS = frozenset(
+    (
+        "あ",
+        "あー",
+        "ああ",
+        "あっ",
+        "え",
+        "えー",
+        "ええ",
+        "えっ",
+        "うん",
+        "うーん",
+        "ん",
+        "んー",
+        "はい",
+        "はぁ",
+        "はあ",
+        "ふふ",
+        "ふふふ",
+        "うふふ",
+        "あはは",
+        "へへ",
+        "んふ",
+        "んふふ",
+        "あの",
+        "その",
+        "えっと",
+        "えーと",
+        "ええと",
+        "さ",
+        "さあ",
+        "ね",
+        "ねえ",
+        "ほら",
+        "そう",
+        "そうだね",
+        "そうね",
+        "そうそう",
+        "まあ",
+        "ま",
+        "お",
+        "ほ",
+        "スー",
+        "シュー",
+    )
+)
+ASR_SHORT_FILLER_KEEP_ORIGINAL_REPEAT_UNITS = frozenset(("ほら", "さ", "ね", "そう", "うん", "あ", "え", "ふふ"))
 NON_SPEECH_TEXTURE_REPEAT_RE = re.compile(r"(.)\1{2,}")
 NON_SPEECH_TEXTURE_DOMINANT_REPEAT_RE = re.compile(r"(.)\1{24,}")
 NON_SPEECH_TEXTURE_CHARS = frozenset(
@@ -277,6 +361,25 @@ NON_SPEECH_TEXTURE_SPARSE_TOKENS = frozenset(
     )
 )
 NON_SPEECH_TEXTURE_PUNCTUATION = frozenset("…♪♡❤・ーｰ〜～")
+NON_SPEECH_TEXTURE_NGRAM_MIN_LEN = 2
+NON_SPEECH_TEXTURE_NGRAM_MAX_LEN = 5
+NON_SPEECH_TEXTURE_NGRAM_MIN_REPEATS = 8
+NON_SPEECH_TEXTURE_NGRAM_MIN_TOTAL_LEN = 30
+NON_SPEECH_TEXTURE_NGRAM_MIN_COVERAGE = 0.78
+MIXED_TEXTURE_SPEECH_CUES = (
+    "気持ちいい",
+    "きもちいい",
+    "キモチいい",
+    "いく",
+    "イク",
+    "だめ",
+    "ダメ",
+    "もっと",
+    "して",
+    "した",
+    "ください",
+    "なさい",
+)
 SPARSE_SPEECH_NATURAL_CUES = (
     "です",
     "ます",
@@ -305,6 +408,9 @@ KOREAN_GURIGURI_TRANSLITERATION_RE = re.compile(
 JAPANESE_HIRAGANA_RE = re.compile(r"[\u3041-\u309fー]")
 JAPANESE_KATAKANA_RE = re.compile(r"[\u30a0-\u30ffー]")
 JAPANESE_KANJI_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+JAPANESE_REPEAT_GRAMMAR_FRAME_RE = re.compile(
+    r"(?:ているのか|いるのか|なのか|のか|でしょうか|ですか|ますか)$"
+)
 JAPANESE_STRONG_SPLIT_CHARS = set(" \t\n\r。、，,.！？!?…♪")
 JAPANESE_SOFT_SPLIT_END_CHARS = set("よねわぞぜ")
 JAPANESE_PARTICLE_SPLIT_START_CHARS = set("はがをにでともへや")
@@ -424,6 +530,34 @@ def _canonical_language(value: str | None) -> str:
     if normalized in KOREAN_TTS_LANGUAGES:
         return "ko"
     return normalized
+
+
+def _model_boundary_text_for_language(text: str, language: str | None) -> tuple[str, str, list[str]]:
+    original = str(text or "").strip()
+    if _canonical_language(language) != "ja":
+        return original, original, []
+    normalized = normalize_japanese_kana_text(original)
+    return normalized.text, normalized.original_text, normalized.risk_flags
+
+
+def _source_script_text_audit_fields(segment: Segment) -> dict[str, Any]:
+    if segment.source_script is None or not segment.source_script.text.strip():
+        return {}
+    text, original, flags = _model_boundary_text_for_language(
+        segment.source_script.text,
+        segment.source_script.language,
+    )
+    return {
+        "source_text": text,
+        "source_text_original": original,
+        "source_text_language": _canonical_language(segment.source_script.language),
+        "text_normalization": {
+            "policy": "ja_hiragana"
+            if _canonical_language(segment.source_script.language) == "ja"
+            else "none",
+            "risk_flags": flags,
+        },
+    }
 
 
 def _segment_counts(manifest: PipelineManifest) -> dict[str, int]:
@@ -718,12 +852,23 @@ def _segment_source_ref_for_gsv(
     if mode == "auto" and source_language == target_language:
         metadata["reject_reasons"] = ["auto_mode_same_source_and_target_language"]
         return None, metadata
+    if (
+        target_language == "ko"
+        and source_language != target_language
+        and not bool(getattr(cfg, "gsv_korean_segment_ref_enabled", True))
+    ):
+        metadata["reject_reasons"] = [
+            "korean_segment_ref_disabled_for_pronunciation_priority"
+        ]
+        metadata["korean_ref_policy"] = "static_for_pronunciation_priority"
+        return None, metadata
     effective_ref_min_sec = max(float(cfg.gsv_ref_min_sec), GSV_API_MIN_REF_SEC)
     if segment.duration < effective_ref_min_sec:
         span = _build_segment_neighbor_ref_span(
             all_segments or (),
             segment,
             source_language=source_language,
+            cfg=cfg,
             min_sec=effective_ref_min_sec,
             max_sec=float(cfg.gsv_ref_max_sec),
             max_gap_sec=float(getattr(cfg, "asr_resegment_merge_gap_sec", 1.0)),
@@ -767,19 +912,31 @@ def _segment_source_ref_for_gsv(
         metadata["reject_reasons"] = list(check.reject_reasons or ("missing_segment_reference",))
         metadata["clean_source_metrics"] = check.clean_source_metrics
         return None, metadata
+    prompt_lang = segment.source_script.language or source_language
+    prompt_text, prompt_text_original, prompt_text_flags = _model_boundary_text_for_language(
+        segment.source_script.text,
+        prompt_lang,
+    )
     metadata.update(
         {
             "used": True,
             "ref_audio_path": str(check.source_audio_path),
-            "prompt_lang": segment.source_script.language or source_language,
+            "prompt_text": prompt_text,
+            "prompt_text_original": prompt_text_original,
+            "prompt_lang": prompt_lang,
+            "prompt_text_normalization": {
+                "policy": "ja_hiragana" if _canonical_language(prompt_lang) == "ja" else "none",
+                "risk_flags": prompt_text_flags,
+            },
             "clean_source_metrics": check.clean_source_metrics,
         }
     )
     return (
         GPTSoVITSRef(
             ref_audio_path=str(check.source_audio_path),
-            prompt_text=segment.source_script.text.strip(),
-            prompt_lang=segment.source_script.language or source_language,
+            prompt_text=prompt_text,
+            prompt_text_original=prompt_text_original,
+            prompt_lang=prompt_lang,
             aux_ref_audio_paths=[],
             source_language=source_language,
             target_language=target_language,
@@ -794,6 +951,7 @@ def _build_segment_neighbor_ref_span(
     target: Segment,
     *,
     source_language: str,
+    cfg: Any | None = None,
     min_sec: float,
     max_sec: float,
     max_gap_sec: float,
@@ -802,6 +960,7 @@ def _build_segment_neighbor_ref_span(
         segment
         for segment in sorted(all_segments, key=lambda item: (item.start, item.end, item.id))
         if _segment_can_seed_voice_ref(segment, source_language)
+        and not _voice_ref_segment_reject_reasons(segment, cfg)
     ]
     try:
         target_index = next(index for index, segment in enumerate(candidates) if segment.id == target.id)
@@ -874,6 +1033,10 @@ def _write_segment_neighbor_ref_for_gsv(
     target_language: str,
     metadata: dict[str, Any],
 ) -> GPTSoVITSRef | None:
+    span_reject_reasons = _voice_ref_span_reject_reasons(span)
+    if span_reject_reasons:
+        metadata["reject_reasons"] = span_reject_reasons
+        return None
     ref_path = ensure_inside_project(
         project_dir,
         (project_dir / "work" / "gpt_sovits" / "segment_refs" / f"{target.id}_ref.wav").resolve(),
@@ -891,18 +1054,27 @@ def _write_segment_neighbor_ref_for_gsv(
         ]
         metadata["clean_source_metrics"] = metrics.as_payload()
         return None
-    prompt_text = _voice_ref_span_prompt_text(span)
     prompt_lang = (
         span.segments[0].source_script.language
         if span.segments[0].source_script
         else source_language
+    )
+    prompt_text, prompt_text_original, prompt_text_flags = _model_boundary_text_for_language(
+        _voice_ref_span_prompt_text(span),
+        prompt_lang,
     )
     metadata.update(
         {
             "used": True,
             "expanded_with_neighbors": True,
             "ref_audio_path": str(ref_path),
+            "prompt_text": prompt_text,
+            "prompt_text_original": prompt_text_original,
             "prompt_lang": prompt_lang,
+            "prompt_text_normalization": {
+                "policy": "ja_hiragana" if _canonical_language(prompt_lang) == "ja" else "none",
+                "risk_flags": prompt_text_flags,
+            },
             "span_segment_ids": [segment.id for segment in span.segments],
             "span_duration_sec": round(span.duration, 6),
             "clean_source_metrics": metrics.as_payload(),
@@ -911,6 +1083,7 @@ def _write_segment_neighbor_ref_for_gsv(
     return GPTSoVITSRef(
         ref_audio_path=str(ref_path),
         prompt_text=prompt_text,
+        prompt_text_original=prompt_text_original,
         prompt_lang=prompt_lang,
         aux_ref_audio_paths=[],
         source_language=source_language,
@@ -952,6 +1125,150 @@ def _clipped_asr_words(chunk: ASRChunk, *, start: float, end: float) -> list[Any
             continue
         clipped.append(word.model_copy(update={"start": word_start, "end": word_end, "text": text}))
     return clipped
+
+
+@dataclass(frozen=True)
+class ASRBoundaryClipResult:
+    chunks: list[ASRChunk]
+    boundary_clipped: bool = False
+    reject_reason: str | None = None
+    dropped_word_count: int = 0
+
+
+def _asr_word_text_needs_separator(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    left_alnum = any(char.isascii() and char.isalnum() for char in left)
+    right_alnum = any(char.isascii() and char.isalnum() for char in right)
+    return left_alnum or right_alnum
+
+
+def _asr_text_from_words(words: Sequence[Any]) -> str:
+    tokens = [str(word.text or "").strip() for word in words if str(word.text or "").strip()]
+    if not tokens:
+        return ""
+    text = tokens[0]
+    previous = tokens[0]
+    for token in tokens[1:]:
+        separator = " " if _asr_word_text_needs_separator(previous, token) else ""
+        text += separator + token
+        previous = token
+    return text.strip()
+
+
+def _clip_asr_chunks_to_window(
+    chunks: Sequence[ASRChunk],
+    *,
+    clip_start: float,
+    clip_end: float,
+    window_start: float,
+    window_end: float,
+    require_word_timestamps_for_boundary: bool = True,
+    boundary_epsilon_sec: float = 0.02,
+) -> ASRBoundaryClipResult:
+    clipped_chunks: list[ASRChunk] = []
+    boundary_clipped = False
+    dropped_word_count = 0
+    clip_crosses_window = (
+        clip_start < window_start - boundary_epsilon_sec
+        or clip_end > window_end + boundary_epsilon_sec
+    )
+    for chunk in sorted(chunks, key=lambda item: (float(item.start), float(item.end))):
+        raw_text = chunk.text.strip()
+        if not raw_text:
+            continue
+        abs_start = clip_start + float(chunk.start)
+        abs_end = clip_start + float(chunk.end)
+        overlaps_window = (
+            min(abs_end, window_end) - max(abs_start, window_start)
+        ) > boundary_epsilon_sec
+        crosses_boundary = (
+            abs_start < window_start - boundary_epsilon_sec
+            or abs_end > window_end + boundary_epsilon_sec
+        )
+        if not overlaps_window:
+            boundary_clipped = True
+            continue
+        if chunk.words:
+            kept_words: list[Any] = []
+            for word in sorted(chunk.words, key=lambda item: (float(item.start), float(item.end))):
+                word_text = word.text.strip()
+                if not word_text:
+                    continue
+                word_start = clip_start + float(word.start)
+                word_end = clip_start + float(word.end)
+                if word_end <= word_start:
+                    continue
+                midpoint = (word_start + word_end) / 2.0
+                if midpoint < window_start or midpoint > window_end:
+                    dropped_word_count += 1
+                    boundary_clipped = True
+                    continue
+                clipped_start = max(window_start, word_start)
+                clipped_end = min(window_end, word_end)
+                if clipped_end <= clipped_start:
+                    dropped_word_count += 1
+                    boundary_clipped = True
+                    continue
+                if clipped_start != word_start or clipped_end != word_end:
+                    boundary_clipped = True
+                kept_words.append(
+                    word.model_copy(
+                        update={
+                            "start": round(clipped_start, 6),
+                            "end": round(clipped_end, 6),
+                            "text": word_text,
+                        }
+                    )
+                )
+            if not kept_words:
+                continue
+            rebuilt_text = _asr_text_from_words(kept_words)
+            if not rebuilt_text:
+                continue
+            if rebuilt_text != raw_text:
+                boundary_clipped = True
+            clipped_chunks.append(
+                chunk.model_copy(
+                    update={
+                        "start": round(float(kept_words[0].start), 6),
+                        "end": round(float(kept_words[-1].end), 6),
+                        "text": rebuilt_text,
+                        "words": kept_words,
+                    }
+                )
+            )
+            continue
+        if require_word_timestamps_for_boundary and clip_crosses_window and crosses_boundary:
+            return ASRBoundaryClipResult(
+                chunks=[],
+                boundary_clipped=True,
+                reject_reason="boundary_clipping_requires_word_timestamps",
+                dropped_word_count=dropped_word_count,
+            )
+        start = max(window_start, abs_start)
+        end = min(window_end, abs_end)
+        if end - start <= boundary_epsilon_sec:
+            boundary_clipped = True
+            continue
+        if crosses_boundary:
+            boundary_clipped = True
+        clipped_chunks.append(
+            chunk.model_copy(
+                update={
+                    "start": round(start, 6),
+                    "end": round(end, 6),
+                    "text": raw_text,
+                    "words": [],
+                }
+            )
+        )
+    return ASRBoundaryClipResult(
+        chunks=clipped_chunks,
+        boundary_clipped=boundary_clipped,
+        reject_reason=None,
+        dropped_word_count=dropped_word_count,
+    )
 
 
 def _tighten_sparse_asr_chunk_timing_from_words(
@@ -1031,7 +1348,8 @@ def _valid_asr_chunks(
             and len(text) / duration < sparse_chunk_min_chars_per_sec
         ):
             continue
-        valid.extend(_split_long_asr_chunk(normalized, max_chunk_sec=max_chunk_sec))
+        for word_split in _split_asr_chunk_on_word_gaps(normalized):
+            valid.extend(_split_long_asr_chunk(word_split, max_chunk_sec=max_chunk_sec))
     return valid
 
 
@@ -1069,6 +1387,55 @@ def _split_long_asr_chunk(chunk: ASRChunk, *, max_chunk_sec: float) -> list[ASRC
             )
         )
     return split_chunks
+
+
+def _split_asr_chunk_on_word_gaps(
+    chunk: ASRChunk,
+    *,
+    min_gap_sec: float = 0.8,
+) -> list[ASRChunk]:
+    words = [
+        word
+        for word in sorted(chunk.words, key=lambda item: (float(item.start), float(item.end)))
+        if word.text.strip() and float(word.end) > float(word.start)
+    ]
+    if len(words) <= 1:
+        return [chunk]
+    split_indexes = [
+        index
+        for index in range(1, len(words))
+        if float(words[index].start) - float(words[index - 1].end) >= min_gap_sec
+    ]
+    if not split_indexes:
+        return [chunk]
+
+    groups: list[list[Any]] = []
+    start_index = 0
+    for split_index in split_indexes:
+        groups.append(words[start_index:split_index])
+        start_index = split_index
+    groups.append(words[start_index:])
+
+    split_chunks: list[ASRChunk] = []
+    for group in groups:
+        text = "".join(word.text.strip() for word in group if word.text.strip()).strip()
+        if not text:
+            continue
+        start = max(float(chunk.start), float(group[0].start))
+        end = min(float(chunk.end), float(group[-1].end))
+        if end - start <= 0.05:
+            continue
+        split_chunks.append(
+            chunk.model_copy(
+                update={
+                    "start": start,
+                    "end": end,
+                    "text": text,
+                    "words": [word.model_copy(update={"text": word.text.strip()}) for word in group],
+                }
+            )
+        )
+    return split_chunks if len(split_chunks) > 1 else [chunk]
 
 
 def _preferred_asr_text_split_points(text: str, part_count: int) -> list[int]:
@@ -1523,7 +1890,7 @@ def _split_sparse_edge_segments_by_audio(
     pieces = _merge_sparse_edge_speech_segments(
         pieces,
         merge_gap_sec=merge_gap_sec,
-        max_segment_sec=float(getattr(cfg, "asr_resegment_max_sec", 20.0)),
+        max_segment_sec=float(getattr(cfg, "asr_resegment_max_sec", 10.0)),
     )
     return _renumber_segments_for_project(pieces, project_dir)
 
@@ -1621,6 +1988,53 @@ def _absorb_micro_asr_groups_for_tts(
         group = absorbed[index]
         duration = group[-1].end - group[0].start
         if duration <= 0 or duration > micro_max_sec or _asr_group_countdown_values(group):
+            index += 1
+            continue
+
+        candidates: list[tuple[float, str, int]] = []
+        if index > 0:
+            left = absorbed[index - 1]
+            gap = group[0].start - left[-1].end
+            combined_duration = group[-1].end - left[0].start
+            if 0 <= gap <= absorb_gap_sec and combined_duration <= max_segment_sec:
+                candidates.append((gap, "left", index - 1))
+        if index + 1 < len(absorbed):
+            right = absorbed[index + 1]
+            gap = right[0].start - group[-1].end
+            combined_duration = right[-1].end - group[0].start
+            if 0 <= gap <= absorb_gap_sec and combined_duration <= max_segment_sec:
+                candidates.append((gap, "right", index + 1))
+        if not candidates:
+            index += 1
+            continue
+
+        _, side, target_index = min(candidates, key=lambda item: (item[0], item[1] != "left"))
+        if side == "left":
+            absorbed[target_index].extend(group)
+            del absorbed[index]
+            index = max(0, target_index)
+        else:
+            absorbed[target_index] = [*group, *absorbed[target_index]]
+            del absorbed[index]
+    return absorbed
+
+
+def _absorb_short_asr_groups_for_tts(
+    groups: list[list[ASRChunk]],
+    *,
+    min_segment_sec: float,
+    merge_gap_sec: float,
+    max_segment_sec: float,
+) -> list[list[ASRChunk]]:
+    if len(groups) <= 1 or min_segment_sec <= 0:
+        return groups
+    absorbed = [list(group) for group in groups]
+    absorb_gap_sec = max(0.0, float(merge_gap_sec))
+    index = 0
+    while index < len(absorbed):
+        group = absorbed[index]
+        duration = group[-1].end - group[0].start
+        if duration <= 0 or duration >= min_segment_sec or _asr_group_countdown_values(group):
             index += 1
             continue
 
@@ -1850,6 +2264,12 @@ def _segments_from_asr_chunks(
         merge_gap_sec=merge_gap_sec,
         max_segment_sec=max_segment_sec,
     )
+    groups = _absorb_short_asr_groups_for_tts(
+        groups,
+        min_segment_sec=min_segment_sec,
+        merge_gap_sec=merge_gap_sec,
+        max_segment_sec=max_segment_sec,
+    )
     segments: list[Segment] = []
     last_end = 0.0
     for index, group in enumerate(groups, start=1):
@@ -1929,6 +2349,93 @@ def _asr_text_has_dominant_non_speech_repetition(compact: str) -> bool:
     return False
 
 
+def _asr_text_has_dominant_ngram_repetition(compact: str) -> bool:
+    if len(compact) < NON_SPEECH_TEXTURE_NGRAM_MIN_TOTAL_LEN:
+        return False
+    for unit_len in range(
+        NON_SPEECH_TEXTURE_NGRAM_MIN_LEN,
+        NON_SPEECH_TEXTURE_NGRAM_MAX_LEN + 1,
+    ):
+        limit = len(compact) - (unit_len * NON_SPEECH_TEXTURE_NGRAM_MIN_REPEATS)
+        for index in range(0, max(0, limit) + 1):
+            unit = compact[index : index + unit_len]
+            if not unit.strip() or len(set(unit)) == 1:
+                continue
+            repeats = 0
+            cursor = index
+            while compact.startswith(unit, cursor):
+                repeats += 1
+                cursor += unit_len
+            if repeats < NON_SPEECH_TEXTURE_NGRAM_MIN_REPEATS:
+                continue
+            run_length = repeats * unit_len
+            coverage = run_length / max(1, len(compact))
+            if coverage >= NON_SPEECH_TEXTURE_NGRAM_MIN_COVERAGE or len(compact) - run_length <= 12:
+                return True
+    return False
+
+
+def _asr_mixed_texture_speech_reason(text: str, *, duration: float) -> str | None:
+    stripped = text.strip()
+    if duration < 4.0:
+        return None
+    if source_countdown_values(stripped) is not None or NUMERIC_ONLY_SOURCE_RE.fullmatch(stripped):
+        return None
+    compact = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤]+", "", stripped)
+    if len(compact) < 8:
+        return None
+    if _asr_text_looks_non_speech_texture(stripped, duration=duration):
+        return None
+    if not any(cue in compact for cue in MIXED_TEXTURE_SPEECH_CUES):
+        return None
+    texture_chars = sum(1 for char in compact if char in NON_SPEECH_TEXTURE_CHARS)
+    texture_ratio = texture_chars / max(1, len(compact))
+    marker_count = sum(1 for char in compact if char in NON_SPEECH_TEXTURE_MARKERS)
+    if texture_ratio >= 0.55 and marker_count >= 2:
+        return "asr_mixed_texture_speech"
+    return None
+
+
+def _compact_short_filler_source_text(text: str) -> str:
+    return re.sub(r"[\s　、。,.，．!！?？…・♪♡❤「」『』（）()［］\[\]【】:：;；\"'`]+", "", text.strip())
+
+
+def _is_repeated_short_filler(compact: str) -> bool:
+    for unit in ASR_SHORT_FILLER_KEEP_ORIGINAL_REPEAT_UNITS:
+        if len(compact) <= len(unit) or len(compact) % len(unit) != 0:
+            continue
+        if unit * (len(compact) // len(unit)) == compact:
+            return True
+    return False
+
+
+def _source_script_keep_original_texture_candidate(source_script: SourceScript | None) -> dict[str, Any] | None:
+    if source_script is None:
+        return None
+    text = source_script.text.strip()
+    duration = max(0.0, float(source_script.end) - float(source_script.start))
+    if duration > ASR_SHORT_FILLER_KEEP_ORIGINAL_MAX_SEC:
+        return None
+    if source_countdown_values(text) is not None or NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
+        return None
+    compact = _compact_short_filler_source_text(text)
+    if not compact:
+        return None
+    if (
+        compact not in ASR_SHORT_FILLER_KEEP_ORIGINAL_TOKENS
+        and not _is_repeated_short_filler(compact)
+    ):
+        return None
+    return {
+        "action": "keep_original_texture",
+        "reason": ASR_SHORT_FILLER_KEEP_ORIGINAL_REASON,
+        "duration_sec": round(duration, 6),
+        "source_text": text,
+        "normalized_source_text": compact,
+        "policy": ASR_SHORT_FILLER_KEEP_ORIGINAL_POLICY,
+    }
+
+
 def _asr_text_looks_non_speech_texture(text: str, *, duration: float) -> bool:
     stripped = text.strip()
     if source_countdown_values(text) is not None or NUMERIC_ONLY_SOURCE_RE.fullmatch(stripped):
@@ -1940,6 +2447,8 @@ def _asr_text_looks_non_speech_texture(text: str, *, duration: float) -> bool:
     if duration >= 6.0 and compact in NON_SPEECH_TEXTURE_SPARSE_TOKENS:
         return True
     if _asr_text_has_dominant_non_speech_repetition(compact):
+        return True
+    if _asr_text_has_dominant_ngram_repetition(compact):
         return True
     if any(char not in NON_SPEECH_TEXTURE_CHARS for char in compact):
         return False
@@ -1959,6 +2468,15 @@ def _asr_text_matches_suspicious_pattern(
     suspicious_text_patterns: list[str] | tuple[str, ...],
 ) -> bool:
     return bool(_asr_suspicious_pattern_hits(text, suspicious_text_patterns))
+
+
+def _asr_numeric_only_chunk_needs_repair(text: str, *, duration: float, sparse_min_sec: float) -> bool:
+    values = source_countdown_values(text)
+    if values is None:
+        return False
+    if duration >= sparse_min_sec:
+        return True
+    return len(values) >= 6 and max(Counter(values).values(), default=0) >= 4
 
 
 def _asr_suspicious_pattern_hits(
@@ -1992,6 +2510,10 @@ def _asr_chunk_needs_repair(
         return False
     duration = chunk.end - chunk.start
     if _asr_text_looks_non_speech_texture(text, duration=duration):
+        return False
+    if _asr_numeric_only_chunk_needs_repair(text, duration=duration, sparse_min_sec=sparse_min_sec):
+        return True
+    if source_countdown_values(text) is not None:
         return False
     if NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
         return False
@@ -2305,7 +2827,9 @@ def _should_apply_contextual_akume_replacement(text: str, source: str, target: s
     has_domain_context = any(cue in compact for cue in ASR_AKUME_CONTEXT_CUES)
     if has_domain_context:
         return True
-    return any(cue in source for cue in ASR_AKUME_GRAMMATICAL_SOURCE_CUES)
+    if any(cue in source for cue in ASR_AKUME_GRAMMATICAL_SOURCE_CUES):
+        return True
+    return any(token in source for token in ASR_AKUME_SOURCE_TOKENS)
 
 
 def _is_contextual_akume_replacement(source: str, target: str) -> bool:
@@ -2389,6 +2913,19 @@ def _asr_text_with_review_candidate_replacements(text: str, replacements: Mappin
     return normalized
 
 
+def _normalize_asr_text_for_repair_equivalence(text: str, cfg: Any) -> str:
+    normalized, _hits = _apply_text_replacements_with_hits(
+        text,
+        dict(getattr(cfg, "asr_text_replacements", {}) or {}),
+    )
+    normalized = _asr_text_with_review_candidate_replacements(
+        normalized,
+        getattr(cfg, "asr_review_candidate_replacements", {}) or {},
+    )
+    normalized, _countdown_hits = _apply_countdown_sequence_repairs_with_hits(normalized)
+    return _compact_asr_context(normalized)
+
+
 def _asr_contextual_suspicious_pattern_hits(
     text: str,
     patterns: list[str] | tuple[str, ...],
@@ -2407,6 +2944,84 @@ def _asr_contextual_suspicious_pattern_hits(
             continue
         filtered.append(pattern)
     return filtered
+
+
+def _asr_auto_resolution_rule_value(rule: Any, key: str, default: Any = None) -> Any:
+    if isinstance(rule, Mapping):
+        return rule.get(key, default)
+    return getattr(rule, key, default)
+
+
+def _asr_auto_resolution_cue_matches(text: str, compact_text: str, cue: object) -> bool:
+    cue_text = str(cue or "").strip()
+    if not cue_text:
+        return False
+    return cue_text in text or _compact_asr_context(cue_text) in compact_text
+
+
+def _asr_candidate_id_for_text(candidate_by_id: Mapping[str, str], text: str) -> str | None:
+    compact_text = _compact_asr_context(text)
+    for candidate_id, candidate_text in candidate_by_id.items():
+        if candidate_text == text or _compact_asr_context(candidate_text) == compact_text:
+            return candidate_id
+    return None
+
+
+def _guarded_asr_review_auto_resolution(
+    item: Mapping[str, Any],
+    candidate_by_id: Mapping[str, str],
+    *,
+    cfg: Any,
+) -> dict[str, Any] | None:
+    original_text = str(candidate_by_id.get("original") or "").strip()
+    if not original_text:
+        return None
+    compact_text = _compact_asr_context(original_text)
+    for rule in list(getattr(cfg, "asr_review_auto_resolution_rules", []) or []):
+        if str(_asr_auto_resolution_rule_value(rule, "action", "auto_replace")) != "auto_replace":
+            continue
+        rule_id = str(_asr_auto_resolution_rule_value(rule, "id", "") or "").strip()
+        source = str(_asr_auto_resolution_rule_value(rule, "source", "") or "").strip()
+        target = str(_asr_auto_resolution_rule_value(rule, "target", "") or "").strip()
+        if not rule_id or not source or not target or source not in original_text:
+            continue
+        negative_any = list(_asr_auto_resolution_rule_value(rule, "negative_any", []) or [])
+        if any(_asr_auto_resolution_cue_matches(original_text, compact_text, cue) for cue in negative_any):
+            continue
+        required_all = list(_asr_auto_resolution_rule_value(rule, "required_all", []) or [])
+        if required_all and not all(
+            _asr_auto_resolution_cue_matches(original_text, compact_text, cue)
+            for cue in required_all
+        ):
+            continue
+        required_any = list(_asr_auto_resolution_rule_value(rule, "required_any", []) or [])
+        if required_any and not any(
+            _asr_auto_resolution_cue_matches(original_text, compact_text, cue)
+            for cue in required_any
+        ):
+            continue
+        resolved_text = original_text.replace(source, target)
+        if resolved_text == original_text:
+            continue
+        confidence = item.get("confidence")
+        source_script = SourceScript(
+            text=resolved_text,
+            language=getattr(cfg, "asr_language", "ja"),
+            backend="asr_review_auto_resolution",
+            start=float(item["start"]),
+            end=float(item["end"]),
+            confidence=float(confidence) if confidence is not None else None,
+        )
+        blocked_review_reasons = _source_script_asr_review_reasons(source_script, cfg)
+        if blocked_review_reasons:
+            continue
+        return {
+            "rule_id": rule_id,
+            "text": resolved_text,
+            "selected_candidate_id": _asr_candidate_id_for_text(candidate_by_id, resolved_text)
+            or f"auto_resolution:{rule_id}",
+        }
+    return None
 
 
 def _apply_contextual_asr_replacements_with_hits(
@@ -2654,7 +3269,7 @@ def _asr_repair_candidate_options(cfg: Any) -> list[dict[str, Any]]:
         "vad_filter": False,
         "vad_parameters": None,
         "condition_on_previous_text": False,
-        "word_timestamps": False,
+        "word_timestamps": True,
         "hallucination_silence_threshold": None,
         "initial_prompt": None,
         "hotwords": None,
@@ -2664,7 +3279,7 @@ def _asr_repair_candidate_options(cfg: Any) -> list[dict[str, Any]]:
         "vad_filter": bool(getattr(cfg, "asr_vad_filter", True)),
         "vad_parameters": vad_parameters or None,
         "condition_on_previous_text": False,
-        "word_timestamps": bool(getattr(cfg, "asr_word_timestamps", False)),
+        "word_timestamps": True,
         "hallucination_silence_threshold": getattr(cfg, "asr_hallucination_silence_threshold", None),
         "initial_prompt": str(getattr(cfg, "asr_initial_prompt", "") or "").strip() or None,
         "hotwords": str(getattr(cfg, "asr_hotwords", "") or "").strip() or None,
@@ -2774,10 +3389,85 @@ def _asr_repair_candidate_score(
     return True, score, "accepted"
 
 
+@dataclass
+class ASRRepairVote:
+    candidate_id: str
+    chunks: list[ASRChunk]
+    score: float
+    vote_count: int
+    normalized_text: str
+
+
+def _select_voted_asr_repair_candidate(
+    candidates: Sequence[tuple[str, list[ASRChunk], float]],
+    *,
+    cfg: Any,
+) -> ASRRepairVote | None:
+    buckets: dict[str, list[tuple[str, list[ASRChunk], float]]] = {}
+    for candidate_id, candidate_chunks, score in candidates:
+        candidate_text = _asr_candidate_text(candidate_chunks)
+        normalized_text = _normalize_asr_text_for_repair_equivalence(candidate_text, cfg)
+        if not normalized_text:
+            continue
+        buckets.setdefault(normalized_text, []).append((candidate_id, candidate_chunks, score))
+    if not buckets:
+        return None
+    normalized_text, group = max(
+        buckets.items(),
+        key=lambda item: (len(item[1]), max(score for _candidate_id, _chunks, score in item[1])),
+    )
+    if len(group) < 2:
+        return None
+    candidate_id, candidate_chunks, score = max(group, key=lambda item: item[2])
+    return ASRRepairVote(
+        candidate_id=candidate_id,
+        chunks=candidate_chunks,
+        score=score,
+        vote_count=len(group),
+        normalized_text=normalized_text,
+    )
+
+
+def _asr_repair_vote_sensitive_original(original: ASRChunk) -> bool:
+    original_text = original.text.strip()
+    if not original_text:
+        return False
+    duration = max(0.001, float(original.end) - float(original.start))
+    compact = _compact_asr_context(original_text)
+    if source_countdown_values(original_text) is not None:
+        return True
+    return duration <= 3.0 or len(compact) <= 3
+
+
+def _asr_repair_candidate_requires_vote(original: ASRChunk, candidate_text: str, cfg: Any) -> bool:
+    if not candidate_text.strip():
+        return False
+    if not _asr_repair_vote_sensitive_original(original):
+        return False
+    original_normalized = _normalize_asr_text_for_repair_equivalence(original.text, cfg)
+    candidate_normalized = _normalize_asr_text_for_repair_equivalence(candidate_text, cfg)
+    return bool(candidate_normalized) and candidate_normalized != original_normalized
+
+
 def _asr_repair_candidate_review_reasons(candidate_chunks: list[ASRChunk], cfg: Any) -> list[str]:
     candidate_text = _asr_candidate_text(candidate_chunks)
     if not candidate_text or not candidate_chunks:
         return []
+    replaced_candidate = _asr_text_with_review_candidate_replacements(
+        candidate_text,
+        getattr(cfg, "asr_review_candidate_replacements", {}) or {},
+    ).strip()
+    if replaced_candidate and replaced_candidate != candidate_text.strip():
+        source_script = SourceScript(
+            text=replaced_candidate,
+            language=next((chunk.language for chunk in candidate_chunks if chunk.language), cfg.asr_language),
+            backend="asr_repair_candidate",
+            start=float(candidate_chunks[0].start),
+            end=float(candidate_chunks[-1].end),
+            confidence=_asr_candidate_confidence(candidate_chunks),
+        )
+        return _source_script_asr_review_reasons(source_script, cfg)
+
     original_source_script = SourceScript(
         text=candidate_text,
         language=next((chunk.language for chunk in candidate_chunks if chunk.language), cfg.asr_language),
@@ -2789,23 +3479,6 @@ def _asr_repair_candidate_review_reasons(candidate_chunks: list[ASRChunk], cfg: 
     original_reasons = _source_script_asr_review_reasons(original_source_script, cfg)
     if original_reasons:
         return original_reasons
-    replaced_candidate = _asr_text_with_review_candidate_replacements(
-        candidate_text,
-        getattr(cfg, "asr_review_candidate_replacements", {}) or {},
-    ).strip()
-    source_script = SourceScript(
-        text=replaced_candidate or candidate_text,
-        language=next((chunk.language for chunk in candidate_chunks if chunk.language), cfg.asr_language),
-        backend="asr_repair_candidate",
-        start=float(candidate_chunks[0].start),
-        end=float(candidate_chunks[-1].end),
-        confidence=_asr_candidate_confidence(candidate_chunks),
-    )
-    reasons = _source_script_asr_review_reasons(source_script, cfg)
-    if reasons:
-        return reasons
-    if replaced_candidate and replaced_candidate != candidate_text.strip():
-        return ["asr_candidate_replacement_available"]
     return []
 
 
@@ -2881,17 +3554,35 @@ def _run_asr_repair_option(
             [],
             **dict(option.get("overrides") or {}),
         )
-        candidate_text = _asr_candidate_text(candidate_local)
-        prompt_leaked = _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
-        candidate_abs = [
-            candidate.model_copy(
-                update={
-                    "start": max(group_start, min(group_end, clip_start + candidate.start)),
-                    "end": max(group_start, min(group_end, clip_start + candidate.end)),
-                }
+        raw_candidate_text = _asr_candidate_text(candidate_local)
+        raw_prompt_leaked = _asr_candidate_looks_prompt_leaked(raw_candidate_text, cfg)
+        boundary_result = _clip_asr_chunks_to_window(
+            candidate_local,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            window_start=group_start,
+            window_end=group_end,
+            require_word_timestamps_for_boundary=False,
+        )
+        if boundary_result.reject_reason is not None:
+            return (
+                _asr_repair_attempt_payload(
+                    candidate_id=candidate_id,
+                    clip_start=clip_start,
+                    clip_end=clip_end,
+                    candidate_chunks=[],
+                    prompt_leaked=raw_prompt_leaked,
+                    accepted=False,
+                    score=-100.0,
+                    reason=boundary_result.reject_reason,
+                ),
+                [],
+                -100.0,
+                None,
             )
-            for candidate in candidate_local
-        ]
+        candidate_abs = boundary_result.chunks
+        candidate_text = _asr_candidate_text(candidate_abs)
+        prompt_leaked = raw_prompt_leaked or _asr_candidate_looks_prompt_leaked(candidate_text, cfg)
         candidate_abs = _valid_asr_chunks(
             candidate_abs,
             audio_duration_sec,
@@ -2963,7 +3654,8 @@ def _split_asr_chunks_for_repair(
                 "words": _clipped_asr_words(chunk, start=start, end=end),
             }
         )
-        repair_chunks.extend(_split_long_asr_chunk(normalized, max_chunk_sec=max_chunk_sec))
+        for word_split in _split_asr_chunk_on_word_gaps(normalized):
+            repair_chunks.extend(_split_long_asr_chunk(word_split, max_chunk_sec=max_chunk_sec))
     return repair_chunks
 
 
@@ -2992,7 +3684,7 @@ def _repair_asr_chunks(
     repair_groups: list[tuple[bool, list[ASRChunk]]] = []
     current_repair_group: list[ASRChunk] = []
     repair_group_gap_sec = max(1.0, float(getattr(cfg, "asr_resegment_merge_gap_sec", 1.0)))
-    repair_group_max_sec = max(1.0, float(getattr(cfg, "asr_resegment_max_sec", 20.0)))
+    repair_group_max_sec = max(1.0, float(getattr(cfg, "asr_resegment_max_sec", 10.0)))
     repair_input_chunks = _split_asr_chunks_for_repair(
         chunks,
         audio_duration_sec=audio_duration_sec,
@@ -3071,9 +3763,11 @@ def _repair_asr_chunks(
             else None
         )
         attempts: list[dict[str, Any]] = []
+        accepted_candidates: list[tuple[str, list[ASRChunk], float]] = []
         best_candidate: list[ASRChunk] = []
         best_candidate_id: str | None = None
         best_score = -math.inf
+        reject_reason: str | None = None
 
         for option in option_specs:
             attempt_payload, candidate, score, candidate_id = _run_asr_repair_option(
@@ -3093,7 +3787,13 @@ def _repair_asr_chunks(
                 best_score = score
                 best_candidate = candidate
                 best_candidate_id = candidate_id
-            if best_candidate and best_score >= 0.5:
+            if candidate and candidate_id is not None:
+                accepted_candidates.append((candidate_id, candidate, score))
+            if (
+                best_candidate
+                and best_score >= 0.5
+                and not _asr_repair_vote_sensitive_original(original)
+            ):
                 break
         if qwen_option_spec is not None and not best_candidate:
             attempt_payload, candidate, score, candidate_id = _run_asr_repair_option(
@@ -3113,16 +3813,43 @@ def _repair_asr_chunks(
                 best_score = score
                 best_candidate = candidate
                 best_candidate_id = candidate_id
+            if candidate and candidate_id is not None:
+                accepted_candidates.append((candidate_id, candidate, score))
+        vote = _select_voted_asr_repair_candidate(accepted_candidates, cfg=cfg)
+        if vote is not None:
+            best_candidate = vote.chunks
+            best_candidate_id = vote.candidate_id
+            best_score = vote.score
+        candidate_text = _asr_candidate_text(best_candidate)
+        if vote is None and best_candidate and _asr_repair_candidate_requires_vote(
+            original,
+            candidate_text,
+            cfg,
+        ):
+            best_candidate = []
+            best_candidate_id = None
+            best_score = -math.inf
+            reject_reason = "candidate_vote_required"
+            candidate_text = ""
         accepted = bool(best_candidate)
+        normalized_candidate_text = (
+            _normalize_asr_text_for_repair_equivalence(candidate_text, cfg)
+            if candidate_text
+            else ""
+        )
         summary["items"].append(
             {
                 "start": round(group_start, 3),
                 "end": round(group_end, 3),
                 "accepted": accepted,
                 "accepted_candidate_id": best_candidate_id,
+                "accepted_candidate_reason": "normalized_candidate_vote" if vote else "score",
+                "candidate_vote_count": vote.vote_count if vote else (1 if accepted else 0),
+                "reject_reason": reject_reason,
+                "normalized_candidate_text": normalized_candidate_text,
                 "prompt_leaked": any(bool(attempt.get("prompt_leaked")) for attempt in attempts),
                 "original_text": original.text,
-                "candidate_text": _asr_candidate_text(best_candidate),
+                "candidate_text": candidate_text,
                 "attempts": attempts,
             }
         )
@@ -3349,6 +4076,76 @@ def _add_generated_asr_review_candidates(
     return generated
 
 
+def _add_qwen_asr_review_candidates(
+    review_items: list[dict[str, Any]],
+    *,
+    qwen_backend: Any | None,
+    project_dir: Path,
+    review_audio_path: Path,
+    audio_duration_sec: float,
+    cfg: Any,
+) -> int:
+    if qwen_backend is None:
+        return 0
+    if not cfg.asr_review_generate_candidates:
+        return 0
+    if not review_audio_path.exists():
+        return 0
+
+    padding_values = [
+        max(0.0, float(value))
+        for value in getattr(cfg, "asr_review_candidate_padding_sec", [])
+    ]
+    if not padding_values:
+        padding_values = [0.8]
+
+    generated = 0
+    review_dir = project_dir / "work" / "transcribe" / "asr_review_clips"
+    for item in review_items:
+        chunk_id = str(item.get("chunk_id") or "chunk")
+        start = float(item["start"])
+        end = float(item["end"])
+        for index, padding_sec in enumerate(padding_values, start=1):
+            clip_start = max(0.0, start - padding_sec)
+            clip_end = min(audio_duration_sec, end + padding_sec)
+            if clip_end <= clip_start:
+                continue
+            candidate_id = f"qwen_asr_pad_{index}"
+            clip_path = review_dir / f"{chunk_id}_{candidate_id}.wav"
+            ffmpeg.slice_audio(
+                review_audio_path,
+                clip_start,
+                clip_end,
+                clip_path,
+                sample_rate=cfg.gemma_sample_rate,
+                channels=1,
+            )
+            try:
+                candidate_chunks = _transcribe_with_backend_options(qwen_backend, clip_path, [])
+            except Exception:
+                continue
+            candidate_text = _asr_candidate_text(candidate_chunks)
+            if _asr_candidate_looks_prompt_leaked(candidate_text, cfg):
+                continue
+            if _append_unique_asr_review_candidate(
+                item,
+                candidate_id=candidate_id,
+                text=candidate_text,
+            ):
+                generated += 1
+            replaced_text = _asr_text_with_review_candidate_replacements(
+                candidate_text,
+                cfg.asr_review_candidate_replacements,
+            )
+            if replaced_text != candidate_text and _append_unique_asr_review_candidate(
+                item,
+                candidate_id=f"{candidate_id}_domain_replacement",
+                text=replaced_text,
+            ):
+                generated += 1
+    return generated
+
+
 def _attach_asr_review_audio_clips(
     review_items: list[dict[str, Any]],
     *,
@@ -3429,6 +4226,7 @@ def _review_asr_chunks_with_model(
     review_audio_path: Path,
     audio_duration_sec: float,
     cfg: Any,
+    qwen_fallback_backend: Any | None = None,
 ) -> tuple[list[ASRChunk], dict[str, Any]]:
     summary: dict[str, Any] = {
         "enabled": bool(cfg.asr_review_enabled),
@@ -3436,10 +4234,12 @@ def _review_asr_chunks_with_model(
         "attempted": 0,
         "reviewed": 0,
         "replaced": 0,
+        "guarded_auto_replaced": 0,
         "manual_review": 0,
         "failed": 0,
         "skipped": 0,
         "generated_candidates": 0,
+        "generated_qwen_candidates": 0,
         "audio_input": {"enabled": False, "created": 0, "error": None, "items": []},
         "error": None,
         "errors": [],
@@ -3467,6 +4267,15 @@ def _review_asr_chunks_with_model(
         audio_duration_sec=audio_duration_sec,
         cfg=cfg,
     )
+    summary["generated_qwen_candidates"] = _add_qwen_asr_review_candidates(
+        review_items,
+        qwen_backend=qwen_fallback_backend,
+        project_dir=project_dir,
+        review_audio_path=review_audio_path,
+        audio_duration_sec=audio_duration_sec,
+        cfg=cfg,
+    )
+    summary["generated_candidates"] += summary["generated_qwen_candidates"]
 
     backend_kind = cfg.asr_review_backend.replace("-", "_")
     if backend_kind not in {"llama_server_audio", "mock"}:
@@ -3596,8 +4405,11 @@ def _review_asr_chunks_with_model(
         selected_id = str(review.get("selected_candidate_id") or "")
         selected_text = candidate_by_id.get(selected_id)
         confidence = review.get("confidence")
+        model_decision = review.get("decision")
+        model_selected_id = selected_id
+        auto_resolution: dict[str, Any] | None = None
         accepted = (
-            review.get("decision") == "replace"
+            model_decision == "replace"
             and selected_id != "original"
             and selected_text is not None
             and confidence is not None
@@ -3615,8 +4427,19 @@ def _review_asr_chunks_with_model(
             blocked_review_reasons = _asr_repair_candidate_review_reasons([selected_chunk], cfg)
             if blocked_review_reasons:
                 accepted = False
-                summary["manual_review"] += 1
-        if review.get("decision") == "manual_review":
+        if not accepted:
+            auto_resolution = _guarded_asr_review_auto_resolution(
+                item,
+                candidate_by_id,
+                cfg=cfg,
+            )
+            if auto_resolution is not None:
+                selected_id = str(auto_resolution["selected_candidate_id"])
+                selected_text = str(auto_resolution["text"])
+                accepted = True
+                blocked_review_reasons = []
+                summary["guarded_auto_replaced"] += 1
+        if not accepted and (blocked_review_reasons or model_decision == "manual_review"):
             summary["manual_review"] += 1
         if accepted:
             selected_text_by_chunk_id[chunk_id] = selected_text
@@ -3627,7 +4450,7 @@ def _review_asr_chunks_with_model(
                 "start": item["start"],
                 "end": item["end"],
                 "accepted": accepted,
-                "decision": review.get("decision"),
+                "decision": model_decision,
                 "selected_candidate_id": selected_id,
                 "confidence": confidence,
                 "original_text": candidate_by_id.get("original", ""),
@@ -3646,6 +4469,16 @@ def _review_asr_chunks_with_model(
                 ],
                 "blocked_review_reasons": blocked_review_reasons,
                 "suspicious_patterns": item.get("suspicious_patterns", []),
+                **(
+                    {
+                        "resolution": "guarded_auto_replace",
+                        "auto_resolution_rule_id": auto_resolution["rule_id"],
+                        "model_decision": model_decision,
+                        "model_selected_candidate_id": model_selected_id,
+                    }
+                    if auto_resolution is not None
+                    else {}
+                ),
             }
         )
 
@@ -4297,6 +5130,8 @@ def _apply_korean_numeric_counting_postprocess(segments: list[Segment]) -> int:
             translation = segment.translation_ko
             if translation is None or not translation.ko_natural.strip():
                 continue
+            if COUNTDOWN_EVENT_NOTE in translation.notes:
+                continue
             spoken_values = [_native_korean_count_number(value) for value in values]
             if any(value is None for value in spoken_values):
                 continue
@@ -4362,10 +5197,22 @@ def _has_repeated_phrase(text: str, *, min_chars: int = 8) -> bool:
     seen: set[str] = set()
     for index in range(0, len(compact) - min_chars + 1):
         phrase = compact[index : index + min_chars]
-        if phrase in seen:
+        if phrase in seen and _is_meaningful_repeated_source_phrase(phrase):
             return True
         seen.add(phrase)
     return False
+
+
+def _is_meaningful_repeated_source_phrase(phrase: str) -> bool:
+    compact = _compact_translation_repeat_text(phrase)
+    if len(compact) < 8:
+        return False
+    kanji_count = len(JAPANESE_KANJI_RE.findall(compact))
+    if kanji_count < 2 and JAPANESE_REPEAT_GRAMMAR_FRAME_RE.search(compact):
+        return False
+    if kanji_count >= 2:
+        return True
+    return len(compact) >= 16
 
 
 def _natural_translation_omits_repeated_source_phrase(
@@ -4423,6 +5270,8 @@ def _translation_backcheck_ko_pattern_matches(
         return bool(re.search(r"비약(?!\s*적)", text))
     if pattern == "미약" and "媚薬" in source_text and "火薬" not in source_text:
         return False
+    if pattern == "체감" and "体感" in source_text:
+        return False
     return pattern in text
 
 
@@ -4431,8 +5280,9 @@ def _backcheck_severity(item: dict[str, Any]) -> str:
     if any(hit in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS for hit in hits):
         return "severe"
     ko_natural = str(item.get("ko_natural") or "")
+    source_text = str(item.get("source_text") or "")
     if any(
-        _translation_backcheck_ko_pattern_matches(ko_natural, pattern)
+        _translation_backcheck_ko_pattern_matches(ko_natural, pattern, source_text=source_text)
         for pattern in SEVERE_TRANSLATION_BACKCHECK_KO_PATTERNS
     ):
         return "severe"
@@ -4470,7 +5320,9 @@ def _finalize_translation_acceptance(
     segments: list[Segment],
     asr_backcheck_items: list[dict[str, Any]],
     quality_counters: Counter[str],
+    cfg: Any | None = None,
 ) -> None:
+    cfg = cfg or ProjectConfig()
     backcheck_by_segment_id = {str(item["segment_id"]): item for item in asr_backcheck_items}
     rows_by_segment_id = {str(row.get("segment_id") or ""): row for row in rows}
     boundary_warning_codes = _translation_boundary_issue_codes(segments)
@@ -4499,6 +5351,49 @@ def _finalize_translation_acceptance(
             if severity == "severe":
                 quality_counters["severe_backcheck"] += 1
                 rejected_reasons.append("severe_translation_smell")
+        repetition_warn_only = (
+            rejected_reasons == ["natural_repetition_omission"]
+            and getattr(cfg, "gemma_text_repetition_omission_policy", "warn") == "warn"
+        )
+        if repetition_warn_only:
+            warning_codes = list(dict.fromkeys([*warning_codes, "natural_repetition_omission"]))
+            literal_fallback_applied = False
+            if translation is not None and translation.ko_literal.strip():
+                max_speech_chars = int(
+                    korean_tts_timing_budget(segment.duration, source_text)["max_speech_chars"]
+                )
+                literal_text = translation.ko_literal.strip()
+                if (
+                    literal_text != translation.ko_natural.strip()
+                    and korean_tts_speech_char_count(literal_text) <= max_speech_chars
+                ):
+                    notes = list(translation.notes)
+                    if "repetition_preserving_literal_fallback" not in notes:
+                        notes.append("repetition_preserving_literal_fallback")
+                    translation = translation.model_copy(
+                        update={"ko_natural": literal_text, "notes": notes}
+                    )
+                    segment.translation_ko = translation
+                    literal_fallback_applied = True
+            segment.analysis["translation_auto_fallback"] = {
+                "reason": "natural_repetition_omission_warn_only",
+                "policy": "warn",
+                "literal_fallback_applied": literal_fallback_applied,
+            }
+            _clear_translation_rejection_errors(segment)
+            row.update(
+                {
+                    "status": "translated",
+                    "source_text": source_text,
+                    "translation_ko": translation.model_dump(mode="json") if translation else None,
+                    "quality_issues": [],
+                    "quality_warnings": warning_codes,
+                    "accepted": True,
+                    "rejected_reasons": [],
+                }
+            )
+            _upsert_translation_row(rows, segment, row)
+            continue
         if rejected_reasons:
             segment.status = "needs_manual_review"
             message = _translation_rejection_message(rejected_reasons)
@@ -4674,6 +5569,14 @@ def _translation_source_text(segment: Segment) -> str:
 
 
 def _countdown_values_for_segment(segment: Segment) -> list[int] | None:
+    source_text = _translation_source_text(segment)
+    if source_text:
+        values = source_countdown_values(source_text)
+        if values is None or not is_descending_countdown(values):
+            return None
+        _ensure_countdown_event_analysis(segment, values)
+        return values
+
     event = segment.analysis.get(COUNTDOWN_EVENT_KEY)
     if isinstance(event, dict):
         raw_values = event.get("values")
@@ -4681,14 +5584,7 @@ def _countdown_values_for_segment(segment: Segment) -> list[int] | None:
             values = [int(value) for value in raw_values]
             if is_descending_countdown(values):
                 return values
-    source_text = _translation_source_text(segment)
-    values = source_countdown_values(source_text)
-    if values is None:
-        values = _embedded_source_countdown_values(source_text)
-    if values is None or not is_descending_countdown(values):
-        return None
-    _ensure_countdown_event_analysis(segment, values)
-    return values
+    return None
 
 
 def _ensure_countdown_event_analysis(segment: Segment, values: list[int]) -> None:
@@ -4733,10 +5629,10 @@ def _counting_values_for_segment(segment: Segment) -> list[int] | None:
 
 
 def _counting_translation_for_segment(segment: Segment, values: list[int]) -> KoreanTranslation | None:
-    tokens = countdown_korean_tokens(values)
-    if tokens is None:
+    spoken_values = [_native_korean_count_number(value) for value in values]
+    if any(value is None for value in spoken_values):
         return None
-    korean_text = ", ".join(tokens)
+    korean_text = ", ".join(value for value in spoken_values if value is not None)
     return KoreanTranslation(
         ko_literal=korean_text,
         ko_natural=korean_text,
@@ -5376,7 +6272,10 @@ def _prefer_folder_asr_source_audio(manifest: PipelineManifest) -> bool:
         return False
     status = str(folder_input.get("asr_source_status") or "")
     silent_count = int(folder_input.get("asr_silent_part_count") or 0)
-    return status in {"separate_asr_parts", "mix_parts_silenced_duplicates"} or silent_count > 0
+    return (
+        status in {"separate_asr_parts", "mix_parts_silenced_duplicates", "mix_parts_silenced_for_asr"}
+        or silent_count > 0
+    )
 
 
 def _select_asr_audio_input(
@@ -5619,6 +6518,9 @@ def _source_script_asr_review_reasons(source_script: SourceScript | None, cfg: A
     if _asr_candidate_looks_prompt_leaked(text, cfg):
         reasons.append("asr_prompt_or_hallucination_leak")
         return reasons
+    mixed_texture_reason = _asr_mixed_texture_speech_reason(text, duration=duration)
+    if mixed_texture_reason:
+        reasons.append(mixed_texture_reason)
     patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
         getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
     )
@@ -5762,8 +6664,49 @@ def _source_script_sparse_speech_unverified_reason(
     return "asr_sparse_speech_unverified"
 
 
+def _source_script_short_clean_fragment_warning_reason(
+    source_script: SourceScript | None,
+    cfg: Any,
+) -> str | None:
+    if not bool(getattr(cfg, "asr_repair_rejected_short_fragment_auto_accept", True)):
+        return None
+    if source_script is None or not source_script.text.strip():
+        return None
+    duration = max(0.001, source_script.end - source_script.start)
+    if duration > float(getattr(cfg, "asr_repair_rejected_short_fragment_max_sec", 0.8)):
+        return None
+    confidence = source_script.confidence
+    if confidence is None or confidence < float(
+        getattr(cfg, "asr_repair_rejected_short_fragment_min_confidence", 0.85)
+    ):
+        return None
+    text = source_script.text.strip()
+    if (
+        _source_script_countdown_unverified_reason(source_script)
+        or _source_script_numeric_sequence_unverified_reason(source_script)
+        or _asr_text_has_unstable_embedded_numeric_sequence(text)
+    ):
+        return None
+    if _source_script_non_speech_texture_reason(source_script) is not None:
+        return None
+    if _asr_candidate_looks_prompt_leaked(text, cfg):
+        return None
+    patterns = list(getattr(cfg, "asr_repair_suspicious_text_patterns", []) or []) + list(
+        getattr(cfg, "asr_review_suspicious_text_patterns", []) or []
+    )
+    if _asr_contextual_suspicious_pattern_hits(text, patterns, cfg):
+        return None
+    if _asr_anomalous_text_reason(text, duration=duration):
+        return None
+    compact = ASR_SHORT_CLEAN_FRAGMENT_DROP_RE.sub("", text)
+    if compact in ASR_SHORT_CLEAN_FRAGMENT_TOKENS:
+        return ASR_SHORT_CLEAN_FRAGMENT_WARNING_REASON
+    return None
+
+
 def _source_script_asr_warning_reasons(source_script: SourceScript | None, cfg: Any) -> list[str]:
     reasons = [
+        _source_script_short_clean_fragment_warning_reason(source_script, cfg),
         _source_script_countdown_unverified_reason(source_script),
         _source_script_numeric_sequence_unverified_reason(source_script),
         _source_script_sparse_speech_unverified_reason(source_script, cfg),
@@ -5782,10 +6725,49 @@ def _filter_asr_repair_review_reasons(
     if not repair_reasons or review_reasons:
         return repair_reasons
     if _source_script_asr_warning_reasons(source_script, cfg) and all(
-        reason.startswith("asr_repair_rejected") for reason in repair_reasons
+        reason == "asr_repair_rejected" for reason in repair_reasons
+    ):
+        return []
+    if (
+        _source_script_is_clean_segment_retry(source_script, cfg)
+        and all(reason == "asr_repair_rejected" for reason in repair_reasons)
     ):
         return []
     return repair_reasons
+
+
+def _source_script_is_clean_segment_retry(source_script: SourceScript | None, cfg: Any) -> bool:
+    if source_script is None or not source_script.text.strip():
+        return False
+    if ":segment_retry:" not in str(source_script.backend):
+        return False
+    if _asr_text_has_unstable_embedded_numeric_sequence(source_script.text):
+        return False
+    if _source_script_non_speech_texture_reason(source_script) is not None:
+        return False
+    if _source_script_asr_warning_reasons(source_script, cfg):
+        return False
+    return not _source_script_asr_review_reasons(source_script, cfg)
+
+
+def _asr_text_has_unstable_embedded_numeric_sequence(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    numeric_values = [int(token) for token in NUMERIC_TOKEN_RE.findall(normalized)]
+    if len(numeric_values) < 6 or max(numeric_values, default=0) > 30:
+        return False
+    if _numeric_values_are_monotonic_step(numeric_values):
+        return False
+    non_numeric = NUMERIC_TOKEN_RE.sub("", normalized)
+    compact_non_numeric = _compact_asr_context(non_numeric)
+    if not compact_non_numeric:
+        return False
+    return bool(
+        JAPANESE_HIRAGANA_RE.search(compact_non_numeric)
+        or JAPANESE_KATAKANA_RE.search(compact_non_numeric)
+        or JAPANESE_KANJI_RE.search(compact_non_numeric)
+    )
 
 
 def _source_script_non_speech_texture_reason(source_script: SourceScript | None) -> str | None:
@@ -5797,9 +6779,36 @@ def _source_script_non_speech_texture_reason(source_script: SourceScript | None)
     return None
 
 
+def _source_script_keep_original_texture_override_reason(
+    segment: Segment,
+    source_script: SourceScript | None,
+    cfg: Any,
+) -> str | None:
+    if not bool(segment.keep_original_texture):
+        return None
+    if source_script is None or not source_script.text.strip():
+        return None
+    text = source_script.text.strip()
+    if source_countdown_values(text) is not None or NUMERIC_ONLY_SOURCE_RE.fullmatch(text):
+        return None
+    duration = max(0.001, float(source_script.end) - float(source_script.start))
+    if _asr_text_looks_non_speech_texture(text, duration=duration):
+        return "asr_non_speech_texture"
+    compact = re.sub(r"[\s　、。,.，．!！?？…・♪♡❤（）()\[\]「」『』]+", "", text)
+    sparse_min_chars_per_sec = float(getattr(cfg, "asr_repair_sparse_min_chars_per_sec", 1.0))
+    if (
+        duration >= 6.0
+        and len(compact) <= 2
+        and len(text) / duration < sparse_min_chars_per_sec
+    ):
+        return "asr_non_speech_texture"
+    return None
+
+
 def _source_script_rejected_repair_reasons(
     source_script: SourceScript | None,
     repair_summary: dict[str, Any],
+    cfg: Any | None = None,
 ) -> list[str]:
     if source_script is None or not source_script.text.strip():
         return []
@@ -5807,6 +6816,11 @@ def _source_script_rejected_repair_reasons(
     script_start = float(source_script.start)
     script_end = float(source_script.end)
     script_duration = max(0.001, script_end - script_start)
+    source_equivalence_text = (
+        _normalize_asr_text_for_repair_equivalence(source_script.text, cfg)
+        if cfg is not None
+        else ""
+    )
     for item in repair_summary.get("items", []):
         if item.get("accepted"):
             continue
@@ -5819,20 +6833,119 @@ def _source_script_rejected_repair_reasons(
         repair_duration = max(0.001, repair_end - repair_start)
         if overlap / min(script_duration, repair_duration) < 0.3:
             continue
-        attempt_reasons = {
-            str(attempt.get("reason") or "")
-            for attempt in item.get("attempts", [])
-            if attempt.get("reason")
-        }
-        suffix = (
-            ":prompt_or_hallucination_leak"
-            if "prompt_or_hallucination_leak" in attempt_reasons
-            else ""
-        )
+        if source_equivalence_text and _repair_item_matches_source_after_replacements(
+            item,
+            source_equivalence_text=source_equivalence_text,
+            cfg=cfg,
+        ):
+            continue
+        suffix = ":prompt_or_hallucination_leak" if _repair_item_prompt_leak_blocks_source(
+            item,
+            source_script=source_script,
+            cfg=cfg,
+        ) else ""
         reason = f"asr_repair_rejected{suffix}"
         if reason not in reasons:
             reasons.append(reason)
     return reasons
+
+
+def _repair_item_prompt_leak_blocks_source(
+    item: Mapping[str, Any],
+    *,
+    source_script: SourceScript,
+    cfg: Any | None,
+) -> bool:
+    attempts = [attempt for attempt in item.get("attempts", []) or [] if isinstance(attempt, Mapping)]
+    prompt_leaked_attempts = [
+        attempt
+        for attempt in attempts
+        if bool(attempt.get("prompt_leaked"))
+        or str(attempt.get("reason") or "") == "prompt_or_hallucination_leak"
+    ]
+    if not prompt_leaked_attempts:
+        return False
+    if cfg is None:
+        return True
+    if _asr_candidate_looks_prompt_leaked(source_script.text, cfg):
+        return True
+    text_attempts = [
+        attempt
+        for attempt in attempts
+        if str(attempt.get("candidate_text") or "").strip()
+    ]
+    if not text_attempts:
+        return True
+    return all(
+        bool(attempt.get("prompt_leaked"))
+        or str(attempt.get("reason") or "") == "prompt_or_hallucination_leak"
+        or _asr_candidate_looks_prompt_leaked(str(attempt.get("candidate_text") or ""), cfg)
+        for attempt in text_attempts
+    )
+
+
+def _repair_item_candidate_texts(item: Mapping[str, Any]) -> list[str]:
+    texts: list[str] = []
+    text = str(item.get("candidate_text") or "").strip()
+    if text:
+        texts.append(text)
+    for attempt in item.get("attempts", []) or []:
+        if not isinstance(attempt, Mapping):
+            continue
+        text = str(attempt.get("candidate_text") or "").strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _repair_item_matches_source_after_replacements(
+    item: Mapping[str, Any],
+    *,
+    source_equivalence_text: str,
+    cfg: Any,
+) -> bool:
+    allow_partial_match = not _repair_item_has_prompt_leak_attempt(item)
+    for text in _repair_item_candidate_texts(item):
+        if _normalized_repair_candidate_matches_source(
+            _normalize_asr_text_for_repair_equivalence(text, cfg),
+            source_equivalence_text,
+            allow_partial=allow_partial_match,
+        ):
+            return True
+    return False
+
+
+def _repair_item_has_prompt_leak_attempt(item: Mapping[str, Any]) -> bool:
+    attempts = [attempt for attempt in item.get("attempts", []) or [] if isinstance(attempt, Mapping)]
+    return any(
+        bool(attempt.get("prompt_leaked"))
+        or str(attempt.get("reason") or "") == "prompt_or_hallucination_leak"
+        for attempt in attempts
+    )
+
+
+def _normalized_repair_candidate_matches_source(
+    candidate_text: str,
+    source_text: str,
+    *,
+    allow_partial: bool,
+) -> bool:
+    if not candidate_text or not source_text:
+        return False
+    if candidate_text == source_text:
+        return True
+    if not allow_partial:
+        return False
+    shorter, longer = (
+        (candidate_text, source_text)
+        if len(candidate_text) <= len(source_text)
+        else (source_text, candidate_text)
+    )
+    if len(shorter) < 8:
+        return False
+    if len(shorter) / max(1, len(longer)) < 0.35:
+        return False
+    return shorter in longer
 
 
 def _asr_summary_int(value: Any) -> int:
@@ -5871,6 +6984,7 @@ def _asr_folder_input_parts(manifest: PipelineManifest) -> list[dict[str, Any]]:
             continue
         if end_sec <= start_sec:
             continue
+        skip_reason = _asr_folder_part_skip_reason(raw_part)
         parts.append(
             {
                 "part_index": int(raw_part.get("part_index") or len(parts) + 1),
@@ -5878,9 +6992,22 @@ def _asr_folder_input_parts(manifest: PipelineManifest) -> list[dict[str, Any]]:
                 "path": str(raw_part.get("path") or ""),
                 "start_sec": start_sec,
                 "end_sec": end_sec,
+                "asr_silenced": skip_reason is not None,
+                "asr_skip_reason": skip_reason,
             }
         )
     return sorted(parts, key=lambda part: (float(part["start_sec"]), int(part["part_index"])))
+
+
+def _asr_folder_part_skip_reason(part: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(part, Mapping):
+        return None
+    raw_reason = str(part.get("asr_skip_reason") or "").strip()
+    path_text = str(part.get("path") or part.get("stem") or "")
+    detected_reason = folder_asr_part_skip_reason(path_text) if path_text else None
+    if bool(part.get("asr_silenced")):
+        return raw_reason or detected_reason or "asr_silenced"
+    return detected_reason
 
 
 def _asr_segment_reference_start(segment: Segment) -> float:
@@ -6099,6 +7226,52 @@ def _asr_segment_replacement_hits(
     return hits
 
 
+def _asr_segment_repair_item(
+    segment: Segment,
+    repair_summary: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    source_script = segment.source_script
+    segment_start = float(source_script.start) if source_script is not None else float(segment.start)
+    segment_end = float(source_script.end) if source_script is not None else float(segment.end)
+    segment_duration = max(0.001, segment_end - segment_start)
+    best_item: Mapping[str, Any] | None = None
+    best_overlap = 0.0
+    for item in repair_summary.get("items", []) or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            item_start = float(item.get("start"))
+            item_end = float(item.get("end"))
+        except (TypeError, ValueError):
+            continue
+        item_duration = max(0.001, item_end - item_start)
+        overlap = max(0.0, min(segment_end, item_end) - max(segment_start, item_start))
+        if overlap / min(segment_duration, item_duration) < 0.3:
+            continue
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_item = item
+    return best_item
+
+
+def _asr_repair_item_preferred_candidate_text(item: Mapping[str, Any]) -> str | None:
+    candidate_text = str(item.get("candidate_text") or "").strip()
+    if candidate_text:
+        return candidate_text
+    attempts = [
+        attempt
+        for attempt in item.get("attempts", []) or []
+        if isinstance(attempt, Mapping) and str(attempt.get("candidate_text") or "").strip()
+    ]
+    if not attempts:
+        return None
+    best_attempt = max(
+        attempts,
+        key=lambda attempt: float(attempt.get("score") or -math.inf),
+    )
+    return str(best_attempt.get("candidate_text") or "").strip() or None
+
+
 def _asr_segment_countdown_verified(segment: Segment) -> bool:
     return _asr_segment_countdown_state(segment) == "verified"
 
@@ -6234,6 +7407,22 @@ def _asr_postprocess_action(item: Mapping[str, Any], candidate_text: str | None)
     return "keep"
 
 
+def _attach_asr_candidate_equivalence_fields(
+    payload: dict[str, Any],
+    *,
+    source_text: str,
+    candidate_text: str,
+    cfg: Any,
+) -> None:
+    normalized_source_text = _normalize_asr_text_for_repair_equivalence(source_text, cfg)
+    normalized_candidate_text = _normalize_asr_text_for_repair_equivalence(candidate_text, cfg)
+    payload["normalized_candidate_text"] = normalized_candidate_text
+    payload["equivalent_to_final_source"] = (
+        bool(normalized_candidate_text)
+        and normalized_candidate_text == normalized_source_text
+    )
+
+
 def _asr_postprocess_review_item(
     segment: Segment,
     *,
@@ -6257,10 +7446,19 @@ def _asr_postprocess_review_item(
     for key in ("source_text", "source_confidence", "source_backend"):
         if key in item:
             payload[key] = item[key]
+    selected_candidate_text: str | None = None
     if (action == "auto_replace" or item.get("replacement_hits")) and source_text:
-        payload["candidate_text"] = source_text
+        selected_candidate_text = source_text
     elif candidate_text is not None:
-        payload["candidate_text"] = candidate_text
+        selected_candidate_text = candidate_text
+    if selected_candidate_text is not None:
+        payload["candidate_text"] = selected_candidate_text
+        _attach_asr_candidate_equivalence_fields(
+            payload,
+            source_text=source_text,
+            candidate_text=selected_candidate_text,
+            cfg=cfg,
+        )
     return payload
 
 
@@ -6321,11 +7519,23 @@ def _build_asr_high_risk_report(
     asr_review_summary: Mapping[str, Any],
     filtered_summary: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    del cfg
-    all_items = [
-        _asr_segment_audit_item(segment, replacements_summary=replacements_summary)
-        for segment in manifest.segments
-    ]
+    all_items: list[dict[str, Any]] = []
+    for segment in manifest.segments:
+        item = _asr_segment_audit_item(segment, replacements_summary=replacements_summary)
+        source_text = str(item.get("source_text") or "").strip()
+        repair_item = _asr_segment_repair_item(segment, repair_summary)
+        if source_text and repair_item is not None:
+            candidate_text = _asr_repair_item_preferred_candidate_text(repair_item)
+            if candidate_text:
+                item["candidate_text"] = candidate_text
+                item["repair_accepted"] = bool(repair_item.get("accepted"))
+                _attach_asr_candidate_equivalence_fields(
+                    item,
+                    source_text=source_text,
+                    candidate_text=candidate_text,
+                    cfg=cfg,
+                )
+        all_items.append(item)
     report_items = [
         item
         for item in all_items
@@ -6356,6 +7566,9 @@ def _build_asr_high_risk_report(
         "repair_attempted": _asr_summary_int(repair_summary.get("attempted")),
         "repair_repaired": _asr_summary_int(repair_summary.get("repaired")),
         "asr_review_attempted": _asr_summary_int(asr_review_summary.get("attempted")),
+        "asr_review_guarded_auto_replaced": _asr_summary_int(
+            asr_review_summary.get("guarded_auto_replaced")
+        ),
         "asr_review_manual_review": _asr_summary_int(asr_review_summary.get("manual_review")),
         "filtered_chunk_count": len(list(filtered_summary or [])),
         "automated_dubbing_ready": automated_dubbing_ready,
@@ -6408,6 +7621,7 @@ def _write_asr_diagnostics_artifacts(
     replacements_summary: dict[str, Any],
     filtered_summary: list[dict[str, Any]],
     qwen_fallback_summary: dict[str, Any],
+    segment_retry_summary: dict[str, Any],
 ) -> None:
     transcribe_dir = project_dir / "work" / "transcribe"
     input_path = transcribe_dir / "asr_input_diagnostics.json"
@@ -6463,6 +7677,7 @@ def _write_asr_diagnostics_artifacts(
         "final_asr_chunks": final_chunk_rows,
         "repair": repair_summary,
         "asr_review": asr_review_summary,
+        "segment_retry": segment_retry_summary,
         "text_replacements": replacements_summary,
         "filtered_chunks": filtered_summary,
         "qwen_repair_fallback": qwen_fallback_summary,
@@ -6488,6 +7703,8 @@ def _write_asr_diagnostics_artifacts(
         "final_asr_word_count": sum(len(chunk.words) for chunk in final_chunks),
         "repair_attempted": repair_summary.get("attempted", 0),
         "repair_repaired": repair_summary.get("repaired", 0),
+        "segment_retry_attempted": segment_retry_summary.get("attempted", 0),
+        "segment_retry_repaired": segment_retry_summary.get("repaired", 0),
         "asr_review_attempted": asr_review_summary.get("attempted", 0),
         "asr_review_replaced": asr_review_summary.get("replaced", 0),
         "text_replacements": replacements_summary,
@@ -6592,15 +7809,23 @@ def _select_voice_ref_spans(
     source_language = _canonical_language(getattr(cfg, "source_language", "ja"))
     ref_min_sec = float(getattr(cfg, "gsv_ref_min_sec", 3.0))
     ref_max_sec = float(getattr(cfg, "gsv_ref_max_sec", 10.0))
-    candidates = [
+    max_gap_sec = float(getattr(cfg, "asr_resegment_merge_gap_sec", 1.0))
+    seed_segments = [
         segment
         for segment in sorted(manifest.segments, key=lambda item: (item.start, item.end, item.id))
         if _segment_can_seed_voice_ref(segment, source_language)
     ]
+    candidates = [
+        segment
+        for segment in seed_segments
+        if not _voice_ref_segment_reject_reasons(segment, cfg)
+    ]
     scored: list[tuple[tuple[float, ...], _VoiceRefSpan, AudioQualityMetrics | None]] = []
     for index, segment in enumerate(candidates):
-        span = _build_voice_ref_span(candidates, index, ref_min_sec, ref_max_sec)
+        span = _build_voice_ref_span(candidates, index, ref_min_sec, ref_max_sec, max_gap_sec)
         if span is None:
+            continue
+        if _voice_ref_span_reject_reasons(span, seed_segments, max_gap_sec):
             continue
         metrics = None
         try:
@@ -6645,15 +7870,125 @@ def _segment_can_seed_voice_ref(segment: Segment, source_language: str) -> bool:
     )
 
 
+def _voice_ref_segment_reject_reasons(segment: Segment, cfg: Any | None = None) -> tuple[str, ...]:
+    del cfg
+    reasons: list[str] = []
+    analysis = segment.analysis if isinstance(segment.analysis, dict) else {}
+    asr_gate = analysis.get("asr_quality_gate")
+    if isinstance(asr_gate, dict):
+        decision = str(asr_gate.get("decision") or "").strip().lower()
+        if asr_gate.get("tts_blocked") is True:
+            reasons.append("asr_quality_gate_tts_blocked")
+        if decision in {"block", "blocked", "reject", "rejected", "manual_review"}:
+            reasons.append(f"asr_quality_gate:{decision}")
+    voice_training = analysis.get("voice_training")
+    if isinstance(voice_training, dict):
+        if voice_training.get("exclude") is True:
+            reasons.append("voice_training_exclude")
+        if voice_training.get("eligible") is False:
+            reasons.append("voice_training_ineligible")
+        if voice_training.get("clean_voice") is False:
+            reasons.append("voice_training_unclean")
+        effect_tags = voice_training.get("effect_tags")
+        if isinstance(effect_tags, str):
+            raw_tags = [effect_tags]
+        elif isinstance(effect_tags, list):
+            raw_tags = effect_tags
+        else:
+            raw_tags = []
+        for tag in raw_tags:
+            normalized = str(tag).strip().lower()
+            if normalized and normalized not in {"none", "clean", "natural", "no_effect"}:
+                reasons.append(f"voice_training_effect_tag:{normalized}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _voice_ref_span_reject_reasons(
+    span: _VoiceRefSpan,
+    neighboring_segments: Sequence[Segment] | None = None,
+    max_gap_sec: float = 1.0,
+) -> list[str]:
+    reasons: list[str] = []
+    repetition_reason = _voice_ref_prompt_repetition_reject_reason(
+        _voice_ref_span_prompt_text(span)
+    )
+    if repetition_reason:
+        reasons.append(repetition_reason)
+    for left, right in zip(span.segments, span.segments[1:], strict=False):
+        left_text = left.source_script.text if left.source_script else ""
+        right_text = right.source_script.text if right.source_script else ""
+        if _source_split_inside_japanese_word(left_text, right_text):
+            reasons.append(
+                f"source_split_inside_japanese_word:{left.id}->{right.id}"
+            )
+    if neighboring_segments:
+        sorted_neighbors = sorted(neighboring_segments, key=lambda item: (item.start, item.end, item.id))
+        span_ids = {segment.id for segment in span.segments}
+        first = span.segments[0]
+        last = span.segments[-1]
+        previous = None
+        next_segment = None
+        for index, segment in enumerate(sorted_neighbors):
+            if segment.id == first.id:
+                if index > 0:
+                    previous = sorted_neighbors[index - 1]
+                break
+        for index, segment in enumerate(sorted_neighbors):
+            if segment.id == last.id:
+                if index + 1 < len(sorted_neighbors):
+                    next_segment = sorted_neighbors[index + 1]
+                break
+        if previous is not None and previous.id not in span_ids:
+            gap = max(0.0, first.start - previous.end)
+            left_text = previous.source_script.text if previous.source_script else ""
+            right_text = first.source_script.text if first.source_script else ""
+            if gap <= max_gap_sec and _source_split_inside_japanese_word(left_text, right_text):
+                reasons.append(
+                    f"source_split_inside_japanese_word:{previous.id}->{first.id}"
+                )
+        if next_segment is not None and next_segment.id not in span_ids:
+            gap = max(0.0, next_segment.start - last.end)
+            left_text = last.source_script.text if last.source_script else ""
+            right_text = next_segment.source_script.text if next_segment.source_script else ""
+            if gap <= max_gap_sec and _source_split_inside_japanese_word(left_text, right_text):
+                reasons.append(
+                    f"source_split_inside_japanese_word:{last.id}->{next_segment.id}"
+                )
+    return reasons
+
+
+def _voice_ref_prompt_repetition_reject_reason(prompt_text: str) -> str | None:
+    tokens = [
+        token
+        for token in re.split(r"[\s、。,.!?！？]+", prompt_text.strip())
+        if token
+    ]
+    if len(tokens) >= 3 and len(set(tokens)) / len(tokens) <= 0.5:
+        return "prompt_text_repetitive"
+    compact = re.sub(r"\s+", "", prompt_text.strip())
+    for unit_size in range(1, min(5, len(compact) // 2 + 1)):
+        if len(compact) % unit_size:
+            continue
+        repeat_count = len(compact) // unit_size
+        if repeat_count >= 3 and compact == compact[:unit_size] * repeat_count:
+            return "prompt_text_repetitive"
+    return None
+
+
 def _build_voice_ref_span(
     candidates: list[Segment],
     start_index: int,
     min_sec: float,
     max_sec: float,
+    max_gap_sec: float,
 ) -> _VoiceRefSpan | None:
     segments: list[Segment] = []
     duration = 0.0
     for segment in candidates[start_index:]:
+        if segments:
+            gap = max(0.0, segment.start - segments[-1].end)
+            if gap > max_gap_sec:
+                return None if duration < min_sec else _VoiceRefSpan(tuple(segments), duration)
         next_duration = duration + segment.duration
         if next_duration > max_sec:
             return None if duration < min_sec else _VoiceRefSpan(tuple(segments), duration)
@@ -6867,7 +8202,11 @@ def _prepare_gsv_speaker_refs(
     refs_dir.mkdir(parents=True, exist_ok=True)
     refs_path = ensure_inside_project(project_dir, refs_dir / "refs.json")
     aux_spans = selected_spans[1:]
-    prompt_text = _voice_ref_span_prompt_text(selected_span)
+    prompt_lang = selected_span.segments[0].source_script.language or cfg.source_language
+    prompt_text, prompt_text_original, prompt_text_flags = _model_boundary_text_for_language(
+        _voice_ref_span_prompt_text(selected_span),
+        prompt_lang,
+    )
     data: dict[str, dict[str, Any]] = {}
     for style in ("whisper_close", "sleepy"):
         raw_ref_path = f"refs/speakers/{speaker_id}/{style}.wav"
@@ -6882,12 +8221,17 @@ def _prepare_gsv_speaker_refs(
         data[style] = {
             "ref_audio_path": raw_ref_path,
             "prompt_text": prompt_text,
-            "prompt_lang": selected_span.segments[0].source_script.language or cfg.source_language,
+            "prompt_text_original": prompt_text_original,
+            "prompt_lang": prompt_lang,
             "aux_ref_audio_paths": aux_ref_audio_paths,
             "source_language": cfg.source_language,
             "target_language": cfg.target_language,
             "speaker_id": speaker_id,
             "cross_lingual_role": "ja_source_prompt_for_ko_tts",
+            "text_normalization": {
+                "policy": "ja_hiragana" if _canonical_language(prompt_lang) == "ja" else "none",
+                "risk_flags": prompt_text_flags,
+            },
         }
     write_json_atomic(refs_path, data)
     return refs_path
@@ -7704,6 +9048,10 @@ def _rvc_rejected_training_row(row: dict[str, Any], reject_reasons: Sequence[str
         "background_bleed_db",
         "side_to_mid_db",
         "source_chars_per_sec",
+        "source_text",
+        "source_text_original",
+        "source_text_language",
+        "text_normalization",
         "training_rank_score",
         "training_quality_tier",
     ):
@@ -7860,6 +9208,7 @@ def _rvc_train_dataset(
                 "duration_sec": round(segment.duration, 6),
                 "analysis_speaker_count": segment.analysis.get("speaker_count"),
             }
+            row.update(_source_script_text_audit_fields(segment))
             row.update(
                 _rvc_training_audit_fields(
                     check.metrics,
@@ -7888,6 +9237,7 @@ def _rvc_train_dataset(
                 "dataset_path": str(dataset_dir / f"{segment.id}.wav"),
                 "duration_sec": round(segment.duration, 6),
             }
+            row.update(_source_script_text_audit_fields(segment))
             if source_chars_per_sec is not None:
                 row["source_chars_per_sec"] = round(source_chars_per_sec, 6)
             rank_score = _rvc_training_rank_score(row, cfg)

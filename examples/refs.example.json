@@ -1,12 +1,14 @@
 {
   "sleepy": {
     "prompt_lang": "ja",
-    "prompt_text": "もう少しだけ、力を抜いてくださいね。",
+    "prompt_text": "モースコシダケ、チカラヲヌイテクダサイネ。",
+    "prompt_text_original": "もう少しだけ、力を抜いてくださいね。",
     "ref_audio_path": "refs/sleepy.wav"
   },
   "whisper_close": {
     "prompt_lang": "ja",
-    "prompt_text": "それじゃあ……耳元で、ゆっくり囁いていきますね。",
+    "prompt_text": "ソレジャー……ミミモトデ、ユックリササヤイテイキマスネ。",
+    "prompt_text_original": "それじゃあ……耳元で、ゆっくり囁いていきますね。",
     "ref_audio_path": "refs/whisper_close.wav"
   }
 }

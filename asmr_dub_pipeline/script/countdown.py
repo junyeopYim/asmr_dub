@@ -12,6 +12,7 @@ _TOKEN_RE = re.compile(
     rf"\d{{1,2}}|ゼロ|ぜろ|れい|レイ|零|〇|{_KANA_TENS_PATTERN}|{_KANA_ONES_PATTERN}|十[一二三四五六七八九]?|[二三四五六七八九]十[一二三四五六七八九]?|[一二三四五六七八九]"
 )
 _ALLOWED_REMAINDER_RE = re.compile(r"^[\s,，、。!！?？・:：;；／/\\\-~〜…]*$")
+_JAPANESE_WORD_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fffー々]")
 _TRIPLE_DOT_RE = re.compile(r"\.{2,}")
 _SINGLE_DOT_BETWEEN_DIGITS_RE = re.compile(r"\d[.．]\d")
 _JAPANESE_ONES = {
@@ -76,16 +77,39 @@ _NATIVE_KOREAN_TENS = {
     80: "여든",
     90: "아흔",
 }
+_SINO_KOREAN_ONES = {
+    0: "영",
+    1: "일",
+    2: "이",
+    3: "삼",
+    4: "사",
+    5: "오",
+    6: "육",
+    7: "칠",
+    8: "팔",
+    9: "구",
+}
+_SINO_KOREAN_TENS = {
+    10: "십",
+    20: "이십",
+    30: "삼십",
+    40: "사십",
+    50: "오십",
+    60: "육십",
+    70: "칠십",
+    80: "팔십",
+    90: "구십",
+}
 
 
 def source_countdown_values(text: str) -> list[int] | None:
     normalized = _normalize_source_countdown_text(text)
     if not normalized or _SINGLE_DOT_BETWEEN_DIGITS_RE.search(normalized):
         return None
-    matches = list(_TOKEN_RE.finditer(normalized))
+    matches = _source_countdown_matches(normalized)
     if not matches:
         return None
-    remainder = _TOKEN_RE.sub("", normalized)
+    remainder = _remove_countdown_matches(normalized, matches)
     if not _ALLOWED_REMAINDER_RE.fullmatch(remainder):
         return None
     values: list[int] = []
@@ -102,7 +126,7 @@ def source_countdown_token_matches(text: str) -> list[tuple[int, str, int, int]]
     if not normalized or _SINGLE_DOT_BETWEEN_DIGITS_RE.search(normalized):
         return []
     matches: list[tuple[int, str, int, int]] = []
-    for match in _TOKEN_RE.finditer(normalized):
+    for match in _source_countdown_matches(normalized):
         raw = match.group(0)
         value = _source_token_value(raw)
         if value is None or not 0 <= value <= 99:
@@ -184,8 +208,22 @@ def native_korean_count_number(value: int) -> str | None:
     return None
 
 
+def sino_korean_count_number(value: int) -> str | None:
+    if value in _SINO_KOREAN_ONES:
+        return _SINO_KOREAN_ONES[value]
+    if value in _SINO_KOREAN_TENS:
+        return _SINO_KOREAN_TENS[value]
+    if 10 < value < 100:
+        tens, ones = divmod(value, 10)
+        tens_text = _SINO_KOREAN_TENS.get(tens * 10)
+        ones_text = _SINO_KOREAN_ONES.get(ones)
+        if tens_text and ones_text:
+            return tens_text + ones_text
+    return None
+
+
 def countdown_korean_tokens(values: list[int]) -> list[str] | None:
-    tokens = [native_korean_count_number(value) for value in values]
+    tokens = [sino_korean_count_number(value) for value in values]
     if any(token is None for token in tokens):
         return None
     return [str(token) for token in tokens]
@@ -201,6 +239,43 @@ def countdown_korean_text(values: list[int], *, separator: str = ", ") -> str | 
 def _normalize_source_countdown_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text or "").strip()
     return _TRIPLE_DOT_RE.sub("…", normalized)
+
+
+def _source_countdown_matches(text: str) -> list[re.Match[str]]:
+    return [match for match in _TOKEN_RE.finditer(text) if _is_countdown_token_match(text, match)]
+
+
+def _remove_countdown_matches(text: str, matches: list[re.Match[str]]) -> str:
+    if not matches:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for match in matches:
+        pieces.append(text[cursor : match.start()])
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _is_countdown_token_match(text: str, match: re.Match[str]) -> bool:
+    raw = match.group(0)
+    if not _is_kana_countdown_reading(raw):
+        return True
+    before = text[match.start() - 1] if match.start() > 0 else ""
+    after = text[match.end()] if match.end() < len(text) else ""
+    return not _is_japanese_word_char(before) and not _is_japanese_word_char(after)
+
+
+def _is_kana_countdown_reading(token: str) -> bool:
+    return (
+        token in _JAPANESE_KANA_ONES
+        or token in {"ゼロ", "ぜろ", "れい", "レイ"}
+        or any(token.startswith(prefix) for prefix in _JAPANESE_KANA_TEN_PREFIXES)
+    )
+
+
+def _is_japanese_word_char(char: str) -> bool:
+    return bool(char and _JAPANESE_WORD_CHAR_RE.fullmatch(char))
 
 
 def _source_token_value(token: str) -> int | None:

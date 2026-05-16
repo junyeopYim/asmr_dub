@@ -51,12 +51,14 @@ STANDARD_DIRS = [
 DEFAULT_REFS = {
     "whisper_close": {
         "ref_audio_path": "refs/whisper_close.wav",
-        "prompt_text": "それじゃあ……耳元で、ゆっくり囁いていきますね。",
+        "prompt_text": "それじゃー……みみもとで、ゆっくりささやいていきますね。",
+        "prompt_text_original": "それじゃあ……耳元で、ゆっくり囁いていきますね。",
         "prompt_lang": "ja",
     },
     "sleepy": {
         "ref_audio_path": "refs/sleepy.wav",
-        "prompt_text": "もう少しだけ、力を抜いてくださいね。",
+        "prompt_text": "もーすこしだけ、ちからをぬいてくださいね。",
+        "prompt_text_original": "もう少しだけ、力を抜いてくださいね。",
         "prompt_lang": "ja",
     },
 }

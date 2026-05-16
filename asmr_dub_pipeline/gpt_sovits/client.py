@@ -8,6 +8,8 @@ from pathlib import Path
 
 import httpx
 
+from asmr_dub_pipeline.script.normalizer import normalize_japanese_kana_text
+
 from .schemas import GPTSoVITSRef, GPTSoVITSTTSOptions, GPTSoVITSTTSRequest
 
 
@@ -16,6 +18,10 @@ class GPTSoVITSError(RuntimeError):
 
 
 _HANGUL_RE = re.compile(r"[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]")
+_CUDA_ILLEGAL_MEMORY_RE = re.compile(
+    r"(?:cudaErrorIllegalAddress|illegal memory access)",
+    flags=re.IGNORECASE,
+)
 
 
 def contains_hangul(text: str) -> bool:
@@ -46,6 +52,9 @@ def build_tts_request(
     options = options or GPTSoVITSTTSOptions()
     text_lang = normalize_api_language_code(options.text_lang)
     prompt_lang = normalize_api_language_code(ref.prompt_lang or "ja")
+    prompt_text = ref.prompt_text
+    if prompt_lang == "all_ja":
+        prompt_text = normalize_japanese_kana_text(prompt_text).text
     if contains_hangul(text) and text_lang != "all_ko":
         raise GPTSoVITSError(
             "Korean TTS text must use text_lang='all_ko', got "
@@ -56,7 +65,7 @@ def build_tts_request(
         text=text,
         text_lang=text_lang,
         ref_audio_path=ref.ref_audio_path,
-        prompt_text=ref.prompt_text,
+        prompt_text=prompt_text,
         prompt_lang=prompt_lang,
         aux_ref_audio_paths=list(ref.aux_ref_audio_paths),
         top_k=options.top_k,
@@ -117,6 +126,13 @@ class GPTSoVITSClient:
                     message = f"{primary}: {detail}" if detail else primary
             except ValueError:
                 pass
+            if _CUDA_ILLEGAL_MEMORY_RE.search(message):
+                message = (
+                    f"{message} "
+                    "The CUDA context for this GPT-SoVITS api_v2 process is likely corrupted; "
+                    "restart the GPT-SoVITS api_v2 process before retrying, and reduce concurrent "
+                    "model switches or inference load if it recurs."
+                )
             raise GPTSoVITSError(f"{endpoint} failed with HTTP {response.status_code}: {message}")
         if "json" in content_type.lower():
             try:

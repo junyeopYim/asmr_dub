@@ -214,6 +214,35 @@ def test_folder_input_planner_silences_duplicate_effect_variants_for_asr(tmp_pat
     assert other.resolve() not in plan.asr_silent_parts
 
 
+def test_folder_input_planner_silences_effect_only_tracks_for_asr(tmp_path: Path) -> None:
+    folder = tmp_path / "RJEFFECT"
+    main = write_tiny_wav(folder / "01_本編" / "01 本編.mp3", duration=0.7)
+    effect_only = write_tiny_wav(
+        folder / "93_おまけ（耳責めの効果音のみ抜粋）" / "効果音トラック02e.mp3",
+        duration=0.7,
+    )
+
+    plan = preprocess.plan_folder_input(folder)
+
+    assert plan.status == "planned"
+    assert plan.asr_source_status == "mix_parts_silenced_for_asr"
+    assert plan.asr_parts == plan.mix_parts
+    assert main.resolve() not in plan.asr_silent_parts
+    assert effect_only.resolve() in plan.asr_silent_parts
+
+    metadata = preprocess.folder_input_metadata(
+        plan,
+        mix_audio_path=tmp_path / "mix.wav",
+        asr_audio_path=tmp_path / "asr.wav",
+    )
+    effect_record = next(
+        part for part in metadata["asr_parts"] if Path(part["path"]).name == "効果音トラック02e.mp3"
+    )
+    assert effect_record["asr_silenced"] is True
+    assert effect_record["asr_skip_reason"] == "effect_only"
+    assert metadata["asr_silent_part_count"] == 1
+
+
 def test_numbered_part_merge_planner_refuses_ambiguous_base_file(tmp_path: Path) -> None:
     write_tiny_wav(tmp_path / "RJAMB.wav")
     part_1 = write_tiny_wav(tmp_path / "RJAMB_1.wav")
@@ -454,7 +483,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.asr_batch_size == 16
     assert cfg.asr_word_timestamps is True
     assert cfg.asr_diagnostics_enabled is True
-    assert cfg.asr_resegment_max_sec == 14.0
+    assert cfg.asr_resegment_max_sec == 10.0
     assert cfg.asr_repair_enabled is True
     assert cfg.asr_qwen_repair_fallback_enabled is True
     assert cfg.asr_review_enabled is True
@@ -470,8 +499,20 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gsv_few_shot_max_side_to_mid_db == -6.0
     assert cfg.gsv_few_shot_preferred_chars_per_sec == 4.5
     assert cfg.gsv_few_shot_max_chars_per_sec == 5.2
-    assert cfg.gsv_few_shot_prefer_plain_text is True
-    assert cfg.gsv_concurrency == 6
+    assert cfg.gsv_few_shot_enabled is True
+    assert cfg.gsv_few_shot_min_selection_score == 0.50
+    assert cfg.gsv_few_shot_max_total_sec == 240.0
+    assert cfg.gsv_few_shot_asr_risk_filter is True
+    assert cfg.gsv_few_shot_prefer_plain_text is False
+    assert cfg.gsv_concurrency == 2
+    assert cfg.gsv_pronunciation_qc_workers == 2
+    assert cfg.gsv_numeric_cadence_periods_enabled is True
+    assert cfg.gsv_numeric_cadence_min_values == 3
+    assert cfg.gsv_numeric_sequence_qc_enabled is True
+    assert cfg.gsv_numeric_sequence_qc_require_contiguous is True
+    assert cfg.gsv_numeric_sequence_qc_failure_blocks_mix is True
+    assert cfg.gsv_gpt_weights_policy == "auto"
+    assert cfg.gsv_sovits_weights_policy == "auto"
     assert cfg.gsv_ref_mode == "segment"
     assert cfg.gsv_ref_min_sec == 3.0
     assert cfg.gsv_ref_max_sec == 10.0
@@ -502,6 +543,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.gemma_text_span_size == 10
     assert cfg.gemma_text_span_max_sec == 75.0
     assert cfg.gemma_text_span_max_gap_sec == 5.0
+    assert cfg.gemma_audio_style_scope == "speaker_suspicious"
     assert cfg.mix_allow_korean_timing_draft is False
     assert cfg.rvc_required is True
     assert cfg.rvc_backend == "command"
@@ -509,7 +551,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.rvc_train_backend == "command"
     assert cfg.rvc_train_timeout_sec == 43200.0
     assert cfg.rvc_train_sample_rate == 48_000
-    assert cfg.rvc_train_epochs == 20
+    assert cfg.rvc_train_epochs == 100
     assert cfg.rvc_train_experiment_name == f"asmr-{tiny_wav_path.stem.lower()}-speaker-1"
     assert cfg.rvc_train_command
     assert str(fake_repo / "asmr_dub_pipeline/rvc/webui_train.py") in cfg.rvc_train_command
@@ -522,7 +564,7 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert cfg.rvc_train_preprocess_processes == 0
     assert cfg.rvc_train_f0_workers == 0
     assert cfg.rvc_train_feature_workers == 0
-    assert cfg.rvc_train_save_every_epoch == 5
+    assert cfg.rvc_train_save_every_epoch == 10
     assert cfg.rvc_train_reuse_intermediate_cache is True
     assert cfg.rvc_concurrency == 4
     assert cfg.rvc_batch_infer is True
@@ -549,6 +591,86 @@ def test_full_real_applies_high_quality_preset_by_default(
     assert kwargs["few_shot"] is True
     assert kwargs["gsv_few_shot_force"] is True
     assert kwargs["regenerate_before_mix"] is True
+
+
+def test_full_real_zero_shot_flag_opts_out_of_training_preset(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "full_real_zero_shot"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--real",
+            "--zero-shot",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = load_project_config(project)
+    assert cfg.gsv_few_shot_enabled is False
+    assert cfg.gsv_gpt_weights_policy == "base_for_korean"
+    assert cfg.gsv_sovits_weights_policy == "unchanged"
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["few_shot"] is False
+
+
+def test_full_real_few_shot_flag_opts_into_training_preset(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "full_real_few_shot"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--real",
+            "--few-shot",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = load_project_config(project)
+    assert cfg.gsv_few_shot_enabled is True
+    assert cfg.gsv_gpt_weights_policy == "auto"
+    assert cfg.gsv_sovits_weights_policy == "auto"
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["few_shot"] is True
 
 
 def test_full_real_use_trained_gpt_flag_passes_to_pipeline(
@@ -585,6 +707,142 @@ def test_full_real_use_trained_gpt_flag_passes_to_pipeline(
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["use_trained_gpt"] is True
+
+
+def test_run_defaults_to_zero_shot_unless_few_shot_is_requested(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "run_zero_shot"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "run",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["few_shot"] is False
+
+
+def test_run_few_shot_flag_opts_into_training(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "run_few_shot"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "run",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--few-shot",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["few_shot"] is True
+
+
+def test_run_force_rvc_train_flag_passes_to_pipeline(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "run_force_rvc_train"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "run",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--force-rvc-train",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["rvc_train_force"] is True
+
+
+def test_full_real_forces_rvc_train_by_default(
+    cli_runner,
+    tiny_wav_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "full_real_force_rvc_train"
+    captured: dict[str, object] = {}
+
+    def fake_run_pipeline(*args: object, **kwargs: object) -> PipelineManifest:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return PipelineManifest(artifacts={"export": "out.wav"})
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "full",
+            str(tiny_wav_path),
+            "--project",
+            str(project),
+            "--confirm-rights",
+            "--real",
+            "--no-cache-status",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["rvc_train_force"] is True
 
 
 def test_full_real_asr_backend_flag_passes_to_pipeline(

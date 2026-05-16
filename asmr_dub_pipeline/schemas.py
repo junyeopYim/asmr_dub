@@ -21,6 +21,7 @@ SegmentStatus = Literal[
     "ok",
     "needs_regeneration",
     "needs_manual_review",
+    "absorbed",
     "no_speech_detected",
     "non_speech_texture",
     "failed",
@@ -50,8 +51,25 @@ GSVGPTWeightsPolicy = Literal["auto", "explicit", "few_shot", "base_for_korean",
 GSVSoVITSWeightsPolicy = Literal["auto", "explicit", "few_shot", "unchanged"]
 GSVRefMode = Literal["static", "segment", "auto"]
 GSVDurationRewriteBackend = Literal["none", "gemma"]
+GSVDurationRewriteTiming = Literal["after_initial", "before_zero_shot"]
+GSVTerminalFailurePolicy = Literal["keep_original", "fail"]
+GSVTimingQualityGate = Literal["good", "warn", "fail", "unknown"]
 SpeakerAssignmentBackend = Literal["none", "mock", "pyannote"]
 ASRPreset = Literal["default", "conservative", "whisper", "no_vad_repair"]
+
+DEFAULT_COUNTDOWN_CARRIER_TOKEN_TEMPLATES: dict[str, list[str]] = {
+    "십": ["십 번만요."],
+    "구": ["구팔칠.", "구, 팔, 칠.", "{token}, 살짝만."],
+    "팔": ["정답은 팔, 여기.", "팔, 작게요.", "팔 초만요."],
+    "칠": ["칠 초만요.", "칠, 작게요.", "7."],
+    "육": ["육 초만요.", "육, 작게요.", "6, 육."],
+    "오": ["오 초만요.", "오, 작게요.", "오, 천천히요."],
+    "사": ["사아 번만요."],
+    "삼": ["삼 번만요.", "삼 초만요.", "삼 하고요."],
+    "이": ["이 하고요.", "이 번만요."],
+    "일": ["1.", "일, 천천히요.", "일 번만요.", "일, 일."],
+    "영": ["영 하고요.", "영 번만요.", "영 초만요."],
+}
 
 
 def utc_now() -> datetime:
@@ -237,6 +255,29 @@ class VoiceBankManifest(StrictBaseModel):
 BUILTIN_ASR_CORRECTION_PROFILE = "builtin:asmr_ja"
 
 
+class ASRAutoResolutionRule(StrictBaseModel):
+    id: str
+    source: str
+    target: str
+    required_any: list[str] = Field(default_factory=list)
+    required_all: list[str] = Field(default_factory=list)
+    negative_any: list[str] = Field(default_factory=list)
+    action: Literal["auto_replace"] = "auto_replace"
+
+    @field_validator("id")
+    @classmethod
+    def _validate_rule_id(cls, value: str) -> str:
+        return validate_file_safe_id(value, "asr_review_auto_resolution_rule.id")
+
+    @field_validator("source", "target")
+    @classmethod
+    def _validate_non_empty_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("ASR auto-resolution source and target must not be empty")
+        return stripped
+
+
 class ASRCorrectionProfile(StrictBaseModel):
     initial_prompt: str = ""
     review_initial_prompt: str = ""
@@ -246,6 +287,7 @@ class ASRCorrectionProfile(StrictBaseModel):
     text_replacements: dict[str, str] = Field(default_factory=dict)
     review_suspicious_text_patterns: list[str] = Field(default_factory=list)
     review_candidate_replacements: dict[str, str] = Field(default_factory=dict)
+    review_auto_resolution_rules: list[ASRAutoResolutionRule] = Field(default_factory=list)
     translation_backcheck_source_patterns: list[str] = Field(default_factory=list)
     translation_backcheck_ko_patterns: list[str] = Field(default_factory=list)
 
@@ -287,7 +329,7 @@ class ASRConfig(StrictBaseModel):
     model_id: str = "Systran/faster-whisper-large-v3"
     language: str = "ja"
     local_files_only: bool = True
-    device: str = "auto"
+    device: str = "cuda"
     compute_type: str = "default"
     batched_inference: bool = False
     batch_size: int = Field(default=8, ge=1)
@@ -315,7 +357,7 @@ class ASRConfig(StrictBaseModel):
     qwen_max_new_tokens: int = Field(default=4096, ge=1)
     resegment_from_chunks: bool = True
     resegment_min_sec: float = Field(default=3.0, gt=0)
-    resegment_max_sec: float = Field(default=20.0, gt=0)
+    resegment_max_sec: float = Field(default=10.0, gt=0)
     resegment_merge_gap_sec: float = Field(default=1.0, ge=0)
     countdown_merge_enabled: bool = True
     countdown_merge_gap_sec: float = Field(default=2.5, ge=0)
@@ -323,12 +365,15 @@ class ASRConfig(StrictBaseModel):
     sparse_chunk_max_sec: float = Field(default=30.0, gt=0)
     sparse_chunk_min_chars_per_sec: float = Field(default=0.5, ge=0)
     repair_enabled: bool = True
-    repair_confidence_threshold: float = Field(default=0.94, ge=0.0, le=1.0)
+    repair_confidence_threshold: float = Field(default=0.90, ge=0.0, le=1.0)
     repair_sparse_min_sec: float = Field(default=12.0, gt=0)
     repair_sparse_min_chars_per_sec: float = Field(default=1.0, ge=0)
     repair_padding_sec: float = Field(default=1.0, ge=0)
     repair_max_chunks: int = Field(default=160, ge=0)
     qwen_repair_fallback_enabled: bool = False
+    repair_rejected_short_fragment_auto_accept: bool = True
+    repair_rejected_short_fragment_max_sec: float = Field(default=0.8, gt=0)
+    repair_rejected_short_fragment_min_confidence: float = Field(default=0.85, ge=0.0, le=1.0)
     review_enabled: bool = False
     review_backend: Literal["llama_server_audio", "mock"] = "llama_server_audio"
     review_batch_size: int = Field(default=8, ge=1, le=50)
@@ -339,6 +384,11 @@ class ASRConfig(StrictBaseModel):
     review_candidate_padding_sec: list[float] = Field(default_factory=lambda: [0.4, 1.2])
     review_audio_padding_sec: float = Field(default=0.4, ge=0.0)
     review_initial_prompt: str = ""
+    channel_split_enabled: bool = True
+    channel_split_padding_sec: float = Field(default=1.4, ge=0.0)
+    channel_split_wide_padding_sec: float = Field(default=3.0, ge=0.0)
+    channel_split_max_segments: int = Field(default=80, ge=0)
+    channel_split_no_dialog_texture_max_sec: float = Field(default=1.5, gt=0.0)
     translation_backcheck_enabled: bool = True
     translation_backcheck_mark_manual_review: bool = False
     source_separation_backend: Literal["auto", "none", "demucs", "mock"] = "auto"
@@ -412,13 +462,24 @@ class GemmaConfig(StrictBaseModel):
     text_span_max_gap_sec: float = Field(default=5.0, ge=0)
     text_context_radius: int = Field(default=10, ge=0, le=20)
     text_two_pass: bool = True
+    text_auto_salvage_enabled: bool = True
+    text_repetition_omission_policy: Literal["warn", "manual_review"] = "warn"
     text_concurrency: int = Field(default=1, ge=1, le=8)
     audio_style_concurrency: int = Field(default=2, ge=1, le=8)
+    audio_style_scope: Literal["all", "speaker_suspicious"] = "all"
     text_n_predict: int = Field(default=1536, ge=64)
     text_timeout_sec: float = Field(default=180.0, gt=0)
     text_retries: int = Field(default=1, ge=0, le=5)
     text_server_startup_timeout_sec: float = Field(default=120.0, gt=0)
     text_server_shutdown_timeout_sec: float = Field(default=10.0, gt=0)
+
+    @field_validator("audio_style_scope", mode="before")
+    @classmethod
+    def _normalize_audio_style_scope(cls, value: Any) -> str:
+        normalized = str(value or "all").strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"speaker", "speaker_suspect"}:
+            return "speaker_suspicious"
+        return normalized
 
 
 class TTSConfig(StrictBaseModel):
@@ -465,7 +526,7 @@ class GSVConfig(StrictBaseModel):
     speaker_models: dict[str, GSVSpeakerConfig] = Field(default_factory=dict)
     timeout_sec: float = Field(default=120.0, gt=0)
     retries: int = Field(default=2, ge=0)
-    concurrency: int = Field(default=6, ge=1, le=8)
+    concurrency: int = Field(default=4, ge=1, le=8)
     auto_start: bool = False
     server_command: list[str] = Field(default_factory=list)
     server_cwd: str | None = None
@@ -484,6 +545,9 @@ class GSVConfig(StrictBaseModel):
     few_shot_max_side_to_mid_db: float = Field(default=-8.0, ge=-80.0, le=20.0)
     few_shot_preferred_chars_per_sec: float | None = Field(default=4.5, gt=0)
     few_shot_max_chars_per_sec: float | None = Field(default=5.2, gt=0)
+    few_shot_min_selection_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    few_shot_max_total_sec: float | None = Field(default=None, gt=0)
+    few_shot_asr_risk_filter: bool = True
     few_shot_prefer_plain_text: bool = True
     few_shot_pacing_target_enabled: bool = True
     few_shot_pacing_target_tolerance: float = Field(default=0.10, ge=0.0, le=2.0)
@@ -495,11 +559,18 @@ class GSVConfig(StrictBaseModel):
     few_shot_pacing_max_duration_overage_ratio: float = Field(default=0.10, ge=0.0, le=1.0)
     few_shot_relax_clean_source_for_pacing: bool = True
     few_shot_relaxed_clean_source_penalty: float = Field(default=0.15, ge=0.0, le=1.0)
-    few_shot_insufficient_policy: Literal["error", "zero_shot"] = "error"
+    few_shot_insufficient_policy: Literal["error", "zero_shot"] = "zero_shot"
     ref_mode: GSVRefMode = "static"
     ref_min_sec: float = Field(default=3.0, gt=0)
     ref_max_sec: float = Field(default=10.0, gt=0)
     ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
+    korean_segment_ref_enabled: bool = True
+    korean_segment_ref_clarity_profile_enabled: bool = True
+    korean_segment_ref_warn_blocks_mix: bool = True
+    korean_segment_ref_temperature: float = Field(default=0.75, ge=0.0, le=2.0)
+    korean_segment_ref_top_p: float = Field(default=0.85, gt=0.0, le=1.0)
+    korean_segment_ref_top_k: int = Field(default=8, ge=1)
+    korean_segment_ref_parallel_infer: bool = False
     ko_text_min_hangul_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     top_k: int = Field(default=15, ge=1)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
@@ -514,25 +585,174 @@ class GSVConfig(StrictBaseModel):
     fragment_interval: float = Field(default=0.3, ge=0.0)
     tts_min_speed_factor: float = Field(default=0.85, gt=0.0, le=1.0)
     tts_max_speed_factor: float = Field(default=1.12, ge=1.0, le=1.35)
-    countdown_renderer: Literal["token", "compact"] = "token"
-    countdown_fallback_renderer: Literal["compact", "manual_review", "none"] = "compact"
+    countdown_renderer: Literal[
+        "carrier_bank",
+        "chunk_bank",
+        "canonical_pack",
+        "token",
+        "compact",
+        "numeric_phrase",
+    ] = "numeric_phrase"
+    numeric_phrase_renderer_enabled: bool = True
+    numeric_phrase_max_tempo: float = Field(default=1.1, ge=1.0, le=2.0)
+    numeric_phrase_failure_fallback: Literal["manual_review", "normal_tts"] = "manual_review"
+    numeric_phrase_whole_lead_in_sec: float = Field(default=0.12, ge=0.0, le=1.0)
+    numeric_phrase_tail_guard_sec: float = Field(default=0.16, ge=0.0, le=1.0)
+    countdown_fallback_renderer: Literal["compact", "phrase_slice", "manual_review", "none"] = "manual_review"
     countdown_candidate_count: int = Field(default=8, ge=1, le=24)
+    countdown_carrier_templates: list[str] = Field(
+        default_factory=lambda: [
+            "이번 숫자는 {token}. 입니다.",
+            "숫자만 조용히 말해요. {token}. 다시.",
+        ],
+        min_length=0,
+        max_length=12,
+    )
+    countdown_carrier_token_templates: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            token: list(templates)
+            for token, templates in DEFAULT_COUNTDOWN_CARRIER_TOKEN_TEMPLATES.items()
+        }
+    )
+    countdown_carrier_numeric_unit_enabled: bool = True
+    countdown_carrier_numeric_unit_templates: list[str] = Field(
+        default_factory=lambda: [
+            "{token} 번만요.",
+            "{token} 입니다.",
+            "{token} 하고요.",
+            "{token} 초만요.",
+        ],
+        min_length=1,
+        max_length=12,
+    )
+    countdown_carrier_numeric_unit_onset_window_sec: list[float] = Field(
+        default_factory=lambda: [0.18, 0.24, 0.30, 0.36],
+        min_length=1,
+        max_length=8,
+    )
+    countdown_carrier_numeric_unit_tail_pad_sec: float = Field(default=0.04, ge=0.0, le=0.2)
+    countdown_carrier_slice_start_backoff_sec: float = Field(default=0.02, ge=0.0, le=0.08)
+    countdown_carrier_energy_extend_enabled: bool = True
+    countdown_carrier_energy_extend_max_sec: float = Field(default=0.10, ge=0.0, le=0.4)
+    countdown_carrier_energy_extend_coda_max_sec: float = Field(default=0.20, ge=0.0, le=0.5)
+    countdown_carrier_energy_extend_edge_threshold_ratio: float = Field(default=0.12, ge=0.01, le=0.8)
+    countdown_carrier_energy_extend_quiet_threshold_ratio: float = Field(default=0.08, ge=0.005, le=0.5)
+    countdown_carrier_bulk_asr_enabled: bool = True
+    countdown_carrier_bulk_asr_workers: int = Field(default=3, ge=1, le=8)
+    countdown_carrier_pause_gsv_for_bulk_asr: bool = False
+    countdown_carrier_candidate_count: int = Field(default=2, ge=1, le=8)
+    countdown_carrier_slice_search_enabled: bool = True
+    countdown_carrier_slice_window_sec: list[float] = Field(
+        default_factory=lambda: [0.30, 0.42, 0.55],
+        min_length=1,
+        max_length=8,
+    )
+    countdown_carrier_slice_window_offset_sec: list[float] = Field(
+        default_factory=lambda: [-0.06, 0.0, 0.06],
+        min_length=1,
+        max_length=9,
+    )
+    countdown_carrier_max_slice_windows_per_candidate: int = Field(default=5, ge=1, le=32)
+    countdown_carrier_full_sentence_prefilter_enabled: bool = True
+    countdown_carrier_full_sentence_prefilter_min_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
+    countdown_carrier_quality_retry_enabled: bool = True
+    countdown_carrier_quality_retry_max_rounds: int = Field(default=3, ge=1, le=12)
+    countdown_carrier_quality_retry_target_tier: Literal["A", "B", "C"] = "A"
+    countdown_token_bank_enabled: bool = True
+    countdown_token_bank_warmup_enabled: bool = True
+    countdown_token_bank_pack_warmup_enabled: bool = True
+    countdown_token_bank_pack_templates: list[str] = Field(
+        default_factory=lambda: [
+            "{token}, {token}, {token}",
+            "{token}. {token}. {token}.",
+            "{token}... {token}... {token}",
+        ],
+        min_length=1,
+        max_length=8,
+    )
+    countdown_token_bank_max_ref_count: int = Field(default=4, ge=1, le=16)
+    countdown_token_bank_beam_width: int = Field(default=8, ge=1, le=64)
+    countdown_carrier_stop_window_search_after_pronunciation_pass: bool = True
+    countdown_carrier_target_pronunciation_passes: int = Field(default=2, ge=0, le=32)
+    countdown_chunk_candidate_count: int = Field(default=10, ge=1, le=24)
+    countdown_chunk_max_size: int = Field(default=10, ge=1, le=10)
     countdown_temperature: float = Field(default=0.55, ge=0.0, le=2.0)
-    countdown_token_speed_factor: float = Field(default=1.20, ge=0.5, le=1.35)
+    countdown_timing_mode: Literal["source_smoothed", "even_grid", "source_exact"] = "source_smoothed"
+    countdown_source_anchor_enabled: bool = True
+    countdown_source_anchor_asr_retry_enabled: bool = True
+    countdown_source_anchor_smoothing_blend: float = Field(default=0.70, ge=0.0, le=1.0)
+    countdown_source_anchor_cluster_gap_sec: float = Field(default=2.6, ge=0.0, le=30.0)
+    countdown_hybrid_enabled: bool = True
+    countdown_hybrid_apply_to_synth: bool = True
+    countdown_hybrid_token_gap_fill_ratio: float = Field(default=0.72, gt=0.0, le=2.0)
+    countdown_hybrid_token_max_sec: float = Field(default=0.58, gt=0.0, le=5.0)
+    countdown_hybrid_active_trim_enabled: bool = True
+    countdown_hybrid_active_trim_keep_before_sec: float = Field(default=0.012, ge=0.0, le=1.0)
+    countdown_hybrid_active_trim_keep_after_sec: float = Field(default=0.045, ge=0.0, le=1.0)
+    countdown_hybrid_base_gain: float = Field(default=0.55, ge=0.0, le=2.0)
+    countdown_hybrid_bed_gain: float = Field(default=0.85, ge=0.0, le=2.0)
+    countdown_hybrid_base_duck_enabled: bool = True
+    countdown_hybrid_base_duck_gain: float = Field(default=0.18, ge=0.0, le=1.0)
+    countdown_hybrid_base_duck_pad_sec: float = Field(default=0.055, ge=0.0, le=1.0)
+    countdown_hybrid_base_duck_fade_sec: float = Field(default=0.025, ge=0.0, le=1.0)
+    countdown_strict_token_pronunciation: bool = True
+    countdown_pack_min_span_occupancy: float = Field(default=0.55, ge=0.0, le=1.0)
+    countdown_pack_retime_enabled: bool = True
+    countdown_pack_retime_trigger_max_gap_sec: float = Field(default=0.55, ge=0.0, le=5.0)
+    countdown_pack_retime_trigger_gap_cv: float = Field(default=0.35, ge=0.0, le=5.0)
+    countdown_pack_retime_target_min_gap_sec: float = Field(default=0.14, ge=0.0, le=1.0)
+    countdown_pack_retime_target_max_gap_sec: float = Field(default=0.28, ge=0.0, le=1.0)
+    countdown_pack_retime_leading_sec: float = Field(default=0.08, ge=0.0, le=1.0)
+    countdown_pack_retime_trailing_sec: float = Field(default=0.12, ge=0.0, le=1.0)
+    countdown_phrase_slice_edge_pad_sec: float = Field(default=0.04, ge=0.0, le=0.5)
+    countdown_token_speed_factor: float = Field(default=1.0, ge=0.5, le=1.35)
     countdown_token_min_sec: float = Field(default=0.25, ge=0.0, le=5.0)
     countdown_token_max_sec: float = Field(default=0.95, gt=0.0, le=10.0)
+    countdown_token_single_syllable_max_sec: float = Field(default=0.55, gt=0.0, le=10.0)
+    countdown_token_double_syllable_max_sec: float = Field(default=0.75, gt=0.0, le=10.0)
+    countdown_token_multi_syllable_max_sec: float = Field(default=0.95, gt=0.0, le=10.0)
     countdown_token_max_slot_occupancy: float = Field(default=0.85, gt=0.0, le=2.0)
-    countdown_max_tempo: float = Field(default=1.15, ge=1.0, le=8.0)
+    countdown_max_tempo: float = Field(default=1.0, ge=1.0, le=8.0)
+    countdown_prosody_qc_enabled: bool = True
+    countdown_prosody_max_median_semitone_error: float = Field(default=12.0, gt=0.0, le=48.0)
+    countdown_prosody_min_pass_score: float = Field(default=0.74, ge=0.0, le=1.0)
+    countdown_prosody_min_warn_score: float = Field(default=0.45, ge=0.0, le=1.0)
+    countdown_prosody_failure_blocks_mix: bool = True
     max_attempts_per_candidate: int = Field(default=3, ge=1, le=8)
     initial_candidate_count: int | None = Field(default=None, ge=1, le=8)
     retry_candidate_count: int | None = Field(default=7, ge=1, le=8)
     low_temperature_retry_enabled: bool = True
     low_temperature_retry_candidate_count: int | None = Field(default=20, ge=1, le=20)
     low_temperature_retry_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    pronunciation_qc_enabled: bool = True
+    pronunciation_qc_backend: Literal["auto", "mock", "faster_whisper", "qwen_asr"] = "auto"
+    pronunciation_qc_workers: int = Field(default=1, ge=1, le=4)
+    pronunciation_qc_pass_coverage: float = Field(default=0.82, ge=0.0, le=1.0)
+    pronunciation_qc_warn_coverage: float = Field(default=0.62, ge=0.0, le=1.0)
+    pronunciation_qc_max_observed_unit_ratio: float | None = Field(default=1.8, gt=0.0)
+    pronunciation_qc_max_extra_units: int | None = Field(default=1, ge=0)
+    pronunciation_qc_failure_blocks_mix: bool = True
+    numeric_cadence_periods_enabled: bool = True
+    numeric_cadence_min_values: int = Field(default=3, ge=3, le=20)
+    numeric_sequence_qc_enabled: bool = True
+    numeric_sequence_qc_require_contiguous: bool = True
+    numeric_sequence_qc_failure_blocks_mix: bool = True
+    korean_clarity_retry_enabled: bool = True
+    korean_clarity_retry_candidate_count: int | None = Field(default=None, ge=1, le=20)
+    korean_clarity_temperature: float = Field(default=0.65, ge=0.0, le=2.0)
+    korean_clarity_top_p: float = Field(default=0.75, gt=0.0, le=1.0)
+    korean_clarity_top_k: int = Field(default=5, ge=1)
+    korean_clarity_parallel_infer: bool = False
     zero_shot_candidate_count: int | None = Field(default=None, ge=1, le=8)
     duration_rewrite_backend: GSVDurationRewriteBackend = "none"
+    duration_rewrite_timing: GSVDurationRewriteTiming = "after_initial"
     duration_rewrite_max_attempts: int = Field(default=1, ge=0, le=5)
     duration_rewrite_pre_candidate_count: int | None = Field(default=None, ge=1, le=24)
+    timing_expansion_enabled: bool = True
+    timing_expansion_min_ratio: float = Field(default=0.70, gt=0.0, lt=1.0)
+    timing_expansion_max_attempts: int = Field(default=1, ge=0, le=3)
+    terminal_failure_policy: GSVTerminalFailurePolicy = "keep_original"
+    timing_quality_tolerance: float = Field(default=0.10, gt=0.0, lt=1.0)
     timefit_max_tempo: float = Field(default=1.18, ge=1.0, le=8.0)
     timefit_max_stretch: float = Field(default=1.08, ge=1.0, le=2.0)
     timefit_micro_max_sec: float = Field(default=2.0, gt=0.0)
@@ -544,8 +764,25 @@ class GSVConfig(StrictBaseModel):
     rescue_timefit_max_tempo: float = Field(default=1.45, ge=1.0, le=8.0)
     rescue_timefit_max_stretch: float = Field(default=1.25, ge=1.0, le=2.0)
     rescue_micro_segment_max_sec: float = Field(default=0.6, ge=0.0)
+    micro_segment_unfit_policy: Literal["keep_original", "manual_review"] = "keep_original"
     few_shot_force: bool = False
     few_shot_version: Literal["auto", "v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"] = "auto"
+
+    @model_validator(mode="after")
+    def _validate_pronunciation_qc_thresholds(self) -> GSVConfig:
+        if self.pronunciation_qc_pass_coverage < self.pronunciation_qc_warn_coverage:
+            raise ValueError("pronunciation_qc_pass_coverage must be >= pronunciation_qc_warn_coverage")
+        if self.countdown_pack_retime_target_max_gap_sec < self.countdown_pack_retime_target_min_gap_sec:
+            raise ValueError(
+                "countdown_pack_retime_target_max_gap_sec must be >= "
+                "countdown_pack_retime_target_min_gap_sec"
+            )
+        if (
+            "countdown_carrier_templates" in self.model_fields_set
+            and "countdown_carrier_token_templates" not in self.model_fields_set
+        ):
+            self.countdown_carrier_token_templates = {}
+        return self
 
 
 class RVCConfig(StrictBaseModel):
@@ -558,7 +795,7 @@ class RVCConfig(StrictBaseModel):
     train_timeout_sec: float = Field(default=14400.0, gt=0)
     train_experiment_name: str = "asmr-rvc-speaker-1"
     train_sample_rate: int = Field(default=48_000, ge=0)
-    train_epochs: int = Field(default=20, ge=1)
+    train_epochs: int = Field(default=100, ge=1)
     train_epoch_policy: Literal["fixed", "auto"] = "fixed"
     train_quality_preset: Literal["balanced", "strict"] = "balanced"
     train_batch_size: int = Field(default=0, ge=0, le=64)
@@ -570,7 +807,7 @@ class RVCConfig(StrictBaseModel):
     train_max_background_bleed_db: float | None = None
     train_max_side_to_mid_db: float | None = None
     train_target_clean_sec: float | None = Field(default=None, gt=0.0)
-    train_auto_epoch_min: int = Field(default=20, ge=1)
+    train_auto_epoch_min: int = Field(default=100, ge=1)
     train_auto_epoch_max: int = Field(default=200, ge=1)
     train_min_clean_sec: float = Field(default=600.0, ge=0.0)
     train_min_clean_segments: int = Field(default=1, ge=1)
@@ -580,7 +817,7 @@ class RVCConfig(StrictBaseModel):
     train_preprocess_processes: int = Field(default=0, ge=0)
     train_f0_workers: int = Field(default=0, ge=0)
     train_feature_workers: int = Field(default=0, ge=0)
-    train_save_every_epoch: int = Field(default=5, ge=1)
+    train_save_every_epoch: int = Field(default=10, ge=1)
     train_reuse_intermediate_cache: bool = True
     train_output_model_path: str | None = None
     train_output_index_path: str | None = None
@@ -641,6 +878,7 @@ class VoiceBankConfig(StrictBaseModel):
     diarization_min_speakers: int | None = Field(default=None, ge=1)
     diarization_max_speakers: int | None = Field(default=None, ge=1)
     diarization_embedding_match_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    source_speaker_training_min_dominant_overlap_ratio: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
 class SafetyConfig(StrictBaseModel):
@@ -797,6 +1035,9 @@ _ASR_DIRECT_FLAT_FIELDS = [
     "repair_padding_sec",
     "repair_max_chunks",
     "qwen_repair_fallback_enabled",
+    "repair_rejected_short_fragment_auto_accept",
+    "repair_rejected_short_fragment_max_sec",
+    "repair_rejected_short_fragment_min_confidence",
     "review_enabled",
     "review_backend",
     "review_batch_size",
@@ -807,6 +1048,11 @@ _ASR_DIRECT_FLAT_FIELDS = [
     "review_candidate_padding_sec",
     "review_audio_padding_sec",
     "review_initial_prompt",
+    "channel_split_enabled",
+    "channel_split_padding_sec",
+    "channel_split_wide_padding_sec",
+    "channel_split_max_segments",
+    "channel_split_no_dialog_texture_max_sec",
     "translation_backcheck_enabled",
     "translation_backcheck_mark_manual_review",
     "correction_profile_path",
@@ -846,6 +1092,8 @@ _GEMMA_TEXT_FLAT_FIELDS = [
     "span_max_gap_sec",
     "context_radius",
     "two_pass",
+    "auto_salvage_enabled",
+    "repetition_omission_policy",
     "concurrency",
     "n_predict",
     "timeout_sec",
@@ -881,6 +1129,9 @@ _GSV_FLAT_FIELDS = [
     "few_shot_max_side_to_mid_db",
     "few_shot_preferred_chars_per_sec",
     "few_shot_max_chars_per_sec",
+    "few_shot_min_selection_score",
+    "few_shot_max_total_sec",
+    "few_shot_asr_risk_filter",
     "few_shot_prefer_plain_text",
     "few_shot_pacing_target_enabled",
     "few_shot_pacing_target_tolerance",
@@ -897,6 +1148,13 @@ _GSV_FLAT_FIELDS = [
     "ref_min_sec",
     "ref_max_sec",
     "ref_min_quality_score",
+    "korean_segment_ref_enabled",
+    "korean_segment_ref_clarity_profile_enabled",
+    "korean_segment_ref_warn_blocks_mix",
+    "korean_segment_ref_temperature",
+    "korean_segment_ref_top_p",
+    "korean_segment_ref_top_k",
+    "korean_segment_ref_parallel_infer",
     "ko_text_min_hangul_ratio",
     "top_k",
     "top_p",
@@ -912,24 +1170,125 @@ _GSV_FLAT_FIELDS = [
     "tts_min_speed_factor",
     "tts_max_speed_factor",
     "countdown_renderer",
+    "numeric_phrase_renderer_enabled",
+    "numeric_phrase_max_tempo",
+    "numeric_phrase_failure_fallback",
+    "numeric_phrase_whole_lead_in_sec",
+    "numeric_phrase_tail_guard_sec",
     "countdown_fallback_renderer",
     "countdown_candidate_count",
+    "countdown_carrier_templates",
+    "countdown_carrier_token_templates",
+    "countdown_carrier_numeric_unit_enabled",
+    "countdown_carrier_numeric_unit_templates",
+    "countdown_carrier_numeric_unit_onset_window_sec",
+    "countdown_carrier_numeric_unit_tail_pad_sec",
+    "countdown_carrier_slice_start_backoff_sec",
+    "countdown_carrier_energy_extend_enabled",
+    "countdown_carrier_energy_extend_max_sec",
+    "countdown_carrier_energy_extend_coda_max_sec",
+    "countdown_carrier_energy_extend_edge_threshold_ratio",
+    "countdown_carrier_energy_extend_quiet_threshold_ratio",
+    "countdown_carrier_bulk_asr_enabled",
+    "countdown_carrier_bulk_asr_workers",
+    "countdown_carrier_pause_gsv_for_bulk_asr",
+    "countdown_carrier_candidate_count",
+    "countdown_carrier_slice_search_enabled",
+    "countdown_carrier_slice_window_sec",
+    "countdown_carrier_slice_window_offset_sec",
+    "countdown_carrier_max_slice_windows_per_candidate",
+    "countdown_carrier_full_sentence_prefilter_enabled",
+    "countdown_carrier_full_sentence_prefilter_min_coverage",
+    "countdown_carrier_quality_retry_enabled",
+    "countdown_carrier_quality_retry_max_rounds",
+    "countdown_carrier_quality_retry_target_tier",
+    "countdown_token_bank_enabled",
+    "countdown_token_bank_warmup_enabled",
+    "countdown_token_bank_pack_warmup_enabled",
+    "countdown_token_bank_pack_templates",
+    "countdown_token_bank_max_ref_count",
+    "countdown_token_bank_beam_width",
+    "countdown_carrier_stop_window_search_after_pronunciation_pass",
+    "countdown_carrier_target_pronunciation_passes",
+    "countdown_chunk_candidate_count",
+    "countdown_chunk_max_size",
     "countdown_temperature",
+    "countdown_timing_mode",
+    "countdown_source_anchor_enabled",
+    "countdown_source_anchor_asr_retry_enabled",
+    "countdown_source_anchor_smoothing_blend",
+    "countdown_source_anchor_cluster_gap_sec",
+    "countdown_hybrid_enabled",
+    "countdown_hybrid_apply_to_synth",
+    "countdown_hybrid_token_gap_fill_ratio",
+    "countdown_hybrid_token_max_sec",
+    "countdown_hybrid_active_trim_enabled",
+    "countdown_hybrid_active_trim_keep_before_sec",
+    "countdown_hybrid_active_trim_keep_after_sec",
+    "countdown_hybrid_base_gain",
+    "countdown_hybrid_bed_gain",
+    "countdown_hybrid_base_duck_enabled",
+    "countdown_hybrid_base_duck_gain",
+    "countdown_hybrid_base_duck_pad_sec",
+    "countdown_hybrid_base_duck_fade_sec",
+    "countdown_strict_token_pronunciation",
+    "countdown_pack_min_span_occupancy",
+    "countdown_pack_retime_enabled",
+    "countdown_pack_retime_trigger_max_gap_sec",
+    "countdown_pack_retime_trigger_gap_cv",
+    "countdown_pack_retime_target_min_gap_sec",
+    "countdown_pack_retime_target_max_gap_sec",
+    "countdown_pack_retime_leading_sec",
+    "countdown_pack_retime_trailing_sec",
+    "countdown_phrase_slice_edge_pad_sec",
     "countdown_token_speed_factor",
     "countdown_token_min_sec",
     "countdown_token_max_sec",
+    "countdown_token_single_syllable_max_sec",
+    "countdown_token_double_syllable_max_sec",
+    "countdown_token_multi_syllable_max_sec",
     "countdown_token_max_slot_occupancy",
     "countdown_max_tempo",
+    "countdown_prosody_qc_enabled",
+    "countdown_prosody_max_median_semitone_error",
+    "countdown_prosody_min_pass_score",
+    "countdown_prosody_min_warn_score",
+    "countdown_prosody_failure_blocks_mix",
     "max_attempts_per_candidate",
     "initial_candidate_count",
     "retry_candidate_count",
     "low_temperature_retry_enabled",
     "low_temperature_retry_candidate_count",
     "low_temperature_retry_temperature",
+    "pronunciation_qc_enabled",
+    "pronunciation_qc_backend",
+    "pronunciation_qc_workers",
+    "pronunciation_qc_pass_coverage",
+    "pronunciation_qc_warn_coverage",
+    "pronunciation_qc_max_observed_unit_ratio",
+    "pronunciation_qc_max_extra_units",
+    "pronunciation_qc_failure_blocks_mix",
+    "numeric_cadence_periods_enabled",
+    "numeric_cadence_min_values",
+    "numeric_sequence_qc_enabled",
+    "numeric_sequence_qc_require_contiguous",
+    "numeric_sequence_qc_failure_blocks_mix",
+    "korean_clarity_retry_enabled",
+    "korean_clarity_retry_candidate_count",
+    "korean_clarity_temperature",
+    "korean_clarity_top_p",
+    "korean_clarity_top_k",
+    "korean_clarity_parallel_infer",
     "zero_shot_candidate_count",
     "duration_rewrite_backend",
+    "duration_rewrite_timing",
     "duration_rewrite_max_attempts",
     "duration_rewrite_pre_candidate_count",
+    "timing_expansion_enabled",
+    "timing_expansion_min_ratio",
+    "timing_expansion_max_attempts",
+    "terminal_failure_policy",
+    "timing_quality_tolerance",
     "timefit_max_tempo",
     "timefit_max_stretch",
     "timefit_micro_max_sec",
@@ -941,6 +1300,7 @@ _GSV_FLAT_FIELDS = [
     "rescue_timefit_max_tempo",
     "rescue_timefit_max_stretch",
     "rescue_micro_segment_max_sec",
+    "micro_segment_unfit_policy",
     "few_shot_force",
     "few_shot_version",
 ]
@@ -1075,6 +1435,14 @@ _PROJECT_CONFIG_FLAT_ALIASES: dict[str, FlatConfigPath] = {
     "duration_tolerance": ("mix", "duration_tolerance"),
     "voice_bank_path": ("voice_bank", "path"),
     "speaker_assignment_backend": ("voice_bank", "speaker_assignment_backend"),
+    "source_speaker_training_min_dominant_overlap_ratio": (
+        "voice_bank",
+        "source_speaker_training_min_dominant_overlap_ratio",
+    ),
+    "voice_bank_source_speaker_training_min_dominant_overlap_ratio": (
+        "voice_bank",
+        "source_speaker_training_min_dominant_overlap_ratio",
+    ),
     "source_separation_backend": ("asr", "source_separation_backend"),
     "source_separation_model": ("asr", "source_separation_model"),
     "source_separation_device": ("asr", "source_separation_device"),
@@ -1098,6 +1466,11 @@ _PROJECT_CONFIG_FLAT_ALIASES: dict[str, FlatConfigPath] = {
         "asr",
         "correction_profile",
         "review_candidate_replacements",
+    ),
+    "asr_review_auto_resolution_rules": (
+        "asr",
+        "correction_profile",
+        "review_auto_resolution_rules",
     ),
     "asr_translation_backcheck_source_patterns": (
         "asr",
@@ -1131,6 +1504,10 @@ _PROJECT_CONFIG_FLAT_ALIASES.update(
 _PROJECT_CONFIG_FLAT_ALIASES["gemma_audio_style_concurrency"] = (
     "gemma",
     "audio_style_concurrency",
+)
+_PROJECT_CONFIG_FLAT_ALIASES["gemma_audio_style_scope"] = (
+    "gemma",
+    "audio_style_scope",
 )
 _PROJECT_CONFIG_FLAT_ALIASES.update(
     {f"gsv_{field}": ("gsv", field) for field in _GSV_FLAT_FIELDS}
@@ -1277,6 +1654,45 @@ class SourceScript(StrictBaseModel):
     end: float = Field(gt=0)
 
 
+class TranscriptWord(StrictBaseModel):
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    text: str
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class SourceLaneTranscript(StrictBaseModel):
+    lane_id: str
+    channel: Literal["left", "right", "mid", "side", "mono"]
+    text: str = ""
+    language: str = "ja"
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    pan: float = Field(default=0.0, ge=-1.0, le=1.0)
+    spatial_style: SpatialStyle = "center"
+    backend: str
+    candidate_id: str
+    clip_start: float = Field(ge=0)
+    clip_end: float = Field(gt=0)
+    words: list[TranscriptWord] = Field(default_factory=list)
+    boundary_clipped: bool = False
+    review_reasons: list[str] = Field(default_factory=list)
+
+    @field_validator("lane_id")
+    @classmethod
+    def _lane_id_safe(cls, value: str) -> str:
+        return validate_file_safe_id(value, "lane_id")
+
+    @model_validator(mode="after")
+    def _validate_times(self) -> SourceLaneTranscript:
+        if self.end <= self.start:
+            raise ValueError("lane transcript end must be greater than start")
+        if self.clip_end <= self.clip_start:
+            raise ValueError("lane transcript clip_end must be greater than clip_start")
+        return self
+
+
 class KoreanTranslation(StrictBaseModel):
     ko_literal: str
     ko_natural: str
@@ -1304,6 +1720,7 @@ class TTSCandidate(StrictBaseModel):
     error: str | None = None
     duration_ratio: float | None = Field(default=None, ge=0)
     duration_gate: Literal["pass", "too_short", "too_long", "unknown"] = "unknown"
+    timing_quality_gate: GSVTimingQualityGate = "unknown"
     acceptable_for_mix: bool = False
     selection_score: float | None = None
     selection_reason: str = ""
@@ -1374,6 +1791,7 @@ class QCMetadata(StrictBaseModel):
 class Segment(StrictBaseModel):
     id: str
     speaker_id: str | None = None
+    parent_segment_id: str | None = None
     start: float = Field(ge=0)
     end: float = Field(gt=0)
     duration: float = Field(gt=0)
@@ -1384,6 +1802,8 @@ class Segment(StrictBaseModel):
     status: SegmentStatus = "raw"
     analysis: dict[str, Any] = Field(default_factory=dict)
     source_script: SourceScript | None = None
+    source_lane: SourceLaneTranscript | None = None
+    source_lanes: list[SourceLaneTranscript] = Field(default_factory=list)
     script: JapaneseScript | None = None
     translation_ko: KoreanTranslation | None = None
     tts: TTSMetadata | None = None
@@ -1403,6 +1823,13 @@ class Segment(StrictBaseModel):
         if value is None:
             return None
         return validate_file_safe_id(value, "speaker_id")
+
+    @field_validator("parent_segment_id")
+    @classmethod
+    def _parent_segment_id_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_file_safe_id(value, "parent_segment_id")
 
     @model_validator(mode="after")
     def _validate_times(self) -> Segment:

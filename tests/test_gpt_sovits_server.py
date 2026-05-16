@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
+import signal
 import socket
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
+import yaml
 
 from asmr_dub_pipeline.gpt_sovits import server as gsv_server
 from asmr_dub_pipeline.gpt_sovits.client import GPTSoVITSError
@@ -66,6 +70,43 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+""".strip()
+        + "\n",
+        "utf-8",
+    )
+
+
+def write_parent_exits_after_child_http_server(path: Path) -> None:
+    path.write_text(
+        """
+import socket
+import subprocess
+import sys
+import time
+
+port = int(sys.argv[1])
+child_code = r'''
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import sys
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+'''
+subprocess.Popen([sys.executable, "-c", child_code, str(port)])
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+            break
+    except OSError:
+        time.sleep(0.05)
 """.strip()
         + "\n",
         "utf-8",
@@ -169,6 +210,41 @@ def test_managed_gsv_server_stop_kills_child_process_group(tmp_path: Path) -> No
     assert not marker_path.exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX process groups")
+def test_managed_gsv_server_stop_kills_child_group_after_parent_exits(tmp_path: Path) -> None:
+    port = free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    script = tmp_path / "parent_exits_after_child_server.py"
+    write_parent_exits_after_child_http_server(script)
+    manager = ManagedGPTSoVITSServer(
+        enabled=True,
+        base_url=base_url,
+        command=[sys.executable, str(script), str(port)],
+        startup_timeout_sec=5,
+        shutdown_timeout_sec=1,
+    )
+
+    try:
+        manager.start()
+        assert manager.process is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and manager.process.poll() is None:
+            time.sleep(0.05)
+        assert manager.process.poll() is not None
+        assert is_tcp_open(base_url)
+
+        manager.stop()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and is_tcp_open(base_url):
+            time.sleep(0.05)
+        assert not is_tcp_open(base_url)
+    finally:
+        if manager.process is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(manager.process.pid, signal.SIGKILL)
+
+
 def test_managed_gsv_server_requires_command_when_missing(monkeypatch) -> None:
     monkeypatch.setattr(gsv_server, "_default_gsv_command", lambda base_url: [])
     port = free_port()
@@ -233,6 +309,65 @@ def test_default_gsv_command_prepares_fast_langdetect_cache(monkeypatch, tmp_pat
     cache_dir = source / "fast_langdetect"
     assert cache_dir.is_dir()
     assert (target / "fast_langdetect").resolve() == cache_dir.resolve()
+
+
+def test_default_gsv_command_writes_local_tts_config_atomically(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    install = root / ".cache" / "third_party" / "GPT-SoVITS"
+    api = install / "api_v2.py"
+    pretrained = root / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models"
+    for path in (
+        pretrained / "s1v3.ckpt",
+        pretrained / "v2Pro" / "s2Gv2ProPlus.pth",
+        pretrained / "chinese-roberta-wwm-ext-large" / "config.json",
+        pretrained / "chinese-hubert-base" / "config.json",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", "utf-8")
+    api.parent.mkdir(parents=True, exist_ok=True)
+    api.write_text("", "utf-8")
+    monkeypatch.setattr(gsv_server, "REPO_ROOT", root)
+    monkeypatch.setattr(gsv_server, "_default_gsv_python", lambda: "python")
+
+    command = _default_gsv_command("http://127.0.0.1:9880")
+    config_path = root / ".cache" / "gpt_sovits" / "tts_infer.local.9880.yaml"
+    config = yaml.safe_load(config_path.read_text("utf-8"))
+
+    assert command[-2:] == ["-c", str(config_path)]
+    assert isinstance(config, dict)
+    assert config["custom"]["version"] == "v2ProPlus"
+    assert not list(config_path.parent.glob("tts_infer.local.*.yaml.*.tmp"))
+
+
+def test_default_gsv_command_uses_distinct_local_tts_config_per_port(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    install = root / ".cache" / "third_party" / "GPT-SoVITS"
+    api = install / "api_v2.py"
+    pretrained = root / ".cache" / "gpt_sovits" / "GPT_SoVITS" / "pretrained_models"
+    for path in (
+        pretrained / "s1v3.ckpt",
+        pretrained / "v2Pro" / "s2Gv2ProPlus.pth",
+        pretrained / "chinese-roberta-wwm-ext-large" / "config.json",
+        pretrained / "chinese-hubert-base" / "config.json",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", "utf-8")
+    api.parent.mkdir(parents=True, exist_ok=True)
+    api.write_text("", "utf-8")
+    monkeypatch.setattr(gsv_server, "REPO_ROOT", root)
+    monkeypatch.setattr(gsv_server, "_default_gsv_python", lambda: "python")
+
+    first = _default_gsv_command("http://127.0.0.1:9880")
+    second = _default_gsv_command("http://127.0.0.1:9881")
+
+    assert first[-1].endswith("tts_infer.local.9880.yaml")
+    assert second[-1].endswith("tts_infer.local.9881.yaml")
+    assert first[-1] != second[-1]
+    assert Path(first[-1]).exists()
+    assert Path(second[-1]).exists()
 
 
 def test_patch_gsv_korean_text_preprocessor_disables_short_prefix(tmp_path: Path) -> None:

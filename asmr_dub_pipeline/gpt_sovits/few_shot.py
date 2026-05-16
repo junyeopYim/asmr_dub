@@ -32,6 +32,7 @@ from asmr_dub_pipeline.rights import (
 )
 from asmr_dub_pipeline.schemas import PipelineManifest, ProjectConfig, Segment
 from asmr_dub_pipeline.script.duration_rewrite import japanese_pronunciation_count
+from asmr_dub_pipeline.script.normalizer import normalize_japanese_kana_text
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 FEW_SHOT_PROGRESS_LOG_SECONDS = 10.0
@@ -80,10 +81,6 @@ FEW_SHOT_TIMING_BUCKET_TARGET_SHARES = {
 }
 FEW_SHOT_TARGET_PACING_WEIGHT = 0.45
 FEW_SHOT_TARGET_PACING_FACTOR_WINDOW = 2.0
-FEW_SHOT_CLEAN_SOURCE_REJECT_PREFIXES = (
-    "background_bleed_db_above_max",
-    "side_to_mid_db_above_max",
-)
 _KOREAN_SYLLABLE_RE = re.compile(r"[가-힣]")
 
 
@@ -103,6 +100,7 @@ class FewShotTrainingItem:
     text: str
     language: str
     duration_sec: float
+    source_text_original: str = ""
     quality_score: float = 0.0
     quality_issues: tuple[str, ...] = ()
     source_chars_per_sec: float = 0.0
@@ -129,6 +127,12 @@ class FewShotTrainingSelection:
     items: list[FewShotTrainingItem]
     diagnostics: list[dict[str, Any]]
     candidate_speaker_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FewShotAsrRiskIndex:
+    segment_reasons: dict[str, tuple[str, ...]]
+    intervals: tuple[tuple[float, float, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -493,6 +497,32 @@ def select_training_speaker_ids(
     )
 
 
+def _source_speaker_model_fallback_training_map(manifest: PipelineManifest) -> dict[str, str]:
+    fallback_by_speaker: dict[str, str] = {}
+    for segment in manifest.segments:
+        if not segment.speaker_id:
+            continue
+        fallback = segment.analysis.get("source_speaker_model_fallback")
+        if not isinstance(fallback, dict):
+            continue
+        fallback_speaker_id = fallback.get("speaker_id")
+        if fallback_speaker_id:
+            fallback_by_speaker[segment.speaker_id] = str(fallback_speaker_id)
+    return fallback_by_speaker
+
+
+def _source_speaker_model_fallback_reject_reasons(
+    segment: Segment,
+    fallback_by_speaker: dict[str, str],
+) -> tuple[str, ...]:
+    if not segment.speaker_id:
+        return ()
+    fallback_speaker_id = fallback_by_speaker.get(segment.speaker_id)
+    if not fallback_speaker_id:
+        return ()
+    return (f"source_speaker_model_fallback:{fallback_speaker_id}",)
+
+
 def _select_training_items_with_diagnostics(
     project_dir: Path,
     manifest: PipelineManifest,
@@ -505,6 +535,8 @@ def _select_training_items_with_diagnostics(
     diagnostics: list[dict[str, Any]] = []
     source_language = _canonical_language(cfg.source_language)
     target_sec_per_syllable = _target_korean_sec_per_syllable(manifest, cfg)
+    asr_risk_index = _load_few_shot_asr_risk_index(project_dir, cfg)
+    fallback_by_speaker = _source_speaker_model_fallback_training_map(manifest)
     for segment in sorted(manifest.segments, key=lambda item: (item.start, item.id)):
         if segment.status in SKIP_TRAINING_STATUSES:
             continue
@@ -519,8 +551,14 @@ def _select_training_items_with_diagnostics(
             require_speaker_id=True,
             source_language=source_language,
         )
-        text = segment.source_script.text.strip() if segment.source_script else ""
-        source_chars_per_sec = _source_chars_per_sec(text, segment.duration)
+        source_text_original = segment.source_script.text.strip() if segment.source_script else ""
+        language = segment.source_script.language if segment.source_script else cfg.asr_language
+        canonical_language = _canonical_language(language or cfg.asr_language)
+        text, text_normalization_flags = _model_boundary_text_for_language(
+            source_text_original,
+            canonical_language,
+        )
+        source_chars_per_sec = _source_chars_per_sec(source_text_original, segment.duration)
         source_pronunciation_count = japanese_pronunciation_count(text)
         source_sec_per_pronunciation = _source_sec_per_pronunciation(
             source_pronunciation_count,
@@ -534,23 +572,18 @@ def _select_training_items_with_diagnostics(
         training_selection_score, selection_penalties = _training_selection_score(
             check.metrics.score if check.metrics else None,
             source_chars_per_sec,
-            text,
+            source_text_original,
             cfg,
             target_pacing_score=target_pacing_score,
         )
         reject_reasons = [
             *check.reject_reasons,
+            *_few_shot_asr_risk_reject_reasons(segment, asr_risk_index),
             *_few_shot_duration_reject_reasons(segment, cfg),
             *_few_shot_text_reject_reasons(source_chars_per_sec, cfg),
+            *_source_speaker_model_fallback_reject_reasons(segment, fallback_by_speaker),
         ]
-        soft_reject_reasons = _few_shot_soft_reject_reasons(
-            reject_reasons,
-            cfg,
-            target_sec_per_syllable,
-        )
-        hard_reject_reasons = [
-            reason for reason in reject_reasons if reason not in soft_reject_reasons
-        ]
+        hard_reject_reasons = reject_reasons
         if hard_reject_reasons or not check.source_audio_path or not check.metrics:
             diagnostics.append(
                 _few_shot_diagnostic_row(
@@ -560,6 +593,9 @@ def _select_training_items_with_diagnostics(
                     selected=False,
                     reject_reasons=hard_reject_reasons or ("missing_source_audio",),
                     source_chars_per_sec=source_chars_per_sec,
+                    source_text=text,
+                    source_text_original=source_text_original,
+                    text_normalization_flags=text_normalization_flags,
                     source_pronunciation_count=source_pronunciation_count,
                     source_sec_per_pronunciation=source_sec_per_pronunciation,
                     timing_bucket=timing_bucket,
@@ -572,21 +608,7 @@ def _select_training_items_with_diagnostics(
             )
             continue
         source_audio_path = check.source_audio_path
-        language = segment.source_script.language if segment.source_script else cfg.asr_language
         training_filename = f"{segment.id}.wav"
-        if soft_reject_reasons:
-            relaxed_penalty = float(getattr(cfg, "gsv_few_shot_relaxed_clean_source_penalty", 0.15))
-            training_selection_score = max(
-                0.0,
-                float(training_selection_score or 0.0) - relaxed_penalty,
-            )
-            selection_penalties = (
-                *selection_penalties,
-                *(
-                    f"relaxed_clean_source_filter:{reason}"
-                    for reason in soft_reject_reasons
-                ),
-            )
         candidates.append(
             FewShotTrainingItem(
                 segment_id=segment.id,
@@ -594,7 +616,8 @@ def _select_training_items_with_diagnostics(
                 source_audio_path=source_audio_path,
                 training_filename=training_filename,
                 text=text,
-                language=_canonical_language(language or cfg.asr_language),
+                language=canonical_language,
+                source_text_original=source_text_original,
                 duration_sec=segment.duration,
                 quality_score=check.metrics.score,
                 quality_issues=tuple(check.metrics.issues),
@@ -615,8 +638,11 @@ def _select_training_items_with_diagnostics(
                 check,
                 cfg,
                 selected=False,
-                reject_reasons=("not_selected_target_reached",),
+                reject_reasons=(),
                 source_chars_per_sec=source_chars_per_sec,
+                source_text=text,
+                source_text_original=source_text_original,
+                text_normalization_flags=text_normalization_flags,
                 source_pronunciation_count=source_pronunciation_count,
                 source_sec_per_pronunciation=source_sec_per_pronunciation,
                 timing_bucket=timing_bucket,
@@ -629,7 +655,8 @@ def _select_training_items_with_diagnostics(
         )
     items: list[FewShotTrainingItem] = []
     candidates, duplicate_reasons = _dedupe_training_items(candidates)
-    items = _select_training_items_for_pacing(candidates, cfg)
+    candidates, selection_score_reasons = _filter_training_items_by_selection_score(candidates, cfg)
+    items, max_total_reasons = _trim_training_items_to_max_total(candidates, cfg)
     total = sum(item.duration_sec for item in items)
     min_total_sec = few_shot_min_total_sec(cfg)
     candidate_speaker_ids = tuple(sorted({item.speaker_id for item in candidates if item.speaker_id}))
@@ -650,6 +677,18 @@ def _select_training_items_with_diagnostics(
                 **row,
                 "selected_for_training": False,
                 "reject_reasons": [duplicate_reasons[row["segment_id"]]],
+            }
+        elif row["segment_id"] in selection_score_reasons:
+            row = {
+                **row,
+                "selected_for_training": False,
+                "reject_reasons": [selection_score_reasons[row["segment_id"]]],
+            }
+        elif row["segment_id"] in max_total_reasons:
+            row = {
+                **row,
+                "selected_for_training": False,
+                "reject_reasons": [max_total_reasons[row["segment_id"]]],
             }
         normalized_diagnostics.append(row)
     return FewShotTrainingSelection(
@@ -675,23 +714,176 @@ def _dedupe_training_items(
     return [item for item in candidates if item.segment_id in kept_ids], duplicate_reasons
 
 
-def _few_shot_soft_reject_reasons(
-    reject_reasons: Sequence[str],
+def _filter_training_items_by_selection_score(
+    candidates: Sequence[FewShotTrainingItem],
     cfg: ProjectConfig,
-    target_sec_per_syllable: float | None,
+) -> tuple[list[FewShotTrainingItem], dict[str, str]]:
+    min_score = getattr(cfg, "gsv_few_shot_min_selection_score", None)
+    if min_score is None:
+        return [*candidates], {}
+    threshold = float(min_score)
+    kept: list[FewShotTrainingItem] = []
+    rejected: dict[str, str] = {}
+    for item in candidates:
+        score = float(item.training_selection_score)
+        if score < threshold:
+            rejected[item.segment_id] = (
+                f"training_selection_score_below_min:{score:.3f}<{threshold:.3f}"
+            )
+            continue
+        kept.append(item)
+    return kept, rejected
+
+
+def _trim_training_items_to_max_total(
+    candidates: Sequence[FewShotTrainingItem],
+    cfg: ProjectConfig,
+) -> tuple[list[FewShotTrainingItem], dict[str, str]]:
+    ranked = sorted(candidates, key=_few_shot_base_sort_key)
+    max_total = getattr(cfg, "gsv_few_shot_max_total_sec", None)
+    if max_total is None:
+        return ranked, {}
+    total_available = sum(item.duration_sec for item in ranked)
+    cap = max(float(max_total), few_shot_min_total_sec(cfg))
+    if total_available <= cap + 1e-6:
+        return ranked, {}
+    selected: list[FewShotTrainingItem] = []
+    trimmed: dict[str, str] = {}
+    selected_total = 0.0
+    min_total = few_shot_min_total_sec(cfg)
+    for item in ranked:
+        next_total = selected_total + item.duration_sec
+        if selected and selected_total >= min_total and next_total > cap + 1e-6:
+            trimmed[item.segment_id] = f"max_total_sec_trimmed:{cap:.3f}"
+            continue
+        selected.append(item)
+        selected_total = next_total
+    return selected, trimmed
+
+
+def _load_few_shot_asr_risk_index(project_dir: Path, cfg: ProjectConfig) -> FewShotAsrRiskIndex:
+    if not getattr(cfg, "gsv_few_shot_asr_risk_filter", True):
+        return FewShotAsrRiskIndex(segment_reasons={})
+    transcribe_dir = project_dir / "work" / "transcribe"
+    reasons: dict[str, list[str]] = {}
+    intervals: list[tuple[float, float, str]] = []
+    _load_high_risk_asr_reasons(transcribe_dir / "asr_high_risk_report.json", reasons)
+    _load_postprocess_asr_reasons(transcribe_dir / "asr_postprocess_review.json", reasons)
+    _load_review_asr_reasons(transcribe_dir / "asr_review_summary.json", reasons)
+    _load_repair_asr_intervals(transcribe_dir / "asr_repair_summary.json", intervals)
+    return FewShotAsrRiskIndex(
+        segment_reasons={
+            segment_id: tuple(dict.fromkeys(segment_reasons))
+            for segment_id, segment_reasons in reasons.items()
+        },
+        intervals=tuple(intervals),
+    )
+
+
+def _load_high_risk_asr_reasons(path: Path, reasons: dict[str, list[str]]) -> None:
+    for item in _json_items(path):
+        segment_id = _json_text(item.get("segment_id"))
+        severity = _json_text(item.get("severity")).lower()
+        if severity not in {"warning", "severe"}:
+            continue
+        detail = _reason_detail(item.get("reasons"))
+        _add_asr_reason(reasons, segment_id, f"asr_high_risk_{severity}{detail}")
+
+
+def _load_postprocess_asr_reasons(path: Path, reasons: dict[str, list[str]]) -> None:
+    for item in _json_items(path):
+        segment_id = _json_text(item.get("segment_id"))
+        action = _json_text(item.get("action")).lower()
+        review_required = item.get("review_required") is True
+        if action not in {"manual_review", "candidate_review"} and not review_required:
+            continue
+        label = action if action in {"manual_review", "candidate_review"} else "review_required"
+        detail = _reason_detail(item.get("reasons"))
+        _add_asr_reason(reasons, segment_id, f"asr_postprocess_{label}{detail}")
+
+
+def _load_review_asr_reasons(path: Path, reasons: dict[str, list[str]]) -> None:
+    for item in _json_items(path):
+        segment_id = _json_text(item.get("segment_id") or item.get("chunk_id"))
+        if item.get("failed") is True:
+            _add_asr_reason(reasons, segment_id, "asr_review_failed")
+        if item.get("manual_review") is True:
+            detail = _reason_detail(item.get("review_reasons") or item.get("reasons"))
+            _add_asr_reason(reasons, segment_id, f"asr_review_manual_review{detail}")
+        elif item.get("accepted") is False:
+            _add_asr_reason(reasons, segment_id, "asr_review_unaccepted")
+
+
+def _load_repair_asr_intervals(path: Path, intervals: list[tuple[float, float, str]]) -> None:
+    for item in _json_items(path):
+        if item.get("accepted") is not True:
+            continue
+        start = _json_float(item.get("start"))
+        end = _json_float(item.get("end"))
+        if start is None or end is None or end <= start:
+            continue
+        candidate_id = _json_text(item.get("accepted_candidate_id"))
+        suffix = f":{candidate_id}" if candidate_id else ""
+        intervals.append((start, end, f"asr_repair_changed_text{suffix}"))
+
+
+def _few_shot_asr_risk_reject_reasons(
+    segment: Segment,
+    index: FewShotAsrRiskIndex,
 ) -> tuple[str, ...]:
-    if not getattr(cfg, "gsv_few_shot_relax_clean_source_for_pacing", True):
-        return ()
-    if target_sec_per_syllable is None:
-        return ()
-    soft_reasons = [
-        reason
-        for reason in reject_reasons
-        if reason.startswith(FEW_SHOT_CLEAN_SOURCE_REJECT_PREFIXES)
-    ]
-    if len(soft_reasons) != len(reject_reasons):
-        return ()
-    return tuple(soft_reasons)
+    reasons = [*index.segment_reasons.get(segment.id, ())]
+    for start, end, reason in index.intervals:
+        if max(segment.start, start) < min(segment.end, end):
+            reasons.append(reason)
+    return tuple(dict.fromkeys(reasons))
+
+
+def _json_items(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _json_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _json_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _reason_detail(raw_reasons: Any) -> str:
+    if isinstance(raw_reasons, list):
+        values = [str(reason).strip() for reason in raw_reasons if str(reason).strip()]
+    elif raw_reasons is None:
+        values = []
+    else:
+        values = [str(raw_reasons).strip()] if str(raw_reasons).strip() else []
+    return f":{';'.join(values)}" if values else ""
+
+
+def _add_asr_reason(reasons: dict[str, list[str]], segment_id: str, reason: str) -> None:
+    if not segment_id:
+        return
+    reasons.setdefault(segment_id, []).append(reason)
 
 
 def _few_shot_duration_reject_reasons(segment: Segment, cfg: ProjectConfig) -> tuple[str, ...]:
@@ -1517,6 +1709,9 @@ def _few_shot_diagnostic_row(
     selected: bool,
     reject_reasons: Sequence[str],
     source_chars_per_sec: float | None = None,
+    source_text: str | None = None,
+    source_text_original: str | None = None,
+    text_normalization_flags: Sequence[str] = (),
     source_pronunciation_count: int | None = None,
     source_sec_per_pronunciation: float | None = None,
     timing_bucket: str | None = None,
@@ -1536,6 +1731,12 @@ def _few_shot_diagnostic_row(
         "quality_score": round(metrics.score, 6) if metrics else None,
         "quality_issues": list(metrics.issues) if metrics else [],
         "source_chars_per_sec": round(source_chars_per_sec, 6) if source_chars_per_sec is not None else None,
+        "source_text": source_text,
+        "source_text_original": source_text_original,
+        "text_normalization": {
+            "policy": "ja_hiragana" if _canonical_language(cfg.source_language) == "ja" else "none",
+            "risk_flags": list(text_normalization_flags),
+        },
         "source_pronunciation_count": source_pronunciation_count,
         "source_sec_per_pronunciation": (
             round(source_sec_per_pronunciation, 6)
@@ -1574,6 +1775,13 @@ def _canonical_language(value: str | None) -> str:
     if normalized in {"ko", "kr", "kor", "korean"}:
         return "ko"
     return normalized
+
+
+def _model_boundary_text_for_language(text: str, language: str) -> tuple[str, list[str]]:
+    if _canonical_language(language) != "ja":
+        return text.strip(), []
+    normalized = normalize_japanese_kana_text(text)
+    return normalized.text, normalized.risk_flags
 
 
 def build_training_dataset(
@@ -1642,6 +1850,10 @@ def _fingerprint_payload(
                 "source_audio_path": str(item.source_audio_path),
                 "source_audio_sha256": sha256_file(item.source_audio_path),
                 "text": item.text,
+                "source_text_original": item.source_text_original,
+                "text_normalization": {
+                    "policy": "ja_hiragana" if _canonical_language(item.language) == "ja" else "none",
+                },
                 "language": item.language,
                 "duration_sec": round(item.duration_sec, 6),
                 "quality_score": round(item.quality_score, 6),
