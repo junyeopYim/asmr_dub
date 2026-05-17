@@ -296,8 +296,6 @@ def run_pipeline(
             confirm_rights=confirm_rights,
             scope=cfg.gemma_audio_style_scope,
         )
-        run_stage("translate-ko", translate_ko_step, project_dir, "mock" if mock else "llama_server")
-        run_stage("korean-script", korean_script_step, project_dir)
         if not mock and not use_voice_bank:
             run_stage(
                 "prepare-refs",
@@ -305,6 +303,8 @@ def run_pipeline(
                 project_dir,
                 refs_path or Path("refs/refs.json"),
             )
+        run_stage("translate-ko", translate_ko_step, project_dir, "mock" if mock else "llama_server")
+        run_stage("korean-script", korean_script_step, project_dir)
     else:
         run_stage("segment", segment_step, project_dir)
         if use_voice_bank:

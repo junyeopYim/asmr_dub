@@ -4860,6 +4860,64 @@ def test_source_voice_ref_selection_extends_short_candidate_to_duration_window(
     assert selected[0].duration == pytest.approx(5.0)
 
 
+def test_source_voice_ref_selection_rejects_stale_audio_duration_mismatch(
+    tmp_project_dir: Path,
+) -> None:
+    stale_audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_stale_mix.wav"
+    valid_audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_valid_mix.wav"
+    write_audio(stale_audio, np.full((int(48_000 * 2.8), 2), 0.05, dtype=np.float32), 48_000)
+    write_audio(valid_audio, np.full((int(48_000 * 4.0), 2), 0.05, dtype=np.float32), 48_000)
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gsv_ref_min_quality_score=0.0,
+        ),
+        segments=[
+            Segment(
+                id="seg_stale",
+                start=0.0,
+                end=5.0,
+                duration=5.0,
+                audio_for_gemma=str(stale_audio.relative_to(tmp_project_dir)),
+                audio_for_mix=str(stale_audio.relative_to(tmp_project_dir)),
+                analysis={"speaker_count": 1},
+                source_script=SourceScript(
+                    text="これは古い音声長の参照候補です。",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=5.0,
+                ),
+            ),
+            Segment(
+                id="seg_valid",
+                start=6.0,
+                end=10.0,
+                duration=4.0,
+                audio_for_gemma=str(valid_audio.relative_to(tmp_project_dir)),
+                audio_for_mix=str(valid_audio.relative_to(tmp_project_dir)),
+                analysis={"speaker_count": 1},
+                source_script=SourceScript(
+                    text="今日は少しだけ静かに話しますね。",
+                    language="ja",
+                    backend="mock",
+                    start=6.0,
+                    end=10.0,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_valid"]]
+
+
 def test_source_voice_ref_selection_prefers_plain_prompt_over_intense_longer_prompt(
     tmp_project_dir: Path,
 ) -> None:
@@ -5180,6 +5238,260 @@ def test_source_voice_ref_selection_rejects_repetitive_prompt_when_plain_prefere
     assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
 
 
+def test_source_voice_ref_selection_rejects_partial_repetition_prompt(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(project_name=tmp_project_dir.name),
+        segments=[
+            Segment(
+                id="seg_partial_repeat",
+                start=0.0,
+                end=4.5,
+                duration=4.5,
+                audio_for_gemma="work/segments/audio/seg_partial_repeat_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_partial_repeat_mix.wav",
+                source_script=SourceScript(
+                    text="強くなる強く",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=4.5,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=5.5,
+                end=9.5,
+                duration=4.0,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="今日は少しだけ静かに話しますね。",
+                    language="ja",
+                    backend="mock",
+                    start=5.5,
+                    end=9.5,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
+def test_source_voice_ref_selection_rejects_sparse_long_prompt(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(project_name=tmp_project_dir.name),
+        segments=[
+            Segment(
+                id="seg_sparse",
+                start=0.0,
+                end=8.0,
+                duration=8.0,
+                audio_for_gemma="work/segments/audio/seg_sparse_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_sparse_mix.wav",
+                source_script=SourceScript(
+                    text="なる",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=8.0,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=9.0,
+                end=13.0,
+                duration=4.0,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="今日は少しだけ静かに話しますね。",
+                    language="ja",
+                    backend="mock",
+                    start=9.0,
+                    end=13.0,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
+def test_source_voice_ref_selection_rejects_low_diversity_repetition_prompt(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gsv_few_shot_prefer_plain_text=False,
+        ),
+        segments=[
+            Segment(
+                id="seg_low_diversity",
+                start=0.0,
+                end=7.58,
+                duration=7.58,
+                audio_for_gemma="work/segments/audio/seg_low_diversity_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_low_diversity_mix.wav",
+                source_script=SourceScript(
+                    text="くなる強くくく強強く強く強くなる強くなる強なる",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=7.58,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=8.5,
+                end=14.75,
+                duration=6.25,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="お兄さんの意識に合わせて、ゆらゆらと形を変えていくよ。",
+                    language="ja",
+                    backend="mock",
+                    start=8.5,
+                    end=14.75,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
+def test_source_voice_ref_selection_avoids_repeated_effect_prompt_when_plain_prompt_exists(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gsv_few_shot_prefer_plain_text=False,
+        ),
+        segments=[
+            Segment(
+                id="seg_effect_repeat",
+                start=0.0,
+                end=7.01,
+                duration=7.01,
+                audio_for_gemma="work/segments/audio/seg_effect_repeat_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_effect_repeat_mix.wav",
+                source_script=SourceScript(
+                    text="スキーンフェラチオスキーン",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=7.01,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=8.0,
+                end=14.25,
+                duration=6.25,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="お兄さんの意識に合わせて、ゆらゆらと形を変えていくよ。",
+                    language="ja",
+                    backend="mock",
+                    start=8.0,
+                    end=14.25,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
+def test_source_voice_ref_selection_avoids_explicit_jargon_prompt_when_plain_prompt_exists(
+    tmp_project_dir: Path,
+) -> None:
+    manifest = PipelineManifest(
+        project_config=ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gsv_few_shot_prefer_plain_text=False,
+        ),
+        segments=[
+            Segment(
+                id="seg_jargon",
+                start=0.0,
+                end=7.01,
+                duration=7.01,
+                audio_for_gemma="work/segments/audio/seg_jargon_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_jargon_mix.wav",
+                source_script=SourceScript(
+                    text="エネルギー不足睾丸フチオ",
+                    language="ja",
+                    backend="mock",
+                    start=0.0,
+                    end=7.01,
+                ),
+            ),
+            Segment(
+                id="seg_plain",
+                start=8.0,
+                end=14.25,
+                duration=6.25,
+                audio_for_gemma="work/segments/audio/seg_plain_gemma.wav",
+                audio_for_mix="work/segments/audio/seg_plain_mix.wav",
+                source_script=SourceScript(
+                    text="お兄さんの意識に合わせて、ゆらゆらと形を変えていくよ。",
+                    language="ja",
+                    backend="mock",
+                    start=8.0,
+                    end=14.25,
+                ),
+            ),
+        ],
+    )
+
+    selected = pipeline_steps._select_voice_ref_spans(
+        tmp_project_dir,
+        manifest,
+        manifest.project_config,
+        max_refs=1,
+    )
+
+    assert [[segment.id for segment in span.segments] for span in selected] == [["seg_plain"]]
+
+
 def test_prepare_source_voice_refs_writes_combined_short_reference_span(
     tmp_project_dir: Path,
 ) -> None:
@@ -5231,6 +5543,79 @@ def test_prepare_source_voice_refs_writes_combined_short_reference_span(
     assert refs["whisper_close"]["prompt_text_original"] == "短いです。 続きです。"
     ref_qc = json.loads(Path(manifest.artifacts["source_voice_ref_qc"]).read_text("utf-8"))
     assert ref_qc["refs"][0]["selected_segment_ids"] == ["seg_short", "seg_next"]
+
+
+def test_prepare_source_voice_refs_records_rejected_stale_audio_duration(
+    tmp_project_dir: Path,
+) -> None:
+    save_project_config(
+        ProjectConfig(
+            project_name=tmp_project_dir.name,
+            gsv_ref_min_quality_score=0.0,
+        ),
+        tmp_project_dir / "pipeline.yaml",
+    )
+    stale_audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_stale_mix.wav"
+    valid_audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_valid_mix.wav"
+    write_audio(stale_audio, np.full((int(48_000 * 2.8), 2), 0.05, dtype=np.float32), 48_000)
+    write_audio(valid_audio, np.full((int(48_000 * 4.0), 2), 0.05, dtype=np.float32), 48_000)
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            project_config=ProjectConfig(
+                project_name=tmp_project_dir.name,
+                gsv_ref_min_quality_score=0.0,
+            ),
+            segments=[
+                Segment(
+                    id="seg_stale",
+                    start=0.0,
+                    end=5.0,
+                    duration=5.0,
+                    audio_for_gemma=str(stale_audio.relative_to(tmp_project_dir)),
+                    audio_for_mix=str(stale_audio.relative_to(tmp_project_dir)),
+                    analysis={"speaker_count": 1},
+                    source_script=SourceScript(
+                        text="これは古い音声長の参照候補です。",
+                        language="ja",
+                        backend="mock",
+                        start=0.0,
+                        end=5.0,
+                    ),
+                ),
+                Segment(
+                    id="seg_valid",
+                    start=6.0,
+                    end=10.0,
+                    duration=4.0,
+                    audio_for_gemma=str(valid_audio.relative_to(tmp_project_dir)),
+                    audio_for_mix=str(valid_audio.relative_to(tmp_project_dir)),
+                    analysis={"speaker_count": 1},
+                    source_script=SourceScript(
+                        text="今日は少しだけ静かに話しますね。",
+                        language="ja",
+                        backend="mock",
+                        start=6.0,
+                        end=10.0,
+                    ),
+                ),
+            ],
+        ),
+    )
+
+    manifest = prepare_source_voice_refs_step(tmp_project_dir, confirm_rights=True)
+
+    refs = json.loads((tmp_project_dir / "refs" / "refs.json").read_text("utf-8"))
+    assert duration_sec(tmp_project_dir / refs["whisper_close"]["ref_audio_path"]) == pytest.approx(4.0)
+    ref_qc = json.loads(Path(manifest.artifacts["source_voice_ref_qc"]).read_text("utf-8"))
+    assert ref_qc["refs"][0]["selected_segment_ids"] == ["seg_valid"]
+    assert ref_qc["refs"][0]["selected_actual_duration_sec"] == pytest.approx(4.0)
+    rejected = ref_qc["rejected_spans"]
+    assert any(
+        row["segment_ids"] == ["seg_stale"]
+        and any(reason.startswith("audio_duration_mismatch") for reason in row["reject_reasons"])
+        for row in rejected
+    )
 
 
 def _force_single_translation_lane(project_dir: Path) -> None:
@@ -9832,9 +10217,9 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
         "segment",
         "source-speakers",
         "audio-style",
+        "prepare-refs",
         "translate-ko",
         "korean-script",
-        "prepare-refs",
         "gsv-few-shot",
         "synth",
         "countdown-synth",
@@ -9846,7 +10231,7 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     ]
     assert calls[3][2]["asr_backend"] == "qwen_asr"
     assert calls[6][1][1] == "hf"
-    assert calls[7][1][1] == "llama_server"
+    assert calls[8][1][1] == "llama_server"
     assert calls[11][2]["mock"] is False
     assert calls[11][2]["render_countdowns"] is False
     assert calls[12][2]["mock"] is False

@@ -1720,6 +1720,169 @@ def test_korean_segment_ref_can_be_disabled_for_pronunciation_priority(
     ]
 
 
+def test_segment_ref_allows_relaxed_low_overlap_training_exclusion(
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_ref_mode="segment",
+        gsv_ref_min_quality_score=0.0,
+        gsv_few_shot_clean_source_filter=False,
+    )
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    _write_tone_wav(audio, duration=4.0)
+    segment = Segment(
+        id="seg_0001",
+        speaker_id="speaker_0001",
+        start=0.0,
+        end=4.0,
+        duration=4.0,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+        analysis={
+            "speaker_count": 1,
+            "source_speaker_assignment": {
+                "speaker_count": 1,
+                "speaker_id": "speaker_0001",
+                "dominant_overlap_ratio": 0.80,
+            },
+            "voice_training": {
+                "exclude": True,
+                "reason": "low_dominant_source_speaker_overlap",
+            },
+        },
+        source_script=SourceScript(
+            text="これは参照に使う日本語です。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=4.0,
+        ),
+    )
+
+    ref, metadata = steps._segment_source_ref_for_gsv(
+        tmp_project_dir,
+        segment,
+        cfg,
+        [segment],
+    )
+
+    assert ref is not None
+    assert ref.ref_audio_path == str(audio)
+    assert metadata["used"] is True
+    assert metadata["relaxed_training_exclusion"] == "low_dominant_source_speaker_overlap"
+
+
+def test_segment_ref_rejects_relaxed_low_overlap_below_threshold(
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_ref_mode="segment",
+        gsv_ref_min_quality_score=0.0,
+        gsv_few_shot_clean_source_filter=False,
+    )
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    _write_tone_wav(audio, duration=4.0)
+    segment = Segment(
+        id="seg_0001",
+        speaker_id="speaker_0001",
+        start=0.0,
+        end=4.0,
+        duration=4.0,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+        analysis={
+            "speaker_count": 1,
+            "source_speaker_assignment": {
+                "speaker_count": 1,
+                "speaker_id": "speaker_0001",
+                "dominant_overlap_ratio": 0.70,
+            },
+            "voice_training": {
+                "exclude": True,
+                "reason": "low_dominant_source_speaker_overlap",
+            },
+        },
+        source_script=SourceScript(
+            text="これは参照に使う日本語です。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=4.0,
+        ),
+    )
+
+    ref, metadata = steps._segment_source_ref_for_gsv(
+        tmp_project_dir,
+        segment,
+        cfg,
+        [segment],
+    )
+
+    assert ref is None
+    assert metadata["used"] is False
+    assert metadata["reject_reasons"] == ["manual_training_exclude"]
+    assert metadata["relaxed_training_rejected"] == {
+        "reason": "low_dominant_source_speaker_overlap",
+        "overlap_ratio": 0.7,
+        "min_overlap_ratio": 0.75,
+    }
+
+
+def test_segment_ref_keeps_effect_training_exclusion_strict(
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(
+        project_name="test",
+        gsv_ref_mode="segment",
+        gsv_ref_min_quality_score=0.0,
+        gsv_few_shot_clean_source_filter=False,
+    )
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    _write_tone_wav(audio, duration=4.0)
+    segment = Segment(
+        id="seg_0001",
+        speaker_id="speaker_0001",
+        start=0.0,
+        end=4.0,
+        duration=4.0,
+        audio_for_gemma=str(audio),
+        audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+        analysis={
+            "speaker_count": 1,
+            "source_speaker_assignment": {
+                "speaker_count": 1,
+                "speaker_id": "speaker_0001",
+                "dominant_overlap_ratio": 0.95,
+            },
+            "voice_training": {
+                "exclude": True,
+                "reason": "low_dominant_source_speaker_overlap",
+                "effect_tags": ["echo"],
+            },
+        },
+        source_script=SourceScript(
+            text="これは参照に使う日本語です。",
+            language="ja",
+            backend="mock",
+            start=0.0,
+            end=4.0,
+        ),
+    )
+
+    ref, metadata = steps._segment_source_ref_for_gsv(
+        tmp_project_dir,
+        segment,
+        cfg,
+        [segment],
+    )
+
+    assert ref is None
+    assert metadata["used"] is False
+    assert "voice_training_effect_tag_not_none:echo" in metadata["reject_reasons"]
+
+
 def test_synth_extends_short_source_segment_reference_with_neighbor(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1901,6 +2064,168 @@ def test_synth_falls_back_to_static_ref_below_gsv_api_reference_minimum(
     assert candidate_payload["segment_ref"]["reject_reasons"] == [
         "duration_below_gsv_api_ref_min:2.500<3.000"
     ]
+
+
+def test_synth_preflight_regenerates_invalid_static_refs_before_tts(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    _write_tone_wav(tmp_project_dir / "refs" / "whisper_close.wav", duration=2.8)
+    _write_tone_wav(tmp_project_dir / "refs" / "sleepy.wav", duration=2.8)
+    cfg = ProjectConfig(
+        project_name="test",
+        candidate_count=1,
+        gsv_ref_mode="static",
+        gsv_concurrency=1,
+        gsv_ref_min_quality_score=0.0,
+    )
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    _write_tone_wav(audio, duration=4.0)
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            project_config=cfg,
+            segments=[
+                Segment(
+                    id="seg_0001",
+                    speaker_id="speaker_0001",
+                    start=0.0,
+                    end=4.0,
+                    duration=4.0,
+                    audio_for_gemma=str(audio),
+                    audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+                    analysis={"speaker_count": 1},
+                    source_script=SourceScript(
+                        text="今日は少しだけ静かに話しますね。",
+                        language="ja",
+                        backend="mock",
+                        start=0.0,
+                        end=4.0,
+                    ),
+                    script=JapaneseScript(
+                        literal_ja="今日は少しだけ静かに話しますね。",
+                        ja_text="今日は少しだけ静かに話しますね。",
+                        tts_text="조용히 말해 드릴게요.",
+                        tts_language="ko",
+                        source_language="ja",
+                        target_language="ko",
+                    ),
+                )
+            ],
+        ),
+    )
+    ref_durations: list[float] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def build_payload(self, text, ref, options=None):
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            ref_durations.append(duration_sec(Path(request.ref_audio_path)))
+            _write_tone_wav(output_path, duration=4.0)
+            return output_path
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://gsv.local",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    assert ref_durations == [pytest.approx(4.0)]
+    ref_qc = json.loads((tmp_project_dir / "work" / "gpt_sovits" / "ref_qc.json").read_text("utf-8"))
+    assert ref_qc["refs"][0]["selected_actual_duration_sec"] == pytest.approx(4.0)
+
+
+def test_synth_stops_repeating_candidates_after_ref_duration_http_400(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_project(tmp_project_dir)
+    static_ref = tmp_project_dir / "refs" / "whisper_close.wav"
+    _write_tone_wav(static_ref, duration=2.8)
+    cfg = ProjectConfig(
+        project_name="test",
+        candidate_count=3,
+        gsv_ref_mode="static",
+        gsv_concurrency=1,
+    )
+    save_project_config(cfg, tmp_project_dir / "pipeline.yaml")
+    audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0001_mix.wav"
+    _write_tone_wav(audio, duration=4.0)
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            segments=[
+                Segment(
+                    id="seg_0001",
+                    speaker_id="speaker_0001",
+                    start=0.0,
+                    end=4.0,
+                    duration=4.0,
+                    audio_for_gemma=str(audio),
+                    audio_for_mix=str(audio.relative_to(tmp_project_dir)),
+                    analysis={"speaker_count": 1},
+                    source_script=SourceScript(
+                        text="これは参照に使う日本語です。",
+                        language="ja",
+                        backend="mock",
+                        start=0.0,
+                        end=4.0,
+                    ),
+                    script=JapaneseScript(
+                        literal_ja="これは参照に使う日本語です。",
+                        ja_text="これは参照に使う日本語です。",
+                        tts_text="한국어 대사입니다",
+                        tts_language="ko",
+                        source_language="ja",
+                        target_language="ko",
+                    ),
+                )
+            ]
+        ),
+    )
+    synth_calls = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def build_payload(self, text, ref, options=None):
+            return build_tts_request(text, ref, options)
+
+        def synthesize_to_file(self, request, output_path: Path) -> Path:
+            nonlocal synth_calls
+            synth_calls += 1
+            raise GPTSoVITSError(
+                "/tts failed with HTTP 400: tts failed: Reference audio is outside the 3-10 second range, please choose another one!"
+            )
+
+    monkeypatch.setattr(steps, "GPTSoVITSClient", FakeClient)
+
+    synth_step(
+        tmp_project_dir,
+        gsv_url="http://gsv.local",
+        refs_path=tmp_project_dir / "refs" / "refs.json",
+        mock=False,
+        confirm_rights=True,
+    )
+
+    manifest = load_manifest(tmp_project_dir)
+    segment = manifest.segments[0]
+    assert synth_calls == 1
+    assert segment.status == "absorbed"
+    assert segment.tts is not None
+    assert len(segment.tts.candidates) == 1
+    assert segment.tts.candidates[0].payload["ref_failure"]["kind"] == "invalid_ref_duration"
 
 
 def test_synth_retry_failed_reprocesses_previous_tts_failures(

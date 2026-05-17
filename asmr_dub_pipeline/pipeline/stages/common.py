@@ -831,6 +831,108 @@ def _ref_for_tts_language(ref: GPTSoVITSRef, tts_language: str) -> GPTSoVITSRef:
     return ref
 
 
+def _segment_ref_overlap_ratio(analysis: dict[str, Any]) -> float | None:
+    ratios: list[float] = []
+    assignment = analysis.get("source_speaker_assignment")
+    if isinstance(assignment, dict):
+        for key in ("routing_overlap_ratio", "dominant_overlap_ratio"):
+            value = assignment.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (float, int)):
+                ratios.append(float(value))
+    routing = analysis.get("source_speaker_routing")
+    if isinstance(routing, dict):
+        value = routing.get("overlap_ratio")
+        if isinstance(value, (float, int)) and not isinstance(value, bool):
+            ratios.append(float(value))
+    return max(ratios) if ratios else None
+
+
+def _segment_ref_relaxed_training_reason(segment: Segment, cfg: ProjectConfig) -> str | None:
+    voice_training = segment.analysis.get("voice_training")
+    if not isinstance(voice_training, dict) or voice_training.get("exclude") is not True:
+        return None
+    reason = str(voice_training.get("reason") or "").strip()
+    allowed = {
+        str(item).strip()
+        for item in getattr(cfg, "gsv_segment_ref_relaxed_training_reasons", [])
+        if str(item).strip()
+    }
+    return reason if reason in allowed else None
+
+
+def _segment_ref_relaxation_payload(
+    segment: Segment,
+    cfg: ProjectConfig,
+) -> dict[str, Any] | None:
+    reason = _segment_ref_relaxed_training_reason(segment, cfg)
+    if reason is None:
+        return None
+    min_overlap_ratio = float(getattr(cfg, "gsv_segment_ref_min_overlap_ratio", 0.75))
+    overlap_ratio = _segment_ref_overlap_ratio(segment.analysis)
+    if overlap_ratio is None or overlap_ratio < min_overlap_ratio:
+        return {
+            "accepted": False,
+            "reason": reason,
+            "overlap_ratio": None if overlap_ratio is None else round(overlap_ratio, 6),
+            "min_overlap_ratio": round(min_overlap_ratio, 6),
+        }
+    return {
+        "accepted": True,
+        "reason": reason,
+        "overlap_ratio": round(overlap_ratio, 6),
+        "min_overlap_ratio": round(min_overlap_ratio, 6),
+    }
+
+
+def _segment_ref_reject_reasons_after_relaxation(
+    segment: Segment,
+    cfg: ProjectConfig,
+    reject_reasons: Sequence[str],
+    metadata: dict[str, Any],
+) -> list[str]:
+    reasons = list(dict.fromkeys(str(reason) for reason in reject_reasons if str(reason)))
+    if reasons != ["manual_training_exclude"]:
+        return reasons
+    relaxation = _segment_ref_relaxation_payload(segment, cfg)
+    if relaxation is None:
+        return reasons
+    if not relaxation["accepted"]:
+        metadata["relaxed_training_rejected"] = {
+            "reason": relaxation["reason"],
+            "overlap_ratio": relaxation["overlap_ratio"],
+            "min_overlap_ratio": relaxation["min_overlap_ratio"],
+        }
+        return reasons
+    metadata["relaxed_training_exclusion"] = relaxation["reason"]
+    metadata["relaxed_training_overlap_ratio"] = relaxation["overlap_ratio"]
+    metadata["relaxed_training_min_overlap_ratio"] = relaxation["min_overlap_ratio"]
+    return []
+
+
+def _segment_ref_audio_duration_reject_reasons(
+    *,
+    metrics: AudioQualityMetrics | None,
+    expected_duration_sec: float,
+    min_sec: float,
+    max_sec: float,
+) -> list[str]:
+    if metrics is None:
+        return []
+    actual = float(metrics.duration_sec)
+    reasons: list[str] = []
+    if abs(actual - expected_duration_sec) > 0.10:
+        reasons.append(
+            f"audio_duration_mismatch:{actual:.3f}!={expected_duration_sec:.3f}"
+        )
+    if actual < min_sec:
+        reasons.append(f"actual_duration_below_ref_min:{actual:.3f}<{min_sec:.3f}")
+    if actual > max_sec:
+        reasons.append(f"actual_duration_above_ref_max:{actual:.3f}>{max_sec:.3f}")
+    return reasons
+
+
 def _segment_source_ref_for_gsv(
     project_dir: Path,
     segment: Segment,
@@ -908,8 +1010,24 @@ def _segment_source_ref_for_gsv(
         require_speaker_id=False,
         source_language=source_language,
     )
-    if not check.accepted or not check.source_audio_path or not segment.source_script:
-        metadata["reject_reasons"] = list(check.reject_reasons or ("missing_segment_reference",))
+    reject_reasons = list(check.reject_reasons or ())
+    if reject_reasons:
+        reject_reasons = _segment_ref_reject_reasons_after_relaxation(
+            segment,
+            cfg,
+            reject_reasons,
+            metadata,
+        )
+    duration_reasons = _segment_ref_audio_duration_reject_reasons(
+        metrics=check.metrics,
+        expected_duration_sec=segment.duration,
+        min_sec=effective_ref_min_sec,
+        max_sec=float(cfg.gsv_ref_max_sec),
+    )
+    if duration_reasons:
+        reject_reasons.extend(duration_reasons)
+    if reject_reasons or not check.source_audio_path or not segment.source_script:
+        metadata["reject_reasons"] = list(dict.fromkeys(reject_reasons or ["missing_segment_reference"]))
         metadata["clean_source_metrics"] = check.clean_source_metrics
         return None, metadata
     prompt_lang = segment.source_script.language or source_language
@@ -960,7 +1078,7 @@ def _build_segment_neighbor_ref_span(
         segment
         for segment in sorted(all_segments, key=lambda item: (item.start, item.end, item.id))
         if _segment_can_seed_voice_ref(segment, source_language)
-        and not _voice_ref_segment_reject_reasons(segment, cfg)
+        and not _segment_ref_neighbor_reject_reasons(segment, cfg)
     ]
     try:
         target_index = next(index for index, segment in enumerate(candidates) if segment.id == target.id)
@@ -1002,6 +1120,16 @@ def _build_segment_neighbor_ref_span(
         else:
             end_index += 1
     return _VoiceRefSpan(tuple(candidates[start_index : end_index + 1]), duration)
+
+
+def _segment_ref_neighbor_reject_reasons(segment: Segment, cfg: Any | None = None) -> tuple[str, ...]:
+    reasons = list(_voice_ref_segment_reject_reasons(segment, cfg))
+    if reasons != ["voice_training_exclude"] or cfg is None:
+        return tuple(reasons)
+    relaxation = _segment_ref_relaxation_payload(segment, cfg)
+    if relaxation is not None and relaxation["accepted"]:
+        return ()
+    return tuple(reasons)
 
 
 def _segments_can_share_segment_ref(target: Segment, neighbor: Segment) -> bool:
@@ -1047,6 +1175,16 @@ def _write_segment_neighbor_ref_for_gsv(
         metrics = measure_source_voice_quality(ref_path)
     except Exception as exc:
         metadata["reject_reasons"] = [f"neighbor_ref_write_failed:{exc}"]
+        return None
+    duration_reasons = _segment_ref_audio_duration_reject_reasons(
+        metrics=metrics,
+        expected_duration_sec=span.duration,
+        min_sec=max(float(cfg.gsv_ref_min_sec), GSV_API_MIN_REF_SEC),
+        max_sec=float(cfg.gsv_ref_max_sec),
+    )
+    if duration_reasons:
+        metadata["reject_reasons"] = duration_reasons
+        metadata["clean_source_metrics"] = metrics.as_payload()
         return None
     if metrics.score < cfg.gsv_ref_min_quality_score:
         metadata["reject_reasons"] = [
@@ -7827,6 +7965,14 @@ def _select_voice_ref_spans(
             continue
         if _voice_ref_span_reject_reasons(span, seed_segments, max_gap_sec):
             continue
+        span_duration_reasons = _voice_ref_span_audio_duration_reject_reasons(
+            project_dir,
+            span,
+            min_sec=ref_min_sec,
+            max_sec=ref_max_sec,
+        )
+        if span_duration_reasons:
+            continue
         metrics = None
         try:
             source_audio = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
@@ -7841,13 +7987,15 @@ def _select_voice_ref_spans(
     ]
     if not selected:
         selected = sorted(scored, key=lambda item: item[0], reverse=True)
-    plain_selected = [
-        item
-        for item in selected
-        if _voice_ref_span_text_penalty(item[1], cfg) < 0.25
-    ]
-    if plain_selected:
-        selected = plain_selected
+    prefer_plain = getattr(cfg, "gsv_few_shot_prefer_plain_text", True)
+    if prefer_plain:
+        plain_selected = [
+            item
+            for item in selected
+            if _voice_ref_span_text_penalty(item[1], cfg) < 0.25
+        ]
+        if plain_selected:
+            selected = plain_selected
     spans: list[_VoiceRefSpan] = []
     used_segment_ids: set[str] = set()
     for _, span, _ in selected:
@@ -7909,9 +8057,11 @@ def _voice_ref_span_reject_reasons(
     max_gap_sec: float = 1.0,
 ) -> list[str]:
     reasons: list[str] = []
-    repetition_reason = _voice_ref_prompt_repetition_reject_reason(
-        _voice_ref_span_prompt_text(span)
-    )
+    prompt_text = _voice_ref_span_prompt_text(span)
+    sparse_reason = _voice_ref_prompt_sparse_reject_reason(prompt_text, span.duration)
+    if sparse_reason:
+        reasons.append(sparse_reason)
+    repetition_reason = _voice_ref_prompt_repetition_reject_reason(prompt_text)
     if repetition_reason:
         reasons.append(repetition_reason)
     for left, right in zip(span.segments, span.segments[1:], strict=False):
@@ -7957,6 +8107,20 @@ def _voice_ref_span_reject_reasons(
     return reasons
 
 
+def _voice_ref_prompt_compact_text(prompt_text: str) -> str:
+    return re.sub(r"[\s、。,.!?！？…・♪♡❤ーｰ〜～]+", "", prompt_text.strip())
+
+
+def _voice_ref_prompt_sparse_reject_reason(prompt_text: str, duration: float) -> str | None:
+    compact = _voice_ref_prompt_compact_text(prompt_text)
+    if not compact:
+        return "prompt_text_empty"
+    chars_per_sec = len(compact) / duration if duration > 0 else 0.0
+    if duration >= 6.0 and chars_per_sec < 1.25:
+        return "prompt_text_sparse_for_reference"
+    return None
+
+
 def _voice_ref_prompt_repetition_reject_reason(prompt_text: str) -> str | None:
     tokens = [
         token
@@ -7965,14 +8129,58 @@ def _voice_ref_prompt_repetition_reject_reason(prompt_text: str) -> str | None:
     ]
     if len(tokens) >= 3 and len(set(tokens)) / len(tokens) <= 0.5:
         return "prompt_text_repetitive"
-    compact = re.sub(r"\s+", "", prompt_text.strip())
+    compact = _voice_ref_prompt_compact_text(prompt_text)
+    if _voice_ref_prompt_has_low_diversity_repetition(compact):
+        return "prompt_text_repetitive"
     for unit_size in range(1, min(5, len(compact) // 2 + 1)):
         if len(compact) % unit_size:
             continue
         repeat_count = len(compact) // unit_size
         if repeat_count >= 3 and compact == compact[:unit_size] * repeat_count:
             return "prompt_text_repetitive"
+    if _voice_ref_prompt_has_high_repeated_ngram_coverage(compact):
+        return "prompt_text_repetitive"
     return None
+
+
+def _voice_ref_prompt_has_low_diversity_repetition(compact: str) -> bool:
+    if len(compact) < 12:
+        return False
+    counts = Counter(compact)
+    unique_ratio = len(counts) / len(compact)
+    top_two_ratio = sum(count for _, count in counts.most_common(2)) / len(compact)
+    return unique_ratio <= 0.25 and top_two_ratio >= 0.65
+
+
+def _voice_ref_prompt_has_high_repeated_ngram_coverage(compact: str) -> bool:
+    if len(compact) < 6:
+        return False
+    max_unit_size = min(8, len(compact) // 2)
+    for unit_size in range(2, max_unit_size + 1):
+        for start in range(0, len(compact) - unit_size + 1):
+            unit = compact[start : start + unit_size]
+            if len(set(unit)) < 2:
+                continue
+            positions = [
+                index
+                for index in range(0, len(compact) - unit_size + 1)
+                if compact.startswith(unit, index)
+            ]
+            if len(positions) < 2:
+                continue
+            non_overlapping: list[int] = []
+            next_allowed = -1
+            for position in positions:
+                if position >= next_allowed:
+                    non_overlapping.append(position)
+                    next_allowed = position + unit_size
+            if len(non_overlapping) < 2:
+                continue
+            coverage = len(non_overlapping) * unit_size / len(compact)
+            required_coverage = 0.6 if unit_size <= 2 else 0.5
+            if coverage >= required_coverage and (len(compact) <= 24 or len(non_overlapping) >= 3):
+                return True
+    return False
 
 
 def _build_voice_ref_span(
@@ -8037,9 +8245,6 @@ def _voice_ref_text_penalty(
         else:
             ratio = min(max((source_chars_per_sec - preferred) / preferred, 0.0), 1.0)
         penalty += 0.25 * ratio
-    prefer_plain = getattr(cfg, "gsv_few_shot_prefer_plain_text", True) if cfg is not None else True
-    if not prefer_plain:
-        return min(penalty, 0.65)
     if re.search(r"^\s*\d+\s+", prompt_text):
         penalty += 0.18
     if re.search(
@@ -8048,10 +8253,10 @@ def _voice_ref_text_penalty(
     ):
         penalty += 0.28
     if re.search(
-        r"(変態|快感|気持ちよ|股間|股|粘液|愛液|子宮|乳首|おっぱい|おまんこ|おちんちん|チンポ|チンチン|ビンビン|勃起|エッチ|エロ|嫌ら|濡れ|尿道|お漏らし|メス|ロリ|痙攣|卵巣|バギナ|ピストン|媚薬|限界|出ない|行けない|侵され)",
+        r"(変態|快感|気持ちよ|股間|股|睾丸|金玉|粘液|愛液|子宮|乳首|おっぱい|おまんこ|おちんちん|おちんぽ|チンポ|チンチン|ビンビン|勃起|フェラ|フェラチオ|エッチ|エロ|嫌ら|濡れ|尿道|お漏らし|メス|ロリ|痙攣|卵巣|バギナ|ピストン|媚薬|限界|出ない|行けない|侵され)",
         prompt_text,
     ):
-        penalty += 0.18
+        penalty += 0.28
     if prompt_text.count(" ") >= 2 and len(prompt_text.replace(" ", "")) / max(prompt_text.count(" ") + 1, 1) < 9:
         penalty += 0.10
     return min(penalty, 0.65)
@@ -8063,6 +8268,33 @@ def _voice_ref_span_prompt_text(span: _VoiceRefSpan) -> str:
         for segment in span.segments
         if segment.source_script and segment.source_script.text.strip()
     )
+
+
+def _voice_ref_span_audio_duration_reject_reasons(
+    project_dir: Path,
+    span: _VoiceRefSpan,
+    *,
+    min_sec: float,
+    max_sec: float,
+) -> list[str]:
+    actual_total = 0.0
+    reasons: list[str] = []
+    for segment in span.segments:
+        try:
+            source = _resolve_project_read_path(project_dir, segment.audio_for_mix, "audio_for_mix")
+            actual = duration_sec(source)
+        except Exception:
+            continue
+        actual_total += actual
+        if abs(actual - segment.duration) > 0.10:
+            reasons.append(
+                f"audio_duration_mismatch:{segment.id}:{actual:.3f}!={segment.duration:.3f}"
+            )
+    if actual_total and actual_total < min_sec:
+        reasons.append(f"actual_span_duration_below_ref_min:{actual_total:.3f}<{min_sec:.3f}")
+    if actual_total > max_sec:
+        reasons.append(f"actual_span_duration_above_ref_max:{actual_total:.3f}>{max_sec:.3f}")
+    return reasons
 
 
 def _write_voice_ref_span(project_dir: Path, span: _VoiceRefSpan, output_path: Path) -> None:

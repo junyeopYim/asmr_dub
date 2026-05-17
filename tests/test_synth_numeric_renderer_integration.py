@@ -9,6 +9,7 @@ import pytest
 
 from asmr_dub_pipeline.audio.features import write_audio
 from asmr_dub_pipeline.config import save_project_config
+from asmr_dub_pipeline.gpt_sovits.schemas import GPTSoVITSRef
 from asmr_dub_pipeline.pipeline.manifest_io import load_manifest, save_manifest
 from asmr_dub_pipeline.pipeline.steps import countdown_synth_step, synth_step
 from asmr_dub_pipeline.schemas import (
@@ -22,7 +23,7 @@ from asmr_dub_pipeline.schemas import (
 
 def _write_refs(project_dir: Path) -> Path:
     ref_audio = project_dir / "refs" / "ref.wav"
-    samples = np.zeros((24_000, 2), dtype=np.float32)
+    samples = np.zeros((int(24_000 * 3.2), 2), dtype=np.float32)
     samples[:, 0] = np.sin(np.linspace(0.0, 120.0, len(samples), dtype=np.float32)) * 0.02
     samples[:, 1] = samples[:, 0]
     write_audio(ref_audio, samples, 24_000)
@@ -316,3 +317,232 @@ def test_numeric_renderer_failure_defaults_to_manual_review_without_normal_tts(
     assert segment.analysis["numeric_phrase_renderer"]["status"] == "failed"
     assert segment.analysis["numeric_phrase_renderer"]["fallback"] == "manual_review"
     assert manifest.stage_state["synth"]["numeric_phrase_failed_segments"] == ["seg_numeric"]
+
+
+def test_live_numeric_phrase_wrapper_calls_live_renderer_with_asr_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+    from asmr_dub_pipeline.script.numeric_render_plan import build_numeric_render_plan
+
+    cfg = ProjectConfig(
+        project_name="numeric-live-wrapper",
+        gsv_numeric_phrase_max_tempo=1.07,
+    )
+    segment = _scripted_segment(
+        segment_id="seg_live",
+        tts_text="하나, 둘, 셋.",
+        source_text="1 2 3",
+        duration=3.0,
+    )
+    plan = build_numeric_render_plan([1, 2, 3], target_duration_sec=segment.duration)
+    ref = GPTSoVITSRef(
+        ref_audio_path=str(tmp_path / "refs" / "ref.wav"),
+        prompt_text="테스트입니다",
+        prompt_lang="ko",
+    )
+    client = object()
+    calls: list[dict[str, Any]] = []
+    asr_calls: list[dict[str, Any]] = []
+
+    def fake_create_asr_backend(kind: str, config: dict[str, Any]) -> object:
+        asr_calls.append({"kind": kind, "config": config})
+        return {"kind": kind, "config": config}
+
+    def fake_render_live_numeric_phrase(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        asr_backend = kwargs["asr_backend_factory"]()
+        output_path = Path(args[2])
+        calls.append(
+            {
+                "args": args,
+                "kwargs": kwargs,
+                "asr_backend": asr_backend,
+            }
+        )
+        return {
+            "status": "rendered",
+            "output_path": str(output_path),
+            "duration_sec": segment.duration,
+            "payload": {"numeric_qc": {"gate": "pass"}, "placements": [], "max_tempo": 1.0},
+            "max_tempo": 1.0,
+        }
+
+    monkeypatch.setattr(synth_stage, "create_asr_backend", fake_create_asr_backend)
+    monkeypatch.setattr(synth_stage, "render_live_numeric_phrase", fake_render_live_numeric_phrase)
+
+    result = synth_stage.render_numeric_phrase_segment(
+        project_dir=tmp_path,
+        segment=segment,
+        plan=plan,
+        cfg=cfg,
+        mock=False,
+        lane_index=0,
+        gsv_url="http://example.invalid",
+        ref=ref,
+        client=client,
+    )
+
+    assert result["status"] == "rendered"
+    assert len(calls) == 1
+    assert calls[0]["args"][:2] == (plan, client)
+    assert calls[0]["kwargs"]["ref"] == ref.model_dump(mode="json")
+    assert calls[0]["args"][2] == (
+        tmp_path / "work" / "tts" / "numeric_phrase" / "seg_live_numeric_phrase.wav"
+    )
+    assert calls[0]["kwargs"]["work_dir"] == (
+        tmp_path / "work" / "tts" / "numeric_phrase" / "seg_live"
+    )
+    assert calls[0]["kwargs"]["max_tempo_limit"] == pytest.approx(1.07)
+    assert calls[0]["kwargs"]["mock"] is False
+    assert calls[0]["asr_backend"] == asr_calls[0]
+    assert asr_calls[0]["config"]["language"] == "ko"
+    assert asr_calls[0]["config"]["word_timestamps"] is True
+    assert asr_calls[0]["config"]["condition_on_previous_text"] is False
+    assert asr_calls[0]["config"]["vad_filter"] is True
+    assert asr_calls[0]["config"]["vad_parameters"]["min_silence_duration_ms"] <= 120
+
+
+def test_live_numeric_phrase_wrapper_reports_missing_client_or_ref(tmp_path: Path) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+    from asmr_dub_pipeline.script.numeric_render_plan import build_numeric_render_plan
+
+    cfg = ProjectConfig(project_name="numeric-live-missing")
+    segment = _scripted_segment(
+        segment_id="seg_missing",
+        tts_text="하나, 둘, 셋.",
+        source_text="1 2 3",
+        duration=3.0,
+    )
+    plan = build_numeric_render_plan([1, 2, 3], target_duration_sec=segment.duration)
+    ref = GPTSoVITSRef(
+        ref_audio_path=str(tmp_path / "refs" / "ref.wav"),
+        prompt_text="테스트입니다",
+        prompt_lang="ko",
+    )
+
+    missing_client = synth_stage.render_numeric_phrase_segment(
+        project_dir=tmp_path,
+        segment=segment,
+        plan=plan,
+        cfg=cfg,
+        mock=False,
+        ref=ref,
+        client=None,
+    )
+    missing_ref = synth_stage.render_numeric_phrase_segment(
+        project_dir=tmp_path,
+        segment=segment,
+        plan=plan,
+        cfg=cfg,
+        mock=False,
+        ref=None,
+        client=object(),
+    )
+
+    assert missing_client["status"] == "failed"
+    assert missing_client["reason"] == "numeric_phrase_client_missing"
+    assert missing_ref["status"] == "failed"
+    assert missing_ref["reason"] == "numeric_phrase_ref_missing"
+    assert "live_numeric_phrase_renderer_not_implemented" not in {
+        missing_client["reason"],
+        missing_ref["reason"],
+    }
+
+
+def test_live_numeric_phrase_job_resolves_segment_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+
+    class FakeGPTSoVITSClient:
+        def __init__(self, base_url: str, timeout_sec: float, retries: int) -> None:
+            self.base_url = base_url
+            self.timeout_sec = timeout_sec
+            self.retries = retries
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_create_asr_backend(kind: str, config: dict[str, Any]) -> object:
+        return {"kind": kind, "config": config}
+
+    def fake_render_live_numeric_phrase(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        plan = args[0]
+        output_path = Path(args[2])
+        candidate_path = Path(kwargs["work_dir"]) / "seg_live_job_phrase.wav"
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        write_audio(
+            candidate_path,
+            np.full((int(round(plan.target_duration_sec * 24_000)), 2), 0.01, dtype=np.float32),
+            24_000,
+        )
+        write_audio(
+            output_path,
+            np.full((int(round(plan.target_duration_sec * 48_000)), 2), 0.01, dtype=np.float32),
+            48_000,
+        )
+        calls.append({"args": args, "kwargs": kwargs})
+        return {
+            "status": "rendered",
+            "output_path": str(output_path),
+            "duration_sec": plan.target_duration_sec,
+            "payload": {
+                "numeric_qc": {
+                    "gate": "pass",
+                    "expected_values": list(plan.values),
+                    "observed_values": list(plan.values),
+                },
+                "placements": [{"values": list(plan.values)}],
+                "max_tempo": 1.0,
+                "candidate_generation": [
+                    {
+                        "role": "phrase",
+                        "path": str(candidate_path),
+                        "request": {"text": plan.text, "text_split_method": "cut0"},
+                    }
+                ],
+            },
+            "max_tempo": 1.0,
+            "selection_reason": "test_live_numeric_phrase",
+        }
+
+    monkeypatch.setattr(synth_stage, "GPTSoVITSClient", FakeGPTSoVITSClient)
+    monkeypatch.setattr(synth_stage, "create_asr_backend", fake_create_asr_backend)
+    monkeypatch.setattr(synth_stage, "render_live_numeric_phrase", fake_render_live_numeric_phrase)
+    refs_path = _save_project(
+        tmp_path,
+        ProjectConfig(
+            project_name="numeric-live-job",
+            gsv_gpt_weights_policy="unchanged",
+            gsv_sovits_weights_policy="unchanged",
+            gsv_numeric_phrase_max_tempo=1.05,
+        ),
+        _scripted_segment(
+            segment_id="seg_live_job",
+            tts_text="하나, 둘, 셋.",
+            source_text="1 2 3",
+            duration=3.0,
+        ),
+    )
+
+    synth_step(tmp_path, None, refs_path, mock=False, confirm_rights=True)
+
+    manifest = load_manifest(tmp_path)
+    segment = manifest.segments[0]
+    assert len(calls) == 1
+    assert isinstance(calls[0]["args"][1], FakeGPTSoVITSClient)
+    assert calls[0]["kwargs"]["ref"]["ref_audio_path"] == str((tmp_path / "refs" / "ref.wav").resolve())
+    assert calls[0]["kwargs"]["ref"]["prompt_lang"] == "ja"
+    assert calls[0]["kwargs"]["max_tempo_limit"] == pytest.approx(1.05)
+    assert segment.status == "synthesized"
+    assert segment.analysis["numeric_phrase_renderer"]["status"] == "rendered"
+    analysis_generation = segment.analysis["numeric_phrase_renderer"]["candidate_generation"]
+    assert isinstance(analysis_generation, list)
+    assert analysis_generation[0]["role"] == "phrase"
+    assert analysis_generation[0]["path"].endswith("seg_live_job_phrase.wav")
+    assert segment.tts is not None
+    candidate_generation = segment.tts.candidates[0].payload["candidate_generation"]
+    assert isinstance(candidate_generation, list)
+    assert candidate_generation[0]["role"] == "phrase"
+    assert candidate_generation[0]["path"].endswith("seg_live_job_phrase.wav")

@@ -565,6 +565,16 @@ class GSVConfig(StrictBaseModel):
     ref_max_sec: float = Field(default=10.0, gt=0)
     ref_min_quality_score: float = Field(default=0.25, ge=0.0, le=1.0)
     korean_segment_ref_enabled: bool = True
+    segment_ref_min_overlap_ratio: float = Field(default=0.75, ge=0.0, le=1.0)
+    segment_ref_relaxed_training_reasons: list[str] = Field(
+        default_factory=lambda: [
+            "low_dominant_source_speaker_overlap",
+            "borderline_single_speaker_overlap",
+            "neighbor_confirmed_single_speaker_overlap",
+            "single_speaker_overlap_tts_routing",
+            "merged_overlap_candidates_tts_routing",
+        ]
+    )
     korean_segment_ref_clarity_profile_enabled: bool = True
     korean_segment_ref_warn_blocks_mix: bool = True
     korean_segment_ref_temperature: float = Field(default=0.75, ge=0.0, le=2.0)
@@ -1149,6 +1159,8 @@ _GSV_FLAT_FIELDS = [
     "ref_max_sec",
     "ref_min_quality_score",
     "korean_segment_ref_enabled",
+    "segment_ref_min_overlap_ratio",
+    "segment_ref_relaxed_training_reasons",
     "korean_segment_ref_clarity_profile_enabled",
     "korean_segment_ref_warn_blocks_mix",
     "korean_segment_ref_temperature",

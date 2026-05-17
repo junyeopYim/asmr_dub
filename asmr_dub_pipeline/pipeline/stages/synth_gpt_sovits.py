@@ -16,6 +16,7 @@ from asmr_dub_pipeline.qc.pronunciation_qc import (
 )
 from asmr_dub_pipeline.pipeline.stages.numeric_phrase_renderer import (
     build_numeric_phrase_request,
+    render_live_numeric_phrase,
 )
 from asmr_dub_pipeline.script.numeric_cadence import (
     extract_korean_numeric_values,
@@ -115,6 +116,79 @@ def _numeric_phrase_token_pattern() -> re.Pattern[str]:
 
 
 _NUMERIC_PHRASE_TOKEN_RE = _numeric_phrase_token_pattern()
+_NUMERIC_PHRASE_ASR_PROMPT = "한국어 ASMR 숫자 카운팅 음성을 그대로 받아 적습니다."
+_NUMERIC_PHRASE_ASR_HOTWORDS = (
+    "영 공 하나 둘 셋 넷 다섯 여섯 일곱 여덟 아홉 열 "
+    "일 이 삼 사 오 육 칠 팔 구 십 0 1 2 3 4 5 6 7 8 9 10"
+)
+
+
+def _gsv_invalid_ref_duration_error(error: object) -> bool:
+    message = str(error).lower()
+    return (
+        "reference audio is outside" in message
+        and "3-10" in message
+        and "second" in message
+    )
+
+
+def _gsv_refs_duration_preflight(
+    refs: dict[str, GPTSoVITSRef],
+    cfg: ProjectConfig,
+    *,
+    required_styles: Sequence[str] = ("whisper_close", "sleepy"),
+) -> dict[str, Any]:
+    min_sec = max(float(cfg.gsv_ref_min_sec), GSV_API_MIN_REF_SEC)
+    max_sec = float(cfg.gsv_ref_max_sec)
+    rows: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    for style in required_styles:
+        ref = refs.get(style)
+        if ref is None:
+            rows.append(
+                {
+                    "style": style,
+                    "valid": None,
+                    "skipped": True,
+                    "reject_reasons": ["missing_ref_style"],
+                }
+            )
+            continue
+        ref_path = Path(ref.ref_audio_path)
+        try:
+            actual_duration = duration_sec(ref_path)
+        except Exception as exc:
+            row = {
+                "style": style,
+                "valid": False,
+                "ref_audio_path": ref.ref_audio_path,
+                "reject_reasons": [f"ref_duration_unreadable:{exc}"],
+            }
+            rows.append(row)
+            invalid.append(row)
+            continue
+        reject_reasons: list[str] = []
+        if actual_duration < min_sec:
+            reject_reasons.append(
+                f"actual_duration_below_ref_min:{actual_duration:.3f}<{min_sec:.3f}"
+            )
+        if actual_duration > max_sec:
+            reject_reasons.append(
+                f"actual_duration_above_ref_max:{actual_duration:.3f}>{max_sec:.3f}"
+            )
+        row = {
+            "style": style,
+            "valid": not reject_reasons,
+            "ref_audio_path": ref.ref_audio_path,
+            "actual_duration_sec": round(actual_duration, 6),
+            "min_duration_sec": round(min_sec, 6),
+            "max_duration_sec": round(max_sec, 6),
+            "reject_reasons": reject_reasons,
+        }
+        rows.append(row)
+        if reject_reasons:
+            invalid.append(row)
+    return {"refs": rows, "invalid": invalid}
 
 
 def _close_open_korean_tts_sentence(text: str) -> tuple[str, bool]:
@@ -2435,7 +2509,17 @@ def _numeric_phrase_request_payload(
 
 def _numeric_phrase_candidate_generation_payload(
     request: dict[str, Any],
-) -> dict[str, Any]:
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | list[Any]:
+    if isinstance(payload, dict):
+        raw_generation = payload.get("candidate_generation")
+        if isinstance(raw_generation, (dict, list)):
+            return copy.deepcopy(raw_generation)
+        numeric_phrase = payload.get("numeric_phrase")
+        if isinstance(numeric_phrase, dict):
+            raw_generation = numeric_phrase.get("candidate_generation")
+            if isinstance(raw_generation, (dict, list)):
+                return copy.deepcopy(raw_generation)
     return {
         "text_split_method": str(request.get("text_split_method") or "cut0"),
         "top_k": int(request.get("top_k") or 5),
@@ -2551,6 +2635,31 @@ def _numeric_phrase_render_plan_for_segment(
     return build_numeric_render_plan(values, target_duration_sec=float(segment.duration))
 
 
+def _numeric_phrase_asr_backend_name(cfg: ProjectConfig) -> str:
+    backend = str(getattr(cfg, "asr_backend", "faster_whisper")).strip().lower()
+    return "qwen_asr" if backend == "qwen_asr" else backend.replace("-", "_")
+
+
+def _numeric_phrase_asr_backend_config(cfg: ProjectConfig) -> dict[str, Any]:
+    backend_config = _asr_backend_config(cfg)
+    backend_config.update(
+        {
+            "language": "ko",
+            "word_timestamps": True,
+            "condition_on_previous_text": False,
+            "vad_filter": True,
+            "vad_parameters": {
+                "min_silence_duration_ms": 80,
+                "speech_pad_ms": 120,
+            },
+            "batched_inference": False,
+            "initial_prompt": _NUMERIC_PHRASE_ASR_PROMPT,
+            "hotwords": _NUMERIC_PHRASE_ASR_HOTWORDS,
+        }
+    )
+    return backend_config
+
+
 def _numeric_phrase_values_are_countdown(segment: Segment, values: list[int]) -> bool:
     if not is_descending_countdown(values):
         return False
@@ -2574,18 +2683,50 @@ def render_numeric_phrase_segment(
 ) -> dict[str, Any]:
     """Render a pure numeric phrase segment or explicitly report failure.
 
-    The live GPT-SoVITS phrase rendering path is intentionally left as a thin
-    integration seam for the model backend owner. Tests can monkeypatch this
-    function without reaching normal TTS routing.
+    Mock mode keeps the deterministic synthetic route. Live mode delegates
+    GPT-SoVITS phrase synthesis, ASR QC, and numeric bed rendering to the
+    numeric phrase renderer helper.
     """
-    _ = (lane_index, gsv_url, client)
+    _ = (lane_index, gsv_url)
     plan_payload = _numeric_render_plan_payload(plan)
     if not mock:
-        return {
-            "status": "failed",
-            "reason": "live_numeric_phrase_renderer_not_implemented",
-            "plan": plan_payload,
-        }
+        if client is None:
+            return {
+                "status": "failed",
+                "reason": "numeric_phrase_client_missing",
+                "plan": plan_payload,
+            }
+        if ref is None:
+            return {
+                "status": "failed",
+                "reason": "numeric_phrase_ref_missing",
+                "plan": plan_payload,
+            }
+        output_path = (
+            project_dir
+            / "work"
+            / "tts"
+            / "numeric_phrase"
+            / f"{segment.id}_numeric_phrase.wav"
+        )
+        work_dir = project_dir / "work" / "tts" / "numeric_phrase" / segment.id
+
+        def asr_backend_factory() -> Any:
+            return create_asr_backend(
+                _numeric_phrase_asr_backend_name(cfg),
+                _numeric_phrase_asr_backend_config(cfg),
+            )
+
+        return render_live_numeric_phrase(
+            plan,
+            client,
+            output_path,
+            ref=ref.model_dump(mode="json"),
+            asr_backend_factory=asr_backend_factory,
+            work_dir=work_dir,
+            max_tempo_limit=float(getattr(cfg, "gsv_numeric_phrase_max_tempo", 1.1)),
+            mock=False,
+        )
 
     output_path = project_dir / "work" / "tts" / "numeric_phrase" / f"{segment.id}_numeric_phrase.wav"
     seed_material = f"{segment.id}:{','.join(str(value) for value in plan.values)}"
@@ -2692,7 +2833,40 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
     else:
         refs = load_refs(refs_path, project_dir=project_dir)
         actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
+        if not mock:
+            refs_preflight = _gsv_refs_duration_preflight(refs, cfg)
+            if refs_preflight["invalid"]:
+                from asmr_dub_pipeline.pipeline.stages.voice_refs import (
+                    run_prepare_source_voice_refs_stage,
+                )
+
+                try:
+                    run_prepare_source_voice_refs_stage(
+                        ctx,
+                        actual_refs_path,
+                        confirm_rights=True,
+                    )
+                except Exception as exc:
+                    raise GPTSoVITSError(
+                        "valid source-derived reference not available: "
+                        f"{exc}"
+                    ) from exc
+                manifest = ctx.reload_manifest()
+                _load_config_into_manifest(project_dir, manifest)
+                cfg = manifest.project_config
+                refs = load_refs(actual_refs_path, project_dir=project_dir)
+                refs_preflight = _gsv_refs_duration_preflight(refs, cfg)
+                if refs_preflight["invalid"]:
+                    invalid_styles = ", ".join(
+                        str(row.get("style")) for row in refs_preflight["invalid"]
+                    )
+                    raise GPTSoVITSError(
+                        "valid source-derived reference not available: "
+                        f"{invalid_styles}"
+                    )
         refs_metadata = _refs_audit_metadata(actual_refs_path, refs)
+        if not mock:
+            refs_metadata["refs_preflight"] = refs_preflight
     if not mock:
         manifest.rights_audit = require_existing_or_confirmed_rights(
             manifest.rights_audit,
@@ -10155,7 +10329,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 "request": request_payload,
                 "candidate_text": str(request_payload.get("text") or plan.text),
                 "candidate_generation": _numeric_phrase_candidate_generation_payload(
-                    request_payload
+                    request_payload,
+                    result_payload,
                 ),
                 "numeric_qc": _numeric_phrase_numeric_qc_payload(plan, result_payload),
                 "placements": _numeric_phrase_placements_payload(result_payload),
@@ -10299,7 +10474,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
             max_tempo_limit = float(getattr(cfg, "gsv_numeric_phrase_max_tempo", 1.1))
             request_payload = _numeric_phrase_request_payload(plan, payload)
             candidate_generation = _numeric_phrase_candidate_generation_payload(
-                request_payload
+                request_payload,
+                payload,
             )
             placements = _numeric_phrase_placements_payload(payload)
             numeric_qc = _numeric_phrase_numeric_qc_payload(plan, payload)
@@ -10434,6 +10610,26 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
             numeric_phrase_handled_segment_ids.add(segment.id)
             return True
 
+        def numeric_phrase_ref_for_segment(segment: Segment) -> GPTSoVITSRef | None:
+            if segment.script is None:
+                return None
+            requested_ref_style = segment.script.ref_style or "whisper_close"
+            segment_refs = refs
+            speaker_cfg = _gsv_speaker_cfg(cfg, segment)
+            if speaker_cfg is not None:
+                speaker_refs_path = _resolve_gsv_speaker_path(project_dir, speaker_cfg.refs_path)
+                cache_key = str(speaker_refs_path)
+                with speaker_refs_cache_lock:
+                    if cache_key not in speaker_refs_cache:
+                        speaker_refs_cache[cache_key] = load_refs(speaker_refs_path, project_dir)
+                    segment_refs = speaker_refs_cache[cache_key]
+                if requested_ref_style not in segment_refs:
+                    requested_ref_style = speaker_cfg.default_ref_style
+            return _ref_for_tts_language(
+                resolve_ref(segment_refs, requested_ref_style),
+                segment.script.tts_language,
+            )
+
         def render_numeric_phrase_job(index: int, segment: Segment, lane_index: int) -> bool:
             plan = _numeric_phrase_render_plan_for_segment(segment, cfg)
             if plan is None:
@@ -10450,6 +10646,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 reset_previous_tts_attempt(segment)
             if segment.status == "synthesized" or segment.status in SKIP_STATUSES:
                 return False
+            ref = numeric_phrase_ref_for_segment(segment)
+            if not mock:
+                start_gsv_servers()
             result = render_numeric_phrase_segment(
                 project_dir=project_dir,
                 segment=segment,
@@ -10458,7 +10657,7 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 mock=mock,
                 lane_index=lane_index,
                 gsv_url=None if mock else gsv_base_urls[lane_index],
-                ref=None,
+                ref=ref,
                 client=None if mock or not clients else clients[lane_index],
             )
             if not isinstance(result, dict):
@@ -11793,6 +11992,7 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
             pending_timing_expansion = copy.deepcopy(
                 segment.analysis.pop("pending_timing_expansion", None)
             )
+            ref_duration_failure = False
             for candidate_index in range(effective_candidate_count):
                 seed = cfg.base_seed + index * 100 + candidate_index
                 tts_text_language = _segment_tts_text_language(segment, target_language)
@@ -11942,6 +12142,15 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             peak = peak_dbfs(candidate_path)
                             rms = rms_dbfs(candidate_path)
                         except GPTSoVITSError as exc:
+                            if _gsv_invalid_ref_duration_error(exc):
+                                payload["ref_failure"] = {
+                                    "kind": "invalid_ref_duration",
+                                    "ref_audio_path": current_ref.ref_audio_path,
+                                    "message": str(exc),
+                                    "action": "stop_repeating_ref_candidates",
+                                }
+                                payload["retry"]["next_action"] = "stop_invalid_ref_duration"
+                                ref_duration_failure = True
                             candidates.append(
                                 TTSCandidate(
                                     candidate_index=candidate_index,
@@ -11954,6 +12163,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             )
                             break
                         candidate_backend_name = "gpt-sovits"
+                    if ref_duration_failure:
+                        break
                     too_long = duration_too_long(duration, segment.duration, cfg.duration_tolerance)
                     too_short = duration_too_short(duration, segment.duration, cfg.duration_tolerance)
                     candidate_ratio = duration_ratio(duration, segment.duration)
@@ -12129,6 +12340,8 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                         duration_signal,
                         GPTSoVITSRetrySignal.SEED_CHANGED,
                     ]
+                if ref_duration_failure:
+                    break
             successful = [
                 candidate for candidate in candidates if not candidate.error and candidate.duration_sec is not None
             ]
@@ -12511,13 +12724,30 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                         counts_label="status_counts",
                     )
 
-        def selected_failed_segment_ids() -> list[str]:
+        def segment_has_invalid_ref_duration_failure(segment: Segment) -> bool:
+            if segment.tts is None:
+                return False
+            return any(
+                isinstance(candidate.payload.get("ref_failure"), dict)
+                and candidate.payload.get("ref_failure", {}).get("kind")
+                == "invalid_ref_duration"
+                for candidate in segment.tts.candidates
+            )
+
+        def selected_failed_segment_ids(
+            *,
+            include_invalid_ref_duration: bool = False,
+        ) -> list[str]:
             return [
                 segment.id
                 for segment in manifest.segments
                 if segment.status == "failed"
                 and (only_segment_ids is None or segment.id in only_segment_ids)
                 and failed_segment_in_stage_scope(segment)
+                and (
+                    include_invalid_ref_duration
+                    or not segment_has_invalid_ref_duration_failure(segment)
+                )
             ]
 
         def failed_segment_in_stage_scope(segment: Segment) -> bool:
@@ -13408,7 +13638,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
             )
         synth_pass = "complete"
         terminal_failed_before_fallback = (
-            [] if countdown_only else selected_failed_segment_ids()
+            []
+            if countdown_only
+            else selected_failed_segment_ids(include_invalid_ref_duration=True)
         )
         keep_original_fallback_summary = apply_terminal_keep_original_fallback(
             terminal_failed_before_fallback
