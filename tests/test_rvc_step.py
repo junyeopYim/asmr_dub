@@ -113,6 +113,44 @@ def test_mock_rvc_copies_selected_tts_and_records_manifest(tmp_project_dir: Path
     assert Path(segment.rvc.output_path).exists()
 
 
+def test_mock_rvc_accepts_partial_synth_and_skips_manual_review_segments(
+    tmp_project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = ProjectConfig(rvc_backend="mock")
+    selected = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    manual_review = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    manual_review.status = "needs_manual_review"
+    manual_review.tts = None
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[selected, manual_review])
+    manifest = load_manifest(tmp_project_dir)
+    mark_stage(
+        manifest,
+        "synth",
+        "completed_with_hard_failed_candidates",
+        selected_segments=["seg_0001"],
+        hard_failed_segments=["seg_0002"],
+    )
+    save_manifest(tmp_project_dir, manifest)
+    seen_segments: list[str] = []
+    original_convert = pipeline_steps.RVCMockClient.convert
+
+    def counting_convert(self, input_path: Path, output_path: Path, **kwargs: object):
+        seen_segments.append(str(kwargs.get("segment_id")))
+        return original_convert(self, input_path, output_path, **kwargs)
+
+    monkeypatch.setattr(pipeline_steps.RVCMockClient, "convert", counting_convert)
+
+    converted = pipeline_steps.rvc_step(tmp_project_dir, confirm_rights=True)
+
+    assert seen_segments == ["seg_0001"]
+    assert converted.segments[0].status == "rvc_converted"
+    assert converted.segments[0].rvc is not None
+    assert converted.segments[1].status == "needs_manual_review"
+    assert converted.segments[1].tts is None
+    assert converted.segments[1].rvc is None
+
+
 def test_rvc_rerun_uses_raw_tts_not_previous_rvc_output(
     tmp_project_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -154,6 +192,65 @@ def test_mock_train_rvc_creates_model_artifacts(tmp_project_dir: Path) -> None:
     assert Path(trained.artifacts["rvc_model_path"]).exists()
     assert Path(trained.artifacts["rvc_index_path"]).exists()
     assert Path(trained.artifacts["rvc_train_manifest"]).exists()
+
+
+def test_mock_train_rvc_accepts_partial_synth_when_hard_failures_are_non_blocking(
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock", rvc_train_min_clean_sec=0.0)
+    save_project_config(cfg.model_copy(update={"project_name": tmp_project_dir.name}), tmp_project_dir / "pipeline.yaml")
+    selected = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    manual_review = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    manual_review.status = "needs_manual_review"
+    manual_review.tts = None
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[selected, manual_review],
+    )
+    mark_stage(
+        manifest,
+        "synth",
+        "completed_with_hard_failed_candidates",
+        selected_segments=["seg_0001"],
+        hard_failed_segments=["seg_0002"],
+    )
+    save_manifest(tmp_project_dir, manifest)
+
+    trained = pipeline_steps.rvc_train_step(tmp_project_dir, confirm_rights=True, mock=True)
+
+    train_state = trained.stage_state["train-rvc"]
+    assert train_state["status"] == "completed"
+    assert train_state["input_synth_status"] == "completed_with_hard_failed_candidates"
+    assert train_state["input_synth_downstream_ready"] is True
+    assert train_state["input_synth_hard_failed_segments"] == ["seg_0002"]
+    assert train_state["input_synth_non_blocking_segments"] == ["seg_0002"]
+    assert train_state["input_synth_blocking_segments"] == []
+
+
+def test_mock_train_rvc_rejects_partial_synth_with_blocking_missing_selected_tts(
+    tmp_project_dir: Path,
+) -> None:
+    cfg = ProjectConfig(rvc_backend="mock", rvc_train_backend="mock", rvc_train_min_clean_sec=0.0)
+    save_project_config(cfg.model_copy(update={"project_name": tmp_project_dir.name}), tmp_project_dir / "pipeline.yaml")
+    blocking = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    blocking.tts = None
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[blocking],
+    )
+    mark_stage(
+        manifest,
+        "synth",
+        "completed_with_hard_failed_candidates",
+        selected_segments=[],
+        hard_failed_segments=["seg_0001"],
+    )
+    save_manifest(tmp_project_dir, manifest)
+
+    with pytest.raises(ValueError, match="seg_0001"):
+        pipeline_steps.rvc_train_step(tmp_project_dir, confirm_rights=True, mock=True)
 
 
 def test_train_rvc_auto_epoch_records_effective_epochs(tmp_project_dir: Path) -> None:

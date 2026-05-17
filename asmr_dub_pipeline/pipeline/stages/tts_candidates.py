@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import shutil
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,10 @@ from asmr_dub_pipeline.pipeline.artifacts import (
 )
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.manifest_io import save_manifest, write_json_atomic
+from asmr_dub_pipeline.pipeline.stage_readiness import (
+    NON_BLOCKING_SYNTH_SEGMENT_STATUSES,
+    synth_ready_for_downstream,
+)
 from asmr_dub_pipeline.pipeline.stages.common import (
     _load_config_into_manifest,
     _log_stage_complete,
@@ -377,6 +382,7 @@ def run_tts_select_stage(
     store = CandidateStore(project_dir)
     selected_segments: list[str] = []
     hard_failed_segments: list[str] = []
+    hard_fail_reason_counts: Counter[str] = Counter()
     for segment in manifest.segments:
         if only_segment_ids is not None and segment.id not in only_segment_ids:
             continue
@@ -438,10 +444,12 @@ def run_tts_select_stage(
             segment.qc = None
             segment.mix = {}
             segment.status = "needs_manual_review"
+            hard_fail_reason_counts.update(["all_candidates_stale"])
             segment.analysis["tts_selection"] = {
                 "status": "manual_review",
                 "terminal_reason": "all_candidates_stale",
                 "scores": [],
+                "hard_fail_reasons": ["all_candidates_stale"],
                 "stale_candidate_filtered_count": len(stale_candidates),
                 "stale_candidate_filter_reasons": stale_reasons,
                 "expected_script_generation_id": script_generation_id,
@@ -460,10 +468,19 @@ def run_tts_select_stage(
             segment.qc = None
             segment.mix = {}
             segment.status = "needs_manual_review"
+            segment_hard_fail_reasons = sorted(
+                {
+                    reason
+                    for score in result.scores
+                    for reason in score.hard_fail_reasons
+                }
+            )
+            hard_fail_reason_counts.update(segment_hard_fail_reasons)
             segment.analysis["tts_selection"] = {
                 "status": "manual_review",
                 "terminal_reason": result.terminal_reason,
                 "scores": [score.model_dump(mode="json") for score in result.scores],
+                "hard_fail_reasons": segment_hard_fail_reasons,
                 "stale_candidate_filtered_count": len(stale_candidates),
                 "stale_candidate_filter_reasons": stale_reasons,
                 "expected_script_generation_id": script_generation_id,
@@ -564,11 +581,31 @@ def run_tts_select_stage(
         segment.analysis["tts_selection"] = {"status": "selected", **selection_payload}
         selected_segments.append(segment.id)
     out_path = project_dir / "work" / "tts" / "selected" / "selection_manifest.json"
+    non_blocking_hard_failed_segments = [
+        segment_id
+        for segment_id in hard_failed_segments
+        if (segment := next((item for item in manifest.segments if item.id == segment_id), None)) is not None
+        and segment.status in NON_BLOCKING_SYNTH_SEGMENT_STATUSES
+    ]
+    downstream_blocking_segments = [
+        segment.id
+        for segment in manifest.segments
+        if segment.status not in NON_BLOCKING_SYNTH_SEGMENT_STATUSES
+        and not (segment.tts and segment.tts.selected_candidate_path)
+    ]
+    downstream_ready = not downstream_blocking_segments
+    hard_fail_reason_counts_payload = dict(sorted(hard_fail_reason_counts.items()))
     write_json_atomic(
         out_path,
         {
             "selected_segments": selected_segments,
             "hard_failed_segments": hard_failed_segments,
+            "downstream_ready": downstream_ready,
+            "downstream_blocking_segments": downstream_blocking_segments,
+            "non_blocking_hard_failed_segments": non_blocking_hard_failed_segments,
+            "selected_segment_count": len(selected_segments),
+            "hard_failed_segment_count": len(hard_failed_segments),
+            "hard_fail_reason_counts": hard_fail_reason_counts_payload,
             "segments": [
                 {"id": segment.id, "tts_selection": segment.analysis.get("tts_selection")}
                 for segment in manifest.segments
@@ -583,6 +620,12 @@ def run_tts_select_stage(
         "completed" if not hard_failed_segments else "completed_with_hard_failed_candidates",
         selected_segments=selected_segments,
         hard_failed_segments=hard_failed_segments,
+        downstream_ready=downstream_ready,
+        downstream_blocking_segments=downstream_blocking_segments,
+        non_blocking_hard_failed_segments=non_blocking_hard_failed_segments,
+        selected_segment_count=len(selected_segments),
+        hard_failed_segment_count=len(hard_failed_segments),
+        hard_fail_reason_counts=hard_fail_reason_counts_payload,
         selection_manifest=str(out_path),
         segment_counts=_segment_counts(manifest),
     )
@@ -593,7 +636,14 @@ def run_tts_select_stage(
         backend="candidate-pool",
         selected_segments=selected_segments,
         hard_failed_segments=hard_failed_segments,
+        downstream_ready=downstream_ready,
+        downstream_blocking_segments=downstream_blocking_segments,
+        non_blocking_hard_failed_segments=non_blocking_hard_failed_segments,
+        selected_segment_count=len(selected_segments),
+        hard_failed_segment_count=len(hard_failed_segments),
+        hard_fail_reason_counts=hard_fail_reason_counts_payload,
         segment_counts=_segment_counts(manifest),
     )
+    manifest.stage_state["synth"]["downstream_readiness"] = synth_ready_for_downstream(manifest)
     save_manifest(project_dir, manifest)
     return ctx.update_manifest(manifest)

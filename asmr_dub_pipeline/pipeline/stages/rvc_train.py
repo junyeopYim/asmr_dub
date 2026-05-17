@@ -3,7 +3,18 @@ from __future__ import annotations
 # ruff: noqa: F403,F405,I001
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
+from asmr_dub_pipeline.pipeline.stage_readiness import require_synth_ready_for_downstream
 from asmr_dub_pipeline.pipeline.stages.common import *
+
+
+def _synth_readiness_stage_metadata(readiness: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "input_synth_status": readiness["synth_status"],
+        "input_synth_downstream_ready": readiness["ready"],
+        "input_synth_hard_failed_segments": readiness["hard_failed_segments"],
+        "input_synth_non_blocking_segments": readiness["non_blocking_segments"],
+        "input_synth_blocking_segments": readiness["blocking_segments"],
+    }
 
 
 def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None) -> PipelineManifest:
@@ -13,8 +24,7 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
     cfg = manifest.project_config
     backend = "mock" if mock is True else cfg.rvc_train_backend
     _log_stage_start("train-rvc", f"backend={backend}, segments={len(manifest.segments)}")
-    if manifest.stage_state.get("synth", {}).get("status") != "completed":
-        raise ValueError("train-rvc requires a completed synth stage.")
+    synth_readiness = require_synth_ready_for_downstream(manifest, "train-rvc")
     if backend == "command":
         if not confirm_rights:
             raise RightsError("Real RVC training requires --confirm-rights for source voice training data.")
@@ -149,6 +159,7 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
             speaker_ids=speaker_ids,
             speaker_models={speaker_id: speaker_cfg.model_dump(mode="json") for speaker_id, speaker_cfg in speaker_models.items()},
             dataset_segment_count=sum(len(row["dataset_segments"]) for row in speaker_results.values()),
+            **_synth_readiness_stage_metadata(synth_readiness),
             epoch_policy=cfg.rvc_train_epoch_policy,
             quality_preset=cfg.rvc_train_quality_preset,
             effective_train_epochs_by_speaker={
@@ -240,6 +251,7 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
         model_path=str(result.model_path),
         index_path=str(result.index_path) if result.index_path else None,
         dataset_segment_count=len(dataset_rows),
+        **_synth_readiness_stage_metadata(synth_readiness),
         epoch_policy=cfg.rvc_train_epoch_policy,
         quality_preset=cfg.rvc_train_quality_preset,
         configured_train_epochs=epoch_decision["configured_epochs"],

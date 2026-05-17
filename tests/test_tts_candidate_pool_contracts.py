@@ -410,6 +410,15 @@ def test_tts_select_rejects_only_stale_candidates(tmp_project_dir: Path, tmp_pat
     assert analysis["stale_candidate_filtered_count"] == 1
     assert analysis["expected_script_generation_id"] == make_script_generation_id(segment.script)
     assert analysis["expected_script_hash"] == stable_hash(segment.script or {})
+    synth_state = manifest.stage_state["synth"]
+    assert synth_state["status"] == "completed_with_hard_failed_candidates"
+    assert synth_state["downstream_ready"] is True
+    assert synth_state["downstream_blocking_segments"] == []
+    assert synth_state["hard_failed_segments"] == ["seg_0001"]
+    assert synth_state["non_blocking_hard_failed_segments"] == ["seg_0001"]
+    assert synth_state["selected_segments"] == []
+    assert synth_state["selected_segment_count"] == 0
+    assert synth_state["hard_failed_segment_count"] == 1
 
 
 def test_selected_tts_generation_changes_when_wav_content_changes(

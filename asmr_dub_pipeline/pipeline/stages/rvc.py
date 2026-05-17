@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.artifacts import ensure_segment_generation_ids, make_rvc_generation_id
+from asmr_dub_pipeline.pipeline.stage_readiness import require_synth_ready_for_downstream
 from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.rvc import output_fresh_for_input
 
@@ -130,8 +131,11 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
     cfg = manifest.project_config
     backend = "mock" if mock is True else cfg.rvc_backend
     _log_stage_start("rvc", f"backend={backend}, segments={len(manifest.segments)}")
-    if manifest.stage_state.get("synth", {}).get("status") != "completed":
-        raise ValueError("RVC requires a completed synth stage.")
+    synth_readiness = require_synth_ready_for_downstream(
+        manifest,
+        "RVC",
+        only_segment_ids=only_segment_ids,
+    )
     if not _train_rvc_ready_for_rvc(manifest):
         raise ValueError("RVC requires a completed train-rvc stage.")
     if manifest.stage_state.get("train-rvc", {}).get("status") == "skipped_insufficient_training_data":
@@ -881,6 +885,11 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
             backend=backend,
             failed_segments=failed_segments,
             rvc_manifest=str(out_path),
+            input_synth_status=synth_readiness["synth_status"],
+            input_synth_downstream_ready=synth_readiness["ready"],
+            input_synth_hard_failed_segments=synth_readiness["hard_failed_segments"],
+            input_synth_non_blocking_segments=synth_readiness["non_blocking_segments"],
+            input_synth_blocking_segments=synth_readiness["blocking_segments"],
             concurrency=effective_concurrency,
             execution_mode="batch" if use_batch_rvc else "per_segment",
             force=force,
@@ -900,6 +909,11 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         "completed",
         backend=backend,
         rvc_manifest=str(out_path),
+        input_synth_status=synth_readiness["synth_status"],
+        input_synth_downstream_ready=synth_readiness["ready"],
+        input_synth_hard_failed_segments=synth_readiness["hard_failed_segments"],
+        input_synth_non_blocking_segments=synth_readiness["non_blocking_segments"],
+        input_synth_blocking_segments=synth_readiness["blocking_segments"],
         concurrency=effective_concurrency,
         execution_mode="batch" if use_batch_rvc else "per_segment",
         force=force,
