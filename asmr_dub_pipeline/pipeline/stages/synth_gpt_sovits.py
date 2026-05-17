@@ -2494,8 +2494,10 @@ def _numeric_render_plan_payload(plan: NumericRenderPlan) -> dict[str, Any]:
         "target_duration_sec": round(float(plan.target_duration_sec), 6),
         "text": plan.text,
         "text_variant": plan.text_variant,
+        "policy": plan.render_policy,
         "render_policy": plan.render_policy,
         "groups": [list(group) for group in plan.groups],
+        "counting_compaction_disabled_for_numeric_renderer": True,
     }
 
 
@@ -2773,7 +2775,9 @@ def render_numeric_phrase_segment(
         "values": list(plan.values),
         "tokens": list(plan.tokens),
         "text_variant": plan.text_variant,
+        "policy": plan.render_policy,
         "render_policy": plan.render_policy,
+        "counting_compaction_disabled_for_numeric_renderer": True,
         "target_duration_sec": round(float(segment.duration), 6),
         "duration_ratio": candidate_ratio,
         "duration_gate": duration_gate,
@@ -10348,6 +10352,7 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                     request_payload,
                     result_payload,
                 ),
+                "counting_compaction_disabled_for_numeric_renderer": True,
                 "numeric_qc": _numeric_phrase_numeric_qc_payload(plan, result_payload),
                 "placements": _numeric_phrase_placements_payload(result_payload),
                 "target_duration_sec": round(float(segment.duration), 6),
@@ -10380,38 +10385,7 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 result=result,
             )
             segment.analysis["numeric_phrase_renderer"] = metadata
-            seed = int(getattr(cfg, "base_seed", 0))
-            candidate = TTSCandidate(
-                candidate_index=0,
-                seed=seed,
-                payload=copy.deepcopy(metadata),
-                output_path=str(
-                    project_dir
-                    / "work"
-                    / "tts"
-                    / "numeric_phrase"
-                    / f"{segment.id}_numeric_phrase_failed.wav"
-                ),
-                backend="gpt-sovits-countdown-renderer",
-                error=reason,
-                selection_reason="numeric_phrase_renderer_failed",
-                retry_summary={"numeric_phrase_renderer": True},
-            )
-            segment.tts = TTSMetadata(
-                backend="gpt-sovits-countdown-renderer",
-                ref_style=segment.script.ref_style if segment.script else "whisper_close",
-                candidate_count=1,
-                candidates=[candidate],
-                source_language=cfg.source_language,
-                target_language=cfg.target_language,
-                cross_lingual_voice_transfer=cfg.source_language != cfg.target_language,
-                retry_summary={
-                    "numeric_phrase_renderer": True,
-                    "status": "failed",
-                    "fallback": "manual_review",
-                    "reason": reason,
-                },
-            )
+            segment.tts = None
             segment.status = "needs_manual_review"
             error = f"Numeric phrase renderer failed: {reason}"
             if error not in segment.errors:
@@ -10505,7 +10479,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                     "values": list(plan.values),
                     "tokens": list(plan.tokens),
                     "text_variant": plan.text_variant,
+                    "policy": plan.render_policy,
                     "render_policy": plan.render_policy,
+                    "counting_compaction_disabled_for_numeric_renderer": True,
                     "target_duration_sec": round(float(segment.duration), 6),
                     "duration_ratio": candidate_ratio,
                     "duration_gate": duration_gate,
@@ -10538,12 +10514,12 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                     },
                 }
             )
-            if duration_gate != "pass":
+            if str(numeric_qc.get("gate") or "").lower() not in {"pass", "ok"}:
                 return mark_numeric_phrase_manual_review(
                     segment=segment,
                     plan=plan,
-                    reason=f"duration_gate_{duration_gate}",
-                    result={**result, "duration_gate": duration_gate},
+                    reason="numeric_qc_failed",
+                    result={**result, "numeric_qc": numeric_qc},
                 )
             if audio_gate != "pass":
                 return mark_numeric_phrase_manual_review(
@@ -10568,10 +10544,10 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 backend="gpt-sovits-countdown-renderer",
                 selected=True,
                 duration_ratio=candidate_ratio,
-                duration_gate="pass",
+                duration_gate=duration_gate,
                 timing_quality_gate=_gsv_timing_quality_gate(
                     candidate_ratio,
-                    "pass",
+                    duration_gate,
                     float(getattr(cfg, "gsv_timing_quality_tolerance", 0.10)),
                 ),
                 acceptable_for_mix=True,
@@ -10591,7 +10567,7 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 cross_lingual_voice_transfer=cfg.source_language != cfg.target_language,
                 retry_summary={
                     "numeric_phrase_renderer": True,
-                    "selected_duration_gate": "pass",
+                    "selected_duration_gate": duration_gate,
                     "selected_acceptable_for_mix": True,
                     "selected_duration_ratio": candidate_ratio,
                     "selected_timing_quality_gate": candidate.timing_quality_gate,
@@ -10606,13 +10582,14 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                 "request": request_payload,
                 "candidate_text": str(request_payload.get("text") or plan.text),
                 "candidate_generation": candidate_generation,
+                "counting_compaction_disabled_for_numeric_renderer": True,
                 "numeric_qc": numeric_qc,
                 "placements": placements,
                 "output_path": str(source_path),
                 "selected_candidate_path": str(final_path),
                 "duration_sec": round(actual_duration, 6),
                 "duration_ratio": candidate_ratio,
-                "duration_gate": "pass",
+                "duration_gate": duration_gate,
                 "audio_qc": payload["audio_qc"],
                 "max_tempo": round(max_tempo, 6),
                 "max_tempo_limit": max_tempo_limit,

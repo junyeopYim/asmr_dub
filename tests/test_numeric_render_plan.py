@@ -10,8 +10,8 @@ def test_builds_native_whole_span_plan_for_ascending_count_run() -> None:
     assert plan.kind == NumericRenderKind.NUMERIC_CADENCE
     assert plan.tokens == ["셋", "넷", "다섯", "여섯", "일곱", "여덟", "아홉", "열"]
     assert plan.target_duration_sec == 3.42
-    assert plan.text == "셋 넷 다섯 여섯 일곱 여덟 아홉 열."
-    assert plan.text_variant == "native_spaces"
+    assert plan.text == "셋. 넷. 다섯. 여섯. 일곱. 여덟. 아홉. 열."
+    assert plan.text_variant == "native_periods_no_compact"
     assert plan.render_policy == "whole_span_guard120_pad350"
     assert plan.groups == [[3, 4, 5, 6, 7, 8, 9, 10]]
 

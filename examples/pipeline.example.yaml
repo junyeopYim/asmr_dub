@@ -176,7 +176,12 @@ gsv:
   trim_silence_threshold_db: -50.0
   tts_max_speed_factor: 1.12
   tts_min_speed_factor: 0.9
-  countdown_renderer: carrier_bank
+  countdown_renderer: numeric_phrase
+  numeric_phrase_renderer_enabled: true
+  numeric_phrase_max_tempo: 1.1
+  numeric_phrase_failure_fallback: manual_review
+  numeric_phrase_whole_lead_in_sec: 0.12
+  numeric_phrase_tail_guard_sec: 0.16
   countdown_candidate_count: 8
   countdown_carrier_templates:
   - 이번 숫자는 {token}. 입니다.

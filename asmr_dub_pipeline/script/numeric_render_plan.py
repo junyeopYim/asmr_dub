@@ -58,6 +58,10 @@ def _build_plan(
     )
 
 
+def _period_separated_text(tokens: list[str]) -> str:
+    return ". ".join(tokens) + "."
+
+
 def build_numeric_render_plan(values: list[int], *, target_duration_sec: float) -> NumericRenderPlan | None:
     tokens = _native_tokens(values)
     if tokens is None or len(values) < 3:
@@ -89,8 +93,8 @@ def build_numeric_render_plan(values: list[int], *, target_duration_sec: float) 
         values=values,
         tokens=tokens,
         target_duration_sec=target_duration_sec,
-        text=" ".join(tokens) + ".",
-        text_variant="native_spaces",
+        text=_period_separated_text(tokens),
+        text_variant="native_periods_no_compact",
         render_policy="whole_span_guard120_pad350",
         groups=[values],
     )

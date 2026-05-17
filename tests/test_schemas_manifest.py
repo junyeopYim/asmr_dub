@@ -312,7 +312,10 @@ def test_numeric_phrase_renderer_success_metadata_is_manifest_ready(
     loaded = load_manifest(tmp_path)
     renderer = loaded.segments[0].analysis["numeric_phrase_renderer"]
     assert renderer["status"] == "rendered"
-    assert renderer["candidate_text"] == "하나 둘 셋 넷."
+    assert renderer["candidate_text"] == "하나. 둘. 셋. 넷."
+    assert renderer["text_variant"] == "native_periods_no_compact"
+    assert renderer["policy"] == "whole_span_guard120_pad350"
+    assert renderer["counting_compaction_disabled_for_numeric_renderer"] is True
     assert renderer["candidate_generation"] == {
         "text_split_method": "cut0",
         "top_k": 5,

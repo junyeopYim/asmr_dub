@@ -116,6 +116,21 @@ def test_countdown_generation_uses_native_text_and_low_randomness() -> None:
     assert request.repetition_penalty == 1.8
 
 
+def test_numeric_cadence_generation_uses_native_periods_without_compaction() -> None:
+    plan = build_numeric_render_plan([3, 4, 5, 6, 7, 8, 9, 10], target_duration_sec=3.42)
+    assert plan is not None
+
+    request = build_numeric_phrase_request(plan, ref={"prompt_lang": "ko"})
+
+    assert plan.text_variant == "native_periods_no_compact"
+    assert request.text == "셋. 넷. 다섯. 여섯. 일곱. 여덟. 아홉. 열."
+    assert request.text_split_method == "cut0"
+    assert request.top_k == 5
+    assert request.top_p == 0.85
+    assert request.temperature == 0.65
+    assert request.repetition_penalty == 1.8
+
+
 def test_numeric_phrase_request_normalizes_japanese_prompt_language() -> None:
     plan = build_numeric_render_plan([10, 9, 8], target_duration_sec=1.4)
     assert plan is not None

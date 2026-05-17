@@ -92,19 +92,35 @@ def _save_project(project_dir: Path, cfg: ProjectConfig, segment: Segment) -> Pa
     return refs_path
 
 
-def _rendered_result(project_dir: Path, segment: Segment) -> dict[str, Any]:
+def _rendered_result(
+    project_dir: Path,
+    segment: Segment,
+    *,
+    duration: float | None = None,
+) -> dict[str, Any]:
     output_path = project_dir / "work" / "tts" / "numeric_phrase" / f"{segment.id}_fake.wav"
+    duration = segment.duration if duration is None else duration
     write_audio(
         output_path,
-        np.full((int(round(segment.duration * 48_000)), 2), 0.01, dtype=np.float32),
+        np.full((int(round(duration * 48_000)), 2), 0.01, dtype=np.float32),
         48_000,
     )
     return {
         "status": "rendered",
         "output_path": str(output_path),
-        "duration_sec": segment.duration,
+        "duration_sec": duration,
         "seed": 4242,
-        "payload": {"fake_numeric_renderer": True},
+        "payload": {
+            "fake_numeric_renderer": True,
+            "max_tempo": 1.0,
+            "numeric_qc": {
+                "gate": "pass",
+                "expected_values": [],
+                "observed_values": [],
+                "backend": "test",
+            },
+            "placements": [],
+        },
         "selection_reason": "test_numeric_phrase_renderer",
     }
 
@@ -158,7 +174,18 @@ def test_numeric_cadence_routes_to_numeric_renderer_before_normal_tts(
     assert segment.tts is not None
     assert segment.tts.backend == "gpt-sovits-countdown-renderer"
     assert segment.tts.candidates[0].payload["renderer"] == "numeric_phrase"
+    assert segment.tts.candidates[0].payload["counting_compaction_disabled_for_numeric_renderer"] is True
     assert segment.analysis["numeric_phrase_renderer"]["status"] == "rendered"
+    assert segment.analysis["numeric_phrase_renderer"]["text_variant"] == "native_periods_no_compact"
+    assert segment.analysis["numeric_phrase_renderer"]["candidate_text"] == (
+        "하나. 둘. 셋. 넷. 다섯."
+    )
+    assert (
+        segment.analysis["numeric_phrase_renderer"][
+            "counting_compaction_disabled_for_numeric_renderer"
+        ]
+        is True
+    )
     assert manifest.stage_state["synth"]["numeric_phrase_rendered_segments"] == ["seg_numeric"]
 
 
@@ -314,9 +341,169 @@ def test_numeric_renderer_failure_defaults_to_manual_review_without_normal_tts(
     segment = manifest.segments[0]
     assert segment.status == "needs_manual_review"
     assert "Numeric phrase renderer failed: not implemented in test" in segment.errors
+    assert segment.tts is None
     assert segment.analysis["numeric_phrase_renderer"]["status"] == "failed"
     assert segment.analysis["numeric_phrase_renderer"]["fallback"] == "manual_review"
     assert manifest.stage_state["synth"]["numeric_phrase_failed_segments"] == ["seg_numeric"]
+
+
+def test_numeric_renderer_duration_mismatch_is_timefit_metadata_not_hard_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+
+    def fake_render_numeric_phrase_segment(**kwargs: Any) -> dict[str, Any]:
+        return _rendered_result(kwargs["project_dir"], kwargs["segment"], duration=1.0)
+
+    monkeypatch.setattr(
+        synth_stage,
+        "render_numeric_phrase_segment",
+        fake_render_numeric_phrase_segment,
+    )
+    refs_path = _save_project(
+        tmp_path,
+        ProjectConfig(project_name="numeric-duration-soft", duration_tolerance=0.05),
+        _scripted_segment(
+            segment_id="seg_numeric",
+            tts_text="하나, 둘, 셋, 넷.",
+            source_text="1 2 3 4",
+            duration=3.0,
+        ),
+    )
+
+    synth_step(tmp_path, None, refs_path, mock=True, confirm_rights=True)
+
+    manifest = load_manifest(tmp_path)
+    segment = manifest.segments[0]
+    assert segment.status == "synthesized"
+    assert segment.tts is not None
+    assert segment.tts.selected_candidate_path is not None
+    assert segment.tts.candidates[0].duration_gate == "too_short"
+    assert segment.tts.candidates[0].acceptable_for_mix is True
+    assert segment.analysis["numeric_phrase_renderer"]["duration_gate"] == "too_short"
+    assert segment.analysis["numeric_phrase_renderer"]["numeric_qc"]["gate"] == "pass"
+
+
+def test_numeric_renderer_rendered_result_with_failed_numeric_qc_is_hard_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+
+    def fake_render_numeric_phrase_segment(**kwargs: Any) -> dict[str, Any]:
+        result = _rendered_result(kwargs["project_dir"], kwargs["segment"], duration=1.0)
+        result["payload"]["numeric_qc"] = {
+            "gate": "fail",
+            "expected_values": [10, 9, 8],
+            "observed_values": [19, 8],
+            "issues": ["numeric_sequence_mismatch"],
+        }
+        return result
+
+    monkeypatch.setattr(
+        synth_stage,
+        "render_numeric_phrase_segment",
+        fake_render_numeric_phrase_segment,
+    )
+    refs_path = _save_project(
+        tmp_path,
+        ProjectConfig(project_name="numeric-qc-hard-fail", duration_tolerance=0.05),
+        _scripted_segment(
+            segment_id="seg_countdown",
+            tts_text="십, 구, 팔.",
+            source_text="10 9 8",
+            duration=3.0,
+        ),
+    )
+
+    countdown_synth_step(tmp_path, None, refs_path, mock=True, confirm_rights=True)
+
+    segment = load_manifest(tmp_path).segments[0]
+    assert segment.status == "needs_manual_review"
+    assert segment.tts is None
+    assert segment.analysis["numeric_phrase_renderer"]["reason"] == "numeric_qc_failed"
+    assert segment.analysis["numeric_phrase_renderer"]["numeric_qc"]["observed_values"] == [19, 8]
+
+
+def test_ordinary_short_semantic_speech_stays_on_normal_tts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+
+    calls: list[str] = []
+
+    def fake_render_numeric_phrase_segment(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["segment"].id)
+        return _rendered_result(kwargs["project_dir"], kwargs["segment"])
+
+    monkeypatch.setattr(
+        synth_stage,
+        "render_numeric_phrase_segment",
+        fake_render_numeric_phrase_segment,
+    )
+    refs_path = _save_project(
+        tmp_path,
+        ProjectConfig(project_name="ordinary-short-speech"),
+        _scripted_segment(
+            segment_id="seg_short",
+            tts_text="네, 좋아요.",
+            source_text="はい、いいです。",
+            duration=1.2,
+        ),
+    )
+
+    synth_step(tmp_path, None, refs_path, mock=True, confirm_rights=True)
+
+    manifest = load_manifest(tmp_path)
+    segment = manifest.segments[0]
+    assert calls == []
+    assert segment.status == "synthesized"
+    assert "numeric_phrase_renderer" not in segment.analysis
+    assert segment.tts is not None
+    assert segment.tts.backend != "gpt-sovits-countdown-renderer"
+
+
+def test_non_speech_texture_is_not_routed_to_numeric_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits as synth_stage
+
+    calls: list[str] = []
+
+    def fake_render_numeric_phrase_segment(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["segment"].id)
+        return _rendered_result(kwargs["project_dir"], kwargs["segment"])
+
+    monkeypatch.setattr(
+        synth_stage,
+        "render_numeric_phrase_segment",
+        fake_render_numeric_phrase_segment,
+    )
+    texture = _scripted_segment(
+        segment_id="seg_texture",
+        tts_text="하나, 둘, 셋.",
+        source_text="texture",
+        duration=1.2,
+    )
+    texture.status = "non_speech_texture"
+    texture.keep_original_texture = True
+    texture.script = None
+    refs_path = _save_project(
+        tmp_path,
+        ProjectConfig(project_name="texture-skip"),
+        texture,
+    )
+
+    synth_step(tmp_path, None, refs_path, mock=True, confirm_rights=True)
+
+    segment = load_manifest(tmp_path).segments[0]
+    assert calls == []
+    assert segment.status == "non_speech_texture"
+    assert segment.tts is None
+    assert "numeric_phrase_renderer" not in segment.analysis
 
 
 def test_live_numeric_phrase_wrapper_calls_live_renderer_with_asr_factory(
