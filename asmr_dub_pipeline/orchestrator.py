@@ -34,6 +34,8 @@ from .pipeline.steps import (
     synth_step,
     transcribe_step,
     translate_ko_step,
+    tts_candidate_pool_step,
+    tts_select_step,
 )
 from .qc.repair_plan import plan_is_repairable
 from .rvc import validate_rvc_config, validate_rvc_training_config
@@ -424,35 +426,54 @@ def run_pipeline(
             gsv_url=gsv_url,
             gsv_server_command=gsv_server_command,
         )
-    run_stage(
-        "synth",
-        synth_step,
-        project_dir,
-        gsv_url=gsv_url,
-        refs_path=refs_path or Path("refs/refs.json"),
-        mock=mock,
-        confirm_rights=confirm_rights,
-        gpt_weights_path=gpt_weights_path,
-        sovits_weights_path=sovits_weights_path,
-        auto_gsv_server=auto_gsv_server,
-        gsv_server_command=gsv_server_command,
-        use_trained_gpt=use_trained_gpt,
-        render_countdowns=False,
-    )
-    run_stage(
-        "countdown-synth",
-        countdown_synth_step,
-        project_dir,
-        gsv_url=gsv_url,
-        refs_path=refs_path or Path("refs/refs.json"),
-        mock=mock,
-        confirm_rights=confirm_rights,
-        gpt_weights_path=gpt_weights_path,
-        sovits_weights_path=sovits_weights_path,
-        auto_gsv_server=auto_gsv_server,
-        gsv_server_command=gsv_server_command,
-        use_trained_gpt=use_trained_gpt,
-    )
+    tts_pool_enabled = bool(cfg.tts.candidate_pool_enabled)
+    if tts_pool_enabled:
+        run_stage(
+            "tts.candidate_pool",
+            tts_candidate_pool_step,
+            project_dir,
+            refs_path=refs_path or Path("refs/refs.json"),
+            confirm_rights=confirm_rights,
+            requested_backend="mock" if mock else "auto",
+            gsv_url=gsv_url,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+            use_trained_gpt=use_trained_gpt,
+            mock=mock,
+        )
+        run_stage("tts.select", tts_select_step, project_dir)
+    else:
+        run_stage(
+            "synth",
+            synth_step,
+            project_dir,
+            gsv_url=gsv_url,
+            refs_path=refs_path or Path("refs/refs.json"),
+            mock=mock,
+            confirm_rights=confirm_rights,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+            use_trained_gpt=use_trained_gpt,
+            render_countdowns=False,
+        )
+        run_stage(
+            "countdown-synth",
+            countdown_synth_step,
+            project_dir,
+            gsv_url=gsv_url,
+            refs_path=refs_path or Path("refs/refs.json"),
+            mock=mock,
+            confirm_rights=confirm_rights,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+            use_trained_gpt=use_trained_gpt,
+        )
     if use_voice_bank:
         run_stage("train-rvc", skip_rvc_train_for_voice_bank_step, project_dir)
     else:
@@ -484,7 +505,7 @@ def run_pipeline(
             refs_path=refs_path or Path("refs/refs.json"),
             confirm_rights=confirm_rights,
             gemma_backend=qc_backend,
-            tts_backend="gpt-sovits",
+            tts_backend="auto" if tts_pool_enabled else "gpt-sovits",
             gsv_url=gsv_url,
             gpt_weights_path=gpt_weights_path,
             sovits_weights_path=sovits_weights_path,
@@ -516,7 +537,7 @@ def run_pipeline(
                 confirm_rights=confirm_rights,
                 max_attempts=cfg.auto_repair_max_attempts,
                 gemma_backend=qc_backend,
-                tts_backend="gpt-sovits",
+                tts_backend="auto" if tts_pool_enabled else "gpt-sovits",
                 gsv_url=gsv_url,
                 gpt_weights_path=gpt_weights_path,
                 sovits_weights_path=sovits_weights_path,

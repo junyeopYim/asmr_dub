@@ -27,6 +27,7 @@ STANDARD_DIRS = [
     "work/segments/audio",
     "work/segments/manifests",
     "work/tts/candidates",
+    "work/tts/selected",
     "work/tts/qwen",
     "work/tts/qwen/candidates",
     "work/tts/fish",

@@ -3,6 +3,8 @@ from __future__ import annotations
 # ruff: noqa: F403,F405,I001
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
+from asmr_dub_pipeline.pipeline.invalidation import invalidate_segment
+from asmr_dub_pipeline.pipeline.runner import run_closure
 from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.qc.repair_plan import plan_is_repairable
 
@@ -30,6 +32,20 @@ def _qc_issues(segment: Segment) -> list[str]:
         issues.extend(str(issue) for issue in segment.qc.issues)
     issues.extend(str(error) for error in segment.errors)
     return issues
+
+
+def _failure_signature(segment: Segment) -> str:
+    issues = _qc_issues(segment)
+    if issues:
+        return "|".join(sorted(set(issues)))
+    plan = _analysis_dict(segment, "ko_qc_repair_plan")
+    if plan:
+        return "|".join(
+            str(plan.get(key) or "")
+            for key in ("action", "root_cause", "route")
+            if plan.get(key)
+        )
+    return segment.status
 
 
 def _has_safety_or_rights_issue(segment: Segment) -> bool:
@@ -63,6 +79,18 @@ def classify_auto_repair_segment(
         else 3
     )
     attempt_count = _auto_repair_attempt_count(segment)
+    signature = _failure_signature(segment)
+    previous_signature = _analysis_dict(segment, "auto_repair").get("last_failure_signature")
+    if attempt_count > 0 and previous_signature and previous_signature == signature:
+        return {
+            "action": "manual_review",
+            "stage": "manual",
+            "terminal_manual": True,
+            "reasons": ["repeated_failure_signature"],
+            "attempt_count": attempt_count,
+            "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
+        }
     if attempt_count >= effective_max_attempts:
         return {
             "action": "manual_review",
@@ -71,6 +99,7 @@ def classify_auto_repair_segment(
             "reasons": ["max_attempts"],
             "attempt_count": attempt_count,
             "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
         }
 
     if segment.status in _AUTO_REPAIR_TERMINAL_STATUSES:
@@ -81,6 +110,7 @@ def classify_auto_repair_segment(
             "reasons": [f"terminal_status:{segment.status}"],
             "attempt_count": attempt_count,
             "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
         }
 
     if _has_safety_or_rights_issue(segment):
@@ -91,6 +121,7 @@ def classify_auto_repair_segment(
             "reasons": ["unsafe_or_rights_issue"],
             "attempt_count": attempt_count,
             "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
         }
 
     if segment.source_script is None:
@@ -101,6 +132,7 @@ def classify_auto_repair_segment(
             "reasons": ["missing_source_script"],
             "attempt_count": attempt_count,
             "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
         }
 
     if segment.translation_ko is None and segment.script is None:
@@ -111,6 +143,7 @@ def classify_auto_repair_segment(
             "reasons": ["missing_korean_translation"],
             "attempt_count": attempt_count,
             "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
         }
 
     if segment.script is None:
@@ -153,6 +186,7 @@ def classify_auto_repair_segment(
         "reasons": _qc_issues(segment) or [action],
         "attempt_count": attempt_count,
         "max_attempts": effective_max_attempts,
+        "failure_signature": signature,
     }
 
 
@@ -169,6 +203,9 @@ def _eligible_for_auto_repair(segment: Segment, only_segment_ids: set[str] | Non
             or (segment.tts and segment.tts.selected_candidate_path)
             or segment.source_script is None
         )
+    if segment.status == "quarantined":
+        quarantine = _analysis_dict(segment, "translate_ko_quarantine")
+        return bool(quarantine.get("recoverable"))
     return False
 
 
@@ -188,6 +225,7 @@ def _record_auto_repair_attempt(segment: Segment, plan: dict[str, Any]) -> dict[
         "stage": plan["stage"],
         "terminal_manual": bool(plan.get("terminal_manual")),
         "reasons": list(plan.get("reasons") or []),
+        "failure_signature_before": plan.get("failure_signature"),
     }
     attempts.append(record)
     payload.update(
@@ -199,6 +237,7 @@ def _record_auto_repair_attempt(segment: Segment, plan: dict[str, Any]) -> dict[
             "terminal_manual": bool(plan.get("terminal_manual")),
             "last_action": plan["action"],
             "last_stage": plan["stage"],
+            "last_failure_signature": plan.get("failure_signature"),
         }
     )
     if plan.get("terminal_manual"):
@@ -308,9 +347,8 @@ def run_auto_repair_stage(
 
     from asmr_dub_pipeline.pipeline.stages.korean_script import run_korean_script_stage
     from asmr_dub_pipeline.pipeline.stages.qc import run_qc_stage
-    from asmr_dub_pipeline.pipeline.stages.regenerate import run_regenerate_needs_stage
     from asmr_dub_pipeline.pipeline.stages.rvc import run_rvc_stage
-    from asmr_dub_pipeline.pipeline.stages.synth_qwen import run_synth_qwen_stage
+    from asmr_dub_pipeline.pipeline.stages.translate_ko import run_translate_ko_stage
 
     keep_original_ids = action_groups.get("keep_original_texture", set())
     if keep_original_ids:
@@ -326,9 +364,33 @@ def run_auto_repair_stage(
 
     qwen_ids = action_groups.get("fallback_tts_qwen", set())
     if qwen_ids:
-        run_synth_qwen_stage(ctx, refs_path, confirm_rights=confirm_rights, promote=True, only_segment_ids=qwen_ids)
-        run_rvc_stage(ctx, confirm_rights=confirm_rights, only_segment_ids=qwen_ids)
-        run_qc_stage(ctx, gemma_backend, confirm_rights=confirm_rights, only_segment_ids=qwen_ids)
+        manifest = ctx.reload_manifest()
+        for segment_id in qwen_ids:
+            invalidate_segment(manifest, segment_id, "tts.candidate_pool", "auto_repair_fallback_tts_qwen")
+        save_manifest(project_dir, manifest)
+        closure = run_closure(
+            ctx,
+            ["tts.candidate_pool", "tts.select", "rvc", "qc"],
+            qwen_ids,
+            refs_path=refs_path,
+            confirm_rights=confirm_rights,
+            gemma_backend=gemma_backend,
+            tts_backend="qwen",
+            gsv_url=gsv_url,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+        )
+        manifest = ctx.reload_manifest()
+        for segment in manifest.segments:
+            if segment.id in qwen_ids:
+                payload = segment.analysis.setdefault("auto_repair", {})
+                if isinstance(payload, dict):
+                    payload["closure"] = closure
+        save_manifest(project_dir, manifest)
+        ctx.update_manifest(manifest)
 
     rewrite_ids = action_groups.get("rewrite_script_then_tts", set())
     if rewrite_ids:
@@ -336,8 +398,63 @@ def run_auto_repair_stage(
 
     regenerate_ids = set(action_groups.get("regenerate_tts", set())) | set(rewrite_ids)
     if regenerate_ids:
-        run_regenerate_needs_stage(
+        manifest = ctx.reload_manifest()
+        for segment_id in regenerate_ids:
+            invalidate_segment(manifest, segment_id, "tts.candidate_pool", "auto_repair_regenerate_tts")
+        save_manifest(project_dir, manifest)
+        closure = run_closure(
             ctx,
+            refs_path=refs_path,
+            confirm_rights=confirm_rights,
+            gemma_backend=gemma_backend,
+            tts_backend=tts_backend,
+            target_nodes=["tts.candidate_pool", "tts.select", "rvc", "qc"],
+            segment_ids=regenerate_ids,
+            gsv_url=gsv_url,
+            gpt_weights_path=gpt_weights_path,
+            sovits_weights_path=sovits_weights_path,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+        )
+        manifest = ctx.reload_manifest()
+        for segment in manifest.segments:
+            if segment.id in regenerate_ids:
+                payload = segment.analysis.setdefault("auto_repair", {})
+                if isinstance(payload, dict):
+                    payload["closure"] = closure
+        save_manifest(project_dir, manifest)
+        ctx.update_manifest(manifest)
+
+    rvc_ids = action_groups.get("retry_rvc", set())
+    if rvc_ids:
+        manifest = ctx.reload_manifest()
+        for segment_id in rvc_ids:
+            invalidate_segment(manifest, segment_id, "rvc", "auto_repair_retry_rvc")
+        save_manifest(project_dir, manifest)
+        run_rvc_stage(ctx, confirm_rights=confirm_rights, retry_failed=True, only_segment_ids=rvc_ids)
+        run_qc_stage(ctx, gemma_backend, confirm_rights=confirm_rights, only_segment_ids=rvc_ids)
+
+    translation_ids = set(action_groups.get("retry_translate_ko", set())) | set(
+        action_groups.get("repair_translation_then_tts", set())
+    )
+    if translation_ids:
+        manifest = ctx.reload_manifest()
+        for segment_id in translation_ids:
+            invalidate_segment(manifest, segment_id, "translate_ko", "auto_repair_translation")
+        save_manifest(project_dir, manifest)
+        run_translate_ko_stage(
+            ctx,
+            gemma_backend,
+            confirm_rights=confirm_rights,
+            retry_failed=True,
+            force_retranslate_failed=True,
+        )
+        run_korean_script_stage(ctx, confirm_rights=confirm_rights, only_segment_ids=translation_ids)
+        closure = run_closure(
+            ctx,
+            ["tts.candidate_pool", "tts.select", "rvc", "qc"],
+            translation_ids,
             refs_path=refs_path,
             confirm_rights=confirm_rights,
             gemma_backend=gemma_backend,
@@ -348,18 +465,18 @@ def run_auto_repair_stage(
             use_trained_gpt=use_trained_gpt,
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
-            only_segment_ids=regenerate_ids,
         )
-
-    rvc_ids = action_groups.get("retry_rvc", set())
-    if rvc_ids:
-        run_rvc_stage(ctx, confirm_rights=confirm_rights, retry_failed=True, only_segment_ids=rvc_ids)
-        run_qc_stage(ctx, gemma_backend, confirm_rights=confirm_rights, only_segment_ids=rvc_ids)
+        manifest = ctx.reload_manifest()
+        for segment in manifest.segments:
+            if segment.id in translation_ids:
+                payload = segment.analysis.setdefault("auto_repair", {})
+                if isinstance(payload, dict):
+                    payload["closure"] = closure
+        save_manifest(project_dir, manifest)
+        ctx.update_manifest(manifest)
 
     unsupported_ids = set().union(
         action_groups.get("retry_asr", set()),
-        action_groups.get("retry_translate_ko", set()),
-        action_groups.get("repair_translation_then_tts", set()),
         action_groups.get("repair_asr_then_downstream", set()),
     )
     if unsupported_ids:

@@ -218,7 +218,14 @@ from asmr_dub_pipeline.voice_bank import (
 )
 
 NO_SPEECH_STATUSES = {"no_speech_detected", "non_speech_texture"}
-SKIP_STATUSES = {"needs_manual_review", "absorbed", "failed", *NO_SPEECH_STATUSES}
+SKIP_STATUSES = {
+    "needs_manual_review",
+    "translation_blocked",
+    "quarantined",
+    "absorbed",
+    "failed",
+    *NO_SPEECH_STATUSES,
+}
 ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_RATE = 0.02
 ASR_SOURCE_SEPARATION_FALLBACK_MIN_MANUAL_REVIEW_COUNT = 3
 ASR_SOURCE_SEPARATION_FALLBACK_SEPARATED_SOURCES = {"source_vocals_mono_16k"}
@@ -8557,9 +8564,20 @@ def _experimental_tts_best_path(
 
 
 def _invalidate_downstream_after_tts_promotion(manifest: PipelineManifest) -> None:
-    for stage in ("rvc", "qc", "mix", "export"):
+    for stage in ("rvc", "qc", "mix", "export", "tts.select"):
         manifest.stage_state.pop(stage, None)
-    for artifact in ("rvc_manifest", "rvc", "qc", "mix", "export"):
+    for artifact in (
+        "rvc_manifest",
+        "rvc",
+        "qc",
+        "mix",
+        "mix_manifest",
+        "final_audio",
+        "dialogue_stem",
+        "export",
+        "export_manifest",
+        "final_video",
+    ):
         manifest.artifacts.pop(artifact, None)
 
 

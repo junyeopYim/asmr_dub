@@ -20,6 +20,8 @@ from asmr_dub_pipeline.pipeline.stages.gsv_few_shot import run_gsv_few_shot_stag
 from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_countdown_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_qwen import run_synth_qwen_stage
+from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_candidate_pool_stage
+from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
 from asmr_dub_pipeline.pipeline.stages.rvc_train import run_rvc_train_stage
 from asmr_dub_pipeline.pipeline.stages.rvc_train import run_skip_rvc_train_for_voice_bank_stage
 from asmr_dub_pipeline.pipeline.stages.rvc import run_rvc_stage
@@ -49,6 +51,8 @@ __all__ = [
     "run_countdown_synth_stage",
     "run_synth_stage",
     "run_synth_qwen_stage",
+    "run_tts_candidate_pool_stage",
+    "run_tts_select_stage",
     "run_rvc_train_stage",
     "run_skip_rvc_train_for_voice_bank_stage",
     "run_rvc_stage",

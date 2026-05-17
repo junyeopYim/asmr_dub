@@ -21,6 +21,8 @@ SegmentStatus = Literal[
     "ok",
     "needs_regeneration",
     "needs_manual_review",
+    "translation_blocked",
+    "quarantined",
     "absorbed",
     "no_speech_detected",
     "non_speech_texture",
@@ -484,7 +486,39 @@ class GemmaConfig(StrictBaseModel):
         return normalized
 
 
+class TTSRouterConfig(StrictBaseModel):
+    enabled: bool = True
+    default_backends: list[str] = Field(default_factory=lambda: ["gpt_sovits"])
+    qwen_parallel_enabled: bool = True
+    micro_segment_max_sec: float = Field(default=2.2, gt=0)
+    qwen_for_micro_segments: bool = True
+    qwen_for_numeric_sequences: bool = True
+    qwen_for_gsv_pronunciation_failures: bool = True
+    qwen_for_gsv_duration_failures: bool = True
+    qwen_for_auto_repair_qwen_action: bool = True
+
+
+class TTSSelectorWeights(StrictBaseModel):
+    duration_fit: float = Field(default=0.30, ge=0.0)
+    pronunciation: float = Field(default=0.25, ge=0.0)
+    ko_asr_backcheck: float = Field(default=0.20, ge=0.0)
+    style_match: float = Field(default=0.10, ge=0.0)
+    noise: float = Field(default=0.10, ge=0.0)
+    backend_prior: float = Field(default=0.05, ge=0.0)
+
+
+class TTSSelectorConfig(StrictBaseModel):
+    duration_tolerance: float = Field(default=0.25, ge=0.0, le=1.0)
+    require_numeric_sequence_qc: bool = True
+    require_pronunciation_qc_for_numeric: bool = True
+    weights: TTSSelectorWeights = Field(default_factory=TTSSelectorWeights)
+
+
 class TTSConfig(StrictBaseModel):
+    candidate_pool_enabled: bool = False
+    selected_audio_required: bool = True
+    router: TTSRouterConfig = Field(default_factory=TTSRouterConfig)
+    selector: TTSSelectorConfig = Field(default_factory=TTSSelectorConfig)
     qwen_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     qwen_candidate_count: int = Field(default=4, ge=1, le=8)
     qwen_device_map: str = "cuda:0"
@@ -922,6 +956,16 @@ class ProjectConfig(StrictBaseModel):
     auto_repair_max_rounds: int = Field(default=3, ge=0, le=12)
     auto_repair_run_after_qc: bool = True
     auto_repair_max_attempts: int = Field(default=3, ge=1, le=12)
+    translate_ko_safety_retry_enabled: bool = True
+    translate_ko_safety_retry_max_attempts: int = Field(default=2, ge=0, le=5)
+    translate_ko_safety_retry_modes: list[str] = Field(
+        default_factory=lambda: [
+            "same_model_low_temp",
+            "literal_only_no_expansion",
+            "context_trimmed",
+        ]
+    )
+    translate_ko_safety_block_policy: Literal["quarantine_segment", "fail_stage"] = "quarantine_segment"
 
     @model_validator(mode="before")
     @classmethod
@@ -1448,6 +1492,34 @@ _QWEN_TTS_FLAT_FIELDS = [
     "max_new_tokens",
     "x_vector_only_mode",
 ]
+_TTS_POOL_FLAT_FIELDS = [
+    "candidate_pool_enabled",
+    "selected_audio_required",
+]
+_TTS_ROUTER_FLAT_FIELDS = [
+    "enabled",
+    "default_backends",
+    "qwen_parallel_enabled",
+    "micro_segment_max_sec",
+    "qwen_for_micro_segments",
+    "qwen_for_numeric_sequences",
+    "qwen_for_gsv_pronunciation_failures",
+    "qwen_for_gsv_duration_failures",
+    "qwen_for_auto_repair_qwen_action",
+]
+_TTS_SELECTOR_FLAT_FIELDS = [
+    "duration_tolerance",
+    "require_numeric_sequence_qc",
+    "require_pronunciation_qc_for_numeric",
+]
+_TTS_SELECTOR_WEIGHT_FLAT_FIELDS = [
+    "duration_fit",
+    "pronunciation",
+    "ko_asr_backcheck",
+    "style_match",
+    "noise",
+    "backend_prior",
+]
 _FISH_TTS_FLAT_FIELDS = [
     "repo_dir",
     "base_url",
@@ -1536,6 +1608,10 @@ _PROJECT_CONFIG_FLAT_ALIASES.update(
             "auto_repair_max_rounds",
             "auto_repair_run_after_qc",
             "auto_repair_max_attempts",
+            "translate_ko_safety_retry_enabled",
+            "translate_ko_safety_retry_max_attempts",
+            "translate_ko_safety_retry_modes",
+            "translate_ko_safety_block_policy",
         )
     }
 )
@@ -1585,6 +1661,21 @@ _PROJECT_CONFIG_FLAT_ALIASES.update(
 )
 _PROJECT_CONFIG_FLAT_ALIASES.update(
     {f"qwen_tts_{field}": ("tts", f"qwen_{field}") for field in _QWEN_TTS_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"tts_{field}": ("tts", field) for field in _TTS_POOL_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"tts_router_{field}": ("tts", "router", field) for field in _TTS_ROUTER_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {f"tts_selector_{field}": ("tts", "selector", field) for field in _TTS_SELECTOR_FLAT_FIELDS}
+)
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {
+        f"tts_selector_weight_{field}": ("tts", "selector", "weights", field)
+        for field in _TTS_SELECTOR_WEIGHT_FLAT_FIELDS
+    }
 )
 _PROJECT_CONFIG_FLAT_ALIASES.update(
     {f"fish_tts_{field}": ("tts", f"fish_{field}") for field in _FISH_TTS_FLAT_FIELDS}
@@ -1781,6 +1872,12 @@ class TTSCandidate(StrictBaseModel):
     selection_score: float | None = None
     selection_reason: str = ""
     retry_summary: dict[str, Any] = Field(default_factory=dict)
+    candidate_id: str | None = None
+    metadata_path: str | None = None
+    input_hash: str | None = None
+    backend_config_hash: str | None = None
+    attempt: int = Field(default=0, ge=0)
+    generation_id: str | None = None
 
 
 class TTSMetadata(StrictBaseModel):
@@ -1801,6 +1898,15 @@ class TTSMetadata(StrictBaseModel):
     target_language: str = "ja"
     cross_lingual_voice_transfer: bool = False
     retry_summary: dict[str, Any] = Field(default_factory=dict)
+    generation_id: str | None = None
+    tts_pool_generation_id: str | None = None
+    selected_tts_generation_id: str | None = None
+    input_script_generation_id: str | None = None
+    input_script_hash: str | None = None
+    selected_candidate_id: str | None = None
+    selected_metadata_path: str | None = None
+    candidate_pool_manifest_path: str | None = None
+    route_reason_codes: list[str] = Field(default_factory=list)
 
 
 class RVCMetadata(StrictBaseModel):
@@ -1821,6 +1927,8 @@ class RVCMetadata(StrictBaseModel):
     error: str | None = None
     command: list[str] | None = None
     attempts: list[dict[str, Any]] = Field(default_factory=list)
+    generation_id: str | None = None
+    input_selected_tts_generation_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -1843,6 +1951,8 @@ class QCMetadata(StrictBaseModel):
     issues: list[str] = Field(default_factory=list)
     score: float = Field(default=1.0, ge=0, le=1)
     status: SegmentStatus = "ok"
+    generation_id: str | None = None
+    input_rvc_generation_id: str | None = None
 
 
 class Segment(StrictBaseModel):

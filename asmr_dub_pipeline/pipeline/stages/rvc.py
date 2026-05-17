@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: F403,F405,I001
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
+from asmr_dub_pipeline.pipeline.artifacts import ensure_segment_generation_ids, make_rvc_generation_id
 from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.rvc import output_fresh_for_input
 
@@ -36,6 +37,20 @@ def _run_pre_rvc_fallback_stage(
 
     reason = "train-rvc skipped because clean source voice data was insufficient."
     failed_segments: list[str] = []
+    def refresh_rvc_generation(segment: Segment) -> None:
+        if segment.rvc is None:
+            return
+        ensure_segment_generation_ids(segment)
+        segment.rvc.input_selected_tts_generation_id = (
+            segment.tts.selected_tts_generation_id if segment.tts else None
+        )
+        segment.rvc.generation_id = make_rvc_generation_id(
+            segment_id=segment.id,
+            output_path=segment.rvc.output_path,
+            input_selected_tts_generation_id=segment.rvc.input_selected_tts_generation_id,
+            settings=segment.rvc.settings,
+        )
+
     for segment in manifest.segments:
         if only_segment_ids is not None and segment.id not in only_segment_ids:
             continue
@@ -53,6 +68,7 @@ def _run_pre_rvc_fallback_stage(
                 error=message,
             )
             failed_segments.append(segment.id)
+            refresh_rvc_generation(segment)
             continue
         segment.rvc = RVCMetadata(
             backend=backend,
@@ -64,6 +80,7 @@ def _run_pre_rvc_fallback_stage(
             fallback_reason=reason,
             error=reason,
         )
+        refresh_rvc_generation(segment)
 
     out_path = project_dir / "work" / "rvc" / "rvc_manifest.json"
     write_json_atomic(
@@ -182,6 +199,20 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         f"mode={'batch' if use_batch_rvc else 'per-segment'} "
         f"concurrency={batch_lane_count if use_batch_rvc else rvc_lane_count}"
     )
+
+    def refresh_rvc_generation(segment: Segment) -> None:
+        if segment.rvc is None:
+            return
+        ensure_segment_generation_ids(segment)
+        segment.rvc.input_selected_tts_generation_id = (
+            segment.tts.selected_tts_generation_id if segment.tts else None
+        )
+        segment.rvc.generation_id = make_rvc_generation_id(
+            segment_id=segment.id,
+            output_path=segment.rvc.output_path,
+            input_selected_tts_generation_id=segment.rvc.input_selected_tts_generation_id,
+            settings=segment.rvc.settings,
+        )
 
     def unique_segment_ids(segment_ids: list[str]) -> list[str]:
         seen: set[str] = set()
@@ -436,6 +467,9 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
 
     def rvc_output_exists(segment: Segment) -> bool:
         if force or segment.status != "rvc_converted" or not segment.rvc or not segment.rvc.accepted:
+            return False
+        selected_generation_id = segment.tts.selected_tts_generation_id if segment.tts else None
+        if segment.rvc.input_selected_tts_generation_id != selected_generation_id:
             return False
         if not segment.rvc.output_path:
             return False
@@ -823,6 +857,8 @@ def run_rvc_stage(ctx: PipelineContext, confirm_rights: bool = False, force: boo
         "retry_rounds": len(retry_rounds),
         "rounds": retry_rounds,
     }
+    for _, segment in indexed_segments:
+        refresh_rvc_generation(segment)
     write_json_atomic(
         out_path,
         {

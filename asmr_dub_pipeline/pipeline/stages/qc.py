@@ -3,9 +3,22 @@ from __future__ import annotations
 # ruff: noqa: F403,F405,I001
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
+from asmr_dub_pipeline.pipeline.artifacts import ensure_segment_generation_ids, make_qc_generation_id
 from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.qc.repair_plan import build_ko_qc_repair_plan, plan_is_repairable
 from asmr_dub_pipeline.schemas import QCMetadata
+
+
+def _attach_qc_generation(segment: Segment, qc: QCMetadata) -> QCMetadata:
+    ensure_segment_generation_ids(segment)
+    qc.input_rvc_generation_id = segment.rvc.generation_id if segment.rvc else None
+    qc.generation_id = make_qc_generation_id(
+        segment_id=segment.id,
+        input_rvc_generation_id=qc.input_rvc_generation_id,
+        recommendation=qc.recommendation,
+        issues=qc.issues,
+    )
+    return qc
 
 
 def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool = False, only_segment_ids: set[str] | None = None) -> PipelineManifest:
@@ -53,7 +66,7 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
                 if plan_is_repairable(plan):
                     qc.recommendation = "regenerate"
                     qc.status = "needs_regeneration"
-            segment.qc = qc
+            segment.qc = _attach_qc_generation(segment, qc)
             segment.status = qc.status
             segment.errors.append("Cannot QC without selected TTS and script.")
             last_logged_at = _log_segment_progress(
@@ -88,7 +101,7 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
         except Exception as exc:
             gemma_result = {"recommendation": "manual_review", "issues": [str(exc)]}
         qc = score_qc(audio_metrics, gemma_result)
-        segment.qc = qc
+        segment.qc = _attach_qc_generation(segment, qc)
         if target_language == "ko" and qc.status != "ok":
             plan = build_ko_qc_repair_plan(segment, audio_metrics, gemma_result, qc, cfg)
             segment.analysis["ko_qc_repair_plan"] = plan

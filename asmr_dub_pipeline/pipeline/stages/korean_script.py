@@ -3,6 +3,8 @@ from __future__ import annotations
 # ruff: noqa: F403,F405,I001
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
+from asmr_dub_pipeline.pipeline.artifacts import stable_hash
+from asmr_dub_pipeline.pipeline.invalidation import invalidate_segment
 from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.schemas import NonverbalCue
 from asmr_dub_pipeline.script.duration_rewrite import (
@@ -540,7 +542,10 @@ def run_korean_script_stage(
     total = len(manifest.segments)
     _log_stage_start("korean-script", f"segments={total}")
     _require_audio_stage_rights(manifest, "korean-script", confirm_rights)
-    if manifest.stage_state.get("translate-ko", {}).get("status") != "completed":
+    if manifest.stage_state.get("translate-ko", {}).get("status") not in {
+        "completed",
+        "completed_with_quarantined_segments",
+    }:
         raise ValueError("korean-script requires a completed translate-ko stage.")
 
     scripted = 0
@@ -762,6 +767,8 @@ def run_korean_script_stage(
         nonverbal_cues = _dedupe_korean_script_cues(
             [*normalized.cues, *_coerce_korean_script_cues(analysis.get("nonverbal_cues"))]
         )
+        previous_script_hash = stable_hash(segment.script) if segment.script is not None else None
+        had_downstream = bool(segment.tts or segment.rvc or segment.qc or segment.mix)
         segment.script = JapaneseScript(
             literal_ja=source_text,
             ja_text=source_text or normalized.text,
@@ -813,6 +820,32 @@ def run_korean_script_stage(
                 )
                 segment.analysis["pre_synth_text_qc_recovery"] = recovery_label
         segment.analysis["pre_synth_text_qc"] = preflight.as_payload()
+        current_script_hash = stable_hash(segment.script)
+        if had_downstream and previous_script_hash != current_script_hash:
+            invalidate_segment(
+                manifest,
+                segment.id,
+                "korean_script",
+                "korean_script_changed",
+            )
+            segment.script = JapaneseScript(
+                literal_ja=source_text,
+                ja_text=source_text or normalized.text,
+                tts_text=normalized.text,
+                tts_language="ko",
+                source_language=cfg.source_language,
+                target_language=cfg.target_language,
+                ref_style=ref_style,
+                emotion=emotion,
+                pace=pace,
+                volume=volume,
+                nonverbal_cues=nonverbal_cues,
+                spatial_style=spatial_style,
+                expected_tts_duration_sec=estimated_tts_duration_sec,
+                style_tags=style_tags,
+                risk_flags=risk_flags,
+            )
+            segment.analysis["pre_synth_text_qc"] = preflight.as_payload()
         if preflight.blocked:
             needs_manual_review += 1
             if "tts_safety_minor_sexualized_content" in preflight.issues:

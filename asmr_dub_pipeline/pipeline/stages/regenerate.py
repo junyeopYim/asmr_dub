@@ -3,12 +3,10 @@ from __future__ import annotations
 # ruff: noqa: F403,F405,I001
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
+from asmr_dub_pipeline.pipeline.invalidation import invalidate_segment
+from asmr_dub_pipeline.pipeline.runner import run_closure
 from asmr_dub_pipeline.pipeline.stages.common import *
 from asmr_dub_pipeline.pipeline.stages.experimental_tts import run_synth_experimental_tts_stage
-from asmr_dub_pipeline.pipeline.stages.qc import run_qc_stage
-from asmr_dub_pipeline.pipeline.stages.rvc import run_rvc_stage
-from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_synth_stage
-from asmr_dub_pipeline.pipeline.stages.synth_qwen import run_synth_qwen_stage
 from asmr_dub_pipeline.qc.repair_plan import plan_is_repairable
 
 
@@ -63,45 +61,28 @@ def run_regenerate_needs_stage(ctx: PipelineContext, *, refs_path: Path = Path('
             continue
         if segment.status in {"needs_manual_review", "failed", "needs_regeneration"} and segment.script:
             segment.status = "scripted"
-        segment.rvc = None
-        segment.mix = {}
-    _invalidate_downstream_after_tts_promotion(manifest)
+        invalidate_segment(manifest, segment.id, "tts.candidate_pool", "regenerate_needs")
     save_manifest(project_dir, manifest)
 
     backend = tts_backend.strip().lower().replace("_", "-")
-    if backend in {"gpt-sovits", "gsv"}:
-        run_synth_stage(
+    if backend in {"gpt-sovits", "gsv", "qwen", "mock", "auto", "pool", "candidate-pool"}:
+        closure = run_closure(
             ctx,
-            gsv_url,
-            refs_path,
-            mock=False,
+            ["tts.candidate_pool", "tts.select", "rvc", "qc"],
+            target_ids,
+            refs_path=refs_path,
             confirm_rights=confirm_rights,
+            gemma_backend=gemma_backend,
+            tts_backend="gpt-sovits" if backend == "gsv" else backend,
             gpt_weights_path=gpt_weights_path,
             sovits_weights_path=sovits_weights_path,
             use_trained_gpt=use_trained_gpt,
+            gsv_url=gsv_url,
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
-            only_segment_ids=target_ids,
-        )
-    elif backend == "mock":
-        run_synth_stage(
-            ctx,
-            gsv_url,
-            refs_path,
-            mock=True,
-            confirm_rights=confirm_rights,
-            only_segment_ids=target_ids,
-        )
-    elif backend == "qwen":
-        run_synth_qwen_stage(
-            ctx,
-            refs_path,
-            confirm_rights=confirm_rights,
-            model_id=qwen_model_id,
-            candidate_count=qwen_candidate_count,
-            promote=True,
-            local_files_only=qwen_local_files_only,
-            only_segment_ids=target_ids,
+            qwen_model_id=qwen_model_id,
+            qwen_candidate_count=qwen_candidate_count,
+            qwen_local_files_only=qwen_local_files_only,
         )
     elif backend in {"fish", "fish-tts", "fish-speech", "cosyvoice", "cosy", "cosy-voice"}:
         run_synth_experimental_tts_stage(
@@ -115,15 +96,9 @@ def run_regenerate_needs_stage(ctx: PipelineContext, *, refs_path: Path = Path('
             only_segment_ids=target_ids,
         )
     else:
-        raise ValueError("tts_backend must be one of: gpt-sovits, qwen, fish, cosyvoice, mock")
+        raise ValueError("tts_backend must be one of: gpt-sovits, qwen, auto, pool, fish, cosyvoice, mock")
 
-    run_rvc_stage(ctx, confirm_rights=confirm_rights, only_segment_ids=target_ids)
-    manifest = run_qc_stage(
-        ctx,
-        gemma_backend,
-        confirm_rights=confirm_rights,
-        only_segment_ids=target_ids,
-    )
+    manifest = ctx.reload_manifest()
     remaining = [
         segment.id for segment in manifest.segments if segment.id in target_ids and segment.status == "needs_regeneration"
     ]
@@ -134,6 +109,7 @@ def run_regenerate_needs_stage(ctx: PipelineContext, *, refs_path: Path = Path('
         tts_backend=backend,
         gemma_backend=gemma_backend,
         target_segments=sorted(target_ids),
+        closure=closure if "closure" in locals() else None,
         remaining_needs_regeneration=remaining,
         segment_counts=_segment_counts(manifest),
     )

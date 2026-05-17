@@ -4,7 +4,32 @@ from __future__ import annotations
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
+from asmr_dub_pipeline.gemma.text_translate import _parse_literal_response, build_literal_translate_prompt
 from asmr_dub_pipeline.script.text_qc import has_minor_sexualized_content
+
+_TRANSLATION_REFUSAL_MARKERS = (
+    "refusal",
+    "cannot comply",
+    "can't comply",
+    "content_filter",
+    "content filter",
+    "safety",
+    "blocked",
+    "policy",
+)
+
+
+def _translation_refusal_reason(error: object) -> str | None:
+    text = str(error).strip().lower()
+    if not text:
+        return None
+    if any(marker in text for marker in _TRANSLATION_REFUSAL_MARKERS):
+        if "minor" in text or "underage" in text:
+            return "safety_critical_source_policy"
+        if "content_filter" in text or "content filter" in text:
+            return "provider_safety_block"
+        return "model_refusal"
+    return None
 
 
 def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None = None, confirm_rights: bool = False, force_retranslate: bool = False, retry_failed: bool = False, repair_only: bool = False, force_retranslate_failed: bool = False) -> PipelineManifest:
@@ -43,6 +68,8 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     embedded_countdown_translation_repaired = 0
     asr_backcheck_count = 0
     safety_blocked = 0
+    quarantined = 0
+    quarantine_rows: list[dict[str, Any]] = []
     model_name = cfg.gemma_llama_cpp_model_path if backend_kind == "llama_server" else "mock"
     translatable: list[Segment] = []
 
@@ -137,21 +164,56 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         source_text = segment.source_script.text if segment.source_script else ""
         if source_text.strip() and has_minor_sexualized_content(source_text):
             safety_blocked += 1
-            needs_manual_review += 1
             quality_counters["source_minor_sexualized_content"] += 1
-            segment.status = "needs_manual_review"
-            message = "translate-ko safety blocked source: tts_safety_minor_sexualized_content"
-            if message not in segment.errors:
-                segment.errors.append(message)
-            rows.append(
-                {
+            if cfg.translate_ko_safety_block_policy == "quarantine_segment":
+                quarantined += 1
+                segment.translation_ko = None
+                segment.script = None
+                segment.tts = None
+                segment.rvc = None
+                segment.qc = None
+                segment.mix = {}
+                segment.status = "quarantined"
+                message = "translate-ko quarantined segment: safety_critical_source_policy"
+                if message not in segment.errors:
+                    segment.errors.append(message)
+                quarantine = {
                     "segment_id": segment.id,
-                    "status": "needs_manual_review",
-                    "reason": message,
-                    "source_text": source_text,
-                    "translation_ko": None,
+                    "kind": "safety_critical_source_policy",
+                    "recoverable": False,
+                    "terminal": True,
+                    "reason": "tts_safety_minor_sexualized_content",
+                    "batch_id": "source_safety_preflight",
+                    "next_action": "manual_review",
+                    "attempt_count": 0,
                 }
-            )
+                segment.analysis["translate_ko_quarantine"] = quarantine
+                quarantine_rows.append(quarantine)
+                rows.append(
+                    {
+                        "segment_id": segment.id,
+                        "status": "quarantined",
+                        "reason": "safety_critical_source_policy",
+                        "source_text": source_text,
+                        "translation_ko": None,
+                        "quarantine": quarantine,
+                    }
+                )
+            else:
+                needs_manual_review += 1
+                segment.status = "needs_manual_review"
+                message = "translate-ko safety blocked source: tts_safety_minor_sexualized_content"
+                if message not in segment.errors:
+                    segment.errors.append(message)
+                rows.append(
+                    {
+                        "segment_id": segment.id,
+                        "status": "needs_manual_review",
+                        "reason": message,
+                        "source_text": source_text,
+                        "translation_ko": None,
+                    }
+                )
             continue
         repair_values = deterministic_countdown_translation_needs_repair(segment)
         if repair_values is not None:
@@ -387,7 +449,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
 
     started_at = monotonic()
     last_logged_at = started_at
-    processed = translated + needs_manual_review
+    processed = translated + needs_manual_review + quarantined
 
     def record_raw_translation_row(row: dict[str, Any]) -> None:
         if row.get("status") == "translated":
@@ -412,6 +474,103 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         }
         with diagnostics_lock:
             retry_attempts.append(payload)
+
+    def record_translation_safety_attempt(
+        segment: Segment,
+        *,
+        attempt: int,
+        mode: str,
+        status: str,
+        reason_code: str,
+        batch_id: str,
+        error: str | None = None,
+    ) -> None:
+        payload = segment.analysis.setdefault("translation_safety", {})
+        if not isinstance(payload, dict):
+            payload = {}
+            segment.analysis["translation_safety"] = payload
+        attempts = payload.setdefault("attempts", [])
+        if not isinstance(attempts, list):
+            attempts = []
+            payload["attempts"] = attempts
+        record = {
+            "attempt": attempt,
+            "mode": mode,
+            "status": status,
+            "reason_code": reason_code,
+            "batch_id": batch_id,
+            "parse_status": "parsed" if status == "success" else "failed",
+        }
+        if error:
+            record["error"] = error
+        attempts.append(record)
+        payload.update(
+            {
+                "attempt_count": len(attempts),
+                "last_status": status,
+                "last_reason_code": reason_code,
+                "max_attempts": cfg.translate_ko_safety_retry_max_attempts,
+            }
+        )
+
+    def quarantine_translation_segment(
+        segment: Segment,
+        *,
+        reason_code: str,
+        error: str,
+        recoverable: bool,
+        batch_id: str,
+    ) -> dict[str, Any]:
+        segment.translation_ko = None
+        segment.script = None
+        segment.tts = None
+        segment.rvc = None
+        segment.qc = None
+        segment.mix = {}
+        segment.status = "quarantined"
+        message = f"translate-ko quarantined segment: {reason_code}"
+        if message not in segment.errors:
+            segment.errors.append(message)
+        quarantine = {
+            "segment_id": segment.id,
+            "kind": reason_code,
+            "recoverable": recoverable,
+            "terminal": not recoverable,
+            "reason": error,
+            "batch_id": batch_id,
+            "next_action": "retry_translate_ko" if recoverable else "manual_review",
+            "attempt_count": len(
+                segment.analysis.get("translation_safety", {}).get("attempts", [])
+                if isinstance(segment.analysis.get("translation_safety"), dict)
+                else []
+            ),
+        }
+        segment.analysis["translate_ko_quarantine"] = quarantine
+        quarantine_rows.append(quarantine)
+        return quarantine
+
+    def translate_safety_retry_mode(
+        client: Any,
+        segment: Segment,
+        retry_batch_id: str,
+        context_segments: list[Segment],
+        mode: str,
+    ) -> dict[str, Any]:
+        if mode == "literal_only_no_expansion" and hasattr(client, "_translate_once"):
+            return client._translate_once(
+                segments=[segment],
+                batch_id=retry_batch_id,
+                prompt=build_literal_translate_prompt([segment], retry_batch_id, context_segments),
+                parser=_parse_literal_response,
+                output_field="ko_literal",
+                context_segments=context_segments,
+            )
+        return _translate_with_optional_context(
+            client,
+            [segment],
+            retry_batch_id,
+            context_segments,
+        )
 
     def final_translation_diagnostics_rows() -> list[dict[str, Any]]:
         final_rows = json.loads(json.dumps(rows, ensure_ascii=False))
@@ -527,7 +686,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
 
     if rows:
         persist_partial()
-    if safety_blocked:
+    if safety_blocked and cfg.translate_ko_safety_block_policy == "fail_stage":
         mark_stage(
             manifest,
             "translate-ko",
@@ -629,6 +788,72 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             except Exception as exc:
                 if backend_kind == "llama_server" and _is_gemma_text_server_unavailable(exc):
                     raise
+                refusal_reason = _translation_refusal_reason(exc)
+                if (
+                    refusal_reason is not None
+                    and len(group) == 1
+                    and cfg.translate_ko_safety_retry_enabled
+                    and cfg.translate_ko_safety_block_policy == "quarantine_segment"
+                ):
+                    segment = group[0]
+                    retry_modes = list(cfg.translate_ko_safety_retry_modes)[
+                        : cfg.translate_ko_safety_retry_max_attempts
+                    ]
+                    for attempt, mode in enumerate(retry_modes, start=1):
+                        retry_batch_id = f"{group_batch_id}_safety_{attempt:02d}_{mode}"
+                        try:
+                            context_segments = _translation_context_segments(
+                                manifest.segments,
+                                [segment],
+                                0 if mode == "context_trimmed" else cfg.gemma_text_context_radius,
+                            )
+                            retry_translations = translate_safety_retry_mode(
+                                client,
+                                segment,
+                                retry_batch_id,
+                                context_segments,
+                                mode,
+                            )
+                        except Exception as retry_exc:
+                            retry_reason = _translation_refusal_reason(retry_exc) or refusal_reason
+                            record_translation_safety_attempt(
+                                segment,
+                                attempt=attempt,
+                                mode=mode,
+                                status="failed",
+                                reason_code=retry_reason,
+                                batch_id=retry_batch_id,
+                                error=str(retry_exc),
+                            )
+                            continue
+                        if segment.id in retry_translations:
+                            translations.update({segment.id: retry_translations[segment.id]})
+                            record_translation_safety_attempt(
+                                segment,
+                                attempt=attempt,
+                                mode=mode,
+                                status="success",
+                                reason_code=refusal_reason,
+                                batch_id=retry_batch_id,
+                            )
+                            record_retry_attempt(
+                                attempt_type="safety_retry",
+                                batch_id=retry_batch_id,
+                                segments=[segment],
+                                accepted=True,
+                                reason=refusal_reason,
+                                returned_segment_ids=[segment.id],
+                            )
+                            return
+                    record_failure(group[0], f"translation_safety_refusal:{refusal_reason}:{exc}")
+                    record_retry_attempt(
+                        attempt_type="safety_retry",
+                        batch_id=group_batch_id,
+                        segments=group,
+                        accepted=False,
+                        reason=refusal_reason,
+                    )
+                    return
                 message = f"Korean translation batch failed for {group_batch_id}: {exc}"
                 record_retry_attempt(
                     attempt_type=(
@@ -675,10 +900,46 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         translations: dict[str, Any],
         translation_failures: dict[str, list[str]],
     ) -> None:
-        nonlocal last_logged_at, needs_manual_review, numeric_counting_postprocessed, processed, translated
+        nonlocal last_logged_at, needs_manual_review, numeric_counting_postprocessed, processed, quarantined, translated
         for segment in batch:
             translation = translations.get(segment.id)
             if translation is None:
+                failure_text = "; ".join(translation_failures.get(segment.id, []))
+                refusal_reason = _translation_refusal_reason(failure_text)
+                if refusal_reason is not None and cfg.translate_ko_safety_block_policy == "quarantine_segment":
+                    quarantine = quarantine_translation_segment(
+                        segment,
+                        reason_code=refusal_reason,
+                        error=failure_text,
+                        recoverable=refusal_reason != "safety_critical_source_policy",
+                        batch_id=batch_id,
+                    )
+                    quarantined += 1
+                    processed += 1
+                    source_text = segment.source_script.text if segment.source_script else ""
+                    rows.append(
+                        {
+                            "batch_id": batch_id,
+                            "segment_id": segment.id,
+                            "status": "quarantined",
+                            "reason": refusal_reason,
+                            "source_text": source_text,
+                            "translation_ko": None,
+                            "quarantine": quarantine,
+                            "error": failure_text,
+                        }
+                    )
+                    last_logged_at = _log_translate_progress(
+                        processed,
+                        total,
+                        segment,
+                        "quarantined",
+                        source_text,
+                        None,
+                        started_at,
+                        last_logged_at,
+                    )
+                    continue
                 segment.status = "needs_manual_review"
                 for message in translation_failures.get(segment.id, []):
                     if message not in segment.errors:
@@ -842,6 +1103,16 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     needs_manual_review = sum(1 for row in rows if row.get("status") == "needs_manual_review")
     no_speech_detected = sum(1 for row in rows if row.get("status") in NO_SPEECH_STATUSES)
     non_speech_texture = sum(1 for row in rows if row.get("status") == "non_speech_texture")
+    quarantined = sum(1 for row in rows if row.get("status") == "quarantined")
+    quarantine_path = project_dir / "work" / "translate_ko" / "quarantine.json"
+    write_json_atomic(
+        quarantine_path,
+        {
+            "segments": quarantine_rows,
+            "quarantine_count": quarantined,
+            "policy": cfg.translate_ko_safety_block_policy,
+        },
+    )
     _write_jsonl_atomic(jsonl_path, rows)
     asr_backcheck_summary_path = project_dir / "work" / "translate_ko" / "asr_backcheck_summary.json"
     write_json_atomic(
@@ -888,17 +1159,23 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     manifest.artifacts["translation_summary"] = str(summary_path)
     manifest.artifacts["translation_diagnostics"] = str(diagnostics_path)
     manifest.artifacts["translation_asr_backcheck_summary"] = str(asr_backcheck_summary_path)
+    if quarantined:
+        manifest.artifacts["translation_quarantine"] = str(quarantine_path)
     server_metadata = build_server_metadata()
+    stage_status = "completed_with_quarantined_segments" if quarantined else "completed"
     mark_stage(
         manifest,
         "translate-ko",
-        "completed",
+        stage_status,
         backend=backend_kind,
         model=model_name,
         translated=translated,
         needs_manual_review=needs_manual_review,
         no_speech_detected=no_speech_detected,
         non_speech_texture=non_speech_texture,
+        quarantined_segments=[row["segment_id"] for row in quarantine_rows],
+        quarantine_count=quarantined,
+        recoverable_quarantine_count=sum(1 for row in quarantine_rows if row.get("recoverable")),
         colloquialized=colloquialized,
         digit_pronunciation_postprocessed=digit_pronunciation_postprocessed,
         ordinal_postprocessed=ordinal_postprocessed,
