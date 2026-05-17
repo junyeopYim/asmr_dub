@@ -216,3 +216,42 @@ def test_run_closure_uses_strict_non_mutating_generation_verification(
     assert "missing_qc_input_rvc_generation_id" in result["verification"]["seg_0001"]["issues"]
     assert reloaded.rvc.input_selected_tts_generation_id is None
     assert reloaded.qc.input_rvc_generation_id is None
+
+
+def test_run_closure_requires_metadata_for_requested_target_nodes(
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    from asmr_dub_pipeline.pipeline.runner import run_closure
+
+    segment = Segment(
+        id="seg_0001",
+        start=0.0,
+        end=1.0,
+        duration=1.0,
+        audio_for_gemma="work/segments/audio/seg_0001_gemma.wav",
+        audio_for_mix="work/segments/audio/seg_0001_mix.wav",
+        script=JapaneseScript(
+            ja_text="こんにちは",
+            tts_text="안녕하세요",
+            tts_language="ko",
+            source_language="ja",
+            target_language="ko",
+        ),
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+
+    def fake_stage(ctx: PipelineContext, *args: object, **kwargs: object):
+        return ctx.reload_manifest()
+
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_tts_select_stage", fake_stage)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_rvc_stage", fake_stage)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_qc_stage", fake_stage)
+
+    result = run_closure(PipelineContext.load(tmp_project_dir), ["tts.select", "rvc", "qc"], {"seg_0001"})
+
+    issues = result["verification"]["seg_0001"]["issues"]
+    assert result["verified"] is False
+    assert "missing_tts_metadata" in issues
+    assert "missing_rvc_metadata" in issues
+    assert "missing_qc_metadata" in issues

@@ -226,6 +226,46 @@ def test_auto_repair_does_not_count_unverified_closure_as_repaired(
     assert auto_repair["manual_review_reason"] == "closure_verification_failed"
 
 
+def test_auto_repair_does_not_count_missing_closure_metadata_as_repaired(
+    tmp_project_dir,
+    monkeypatch,
+) -> None:
+    from asmr_dub_pipeline.pipeline.stages.auto_repair import run_auto_repair_stage
+
+    segment = _segment(
+        "seg_0001",
+        selected_tts=None,
+        analysis={"ko_qc_repair_plan": {"action": "regenerate_tts", "terminal_manual": False}},
+    )
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            rights_audit=require_confirmed_rights(True, "test"),
+            project_config=ProjectConfig(rvc_backend="mock", rvc_required=False, rvc_train_required=False),
+            segments=[segment],
+        ),
+    )
+
+    def fake_stage(ctx: PipelineContext, *args: object, **kwargs: object):
+        return ctx.reload_manifest()
+
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_tts_candidate_pool_stage", fake_stage)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_tts_select_stage", fake_stage)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_rvc_stage", fake_stage)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.runner.run_qc_stage", fake_stage)
+
+    repaired = run_auto_repair_stage(PipelineContext.load(tmp_project_dir), confirm_rights=True)
+
+    assert repaired.stage_state["auto-repair"]["repaired_count"] == 0
+    assert repaired.stage_state["auto-repair"]["verification_failed_count"] == 1
+    assert repaired.segments[0].status == "needs_manual_review"
+    auto_repair = repaired.segments[0].analysis["auto_repair"]
+    assert auto_repair["closure_verified"] is False
+    assert "missing_tts_metadata" in auto_repair["closure_verification_issues"]
+    assert "missing_rvc_metadata" in auto_repair["closure_verification_issues"]
+    assert "missing_qc_metadata" in auto_repair["closure_verification_issues"]
+
+
 def test_auto_repair_translation_retry_passes_only_target_segment_ids(
     tmp_project_dir,
     monkeypatch,

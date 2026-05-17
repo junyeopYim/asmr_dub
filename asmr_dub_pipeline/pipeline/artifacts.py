@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -179,16 +180,24 @@ def verify_segment_generation_chain(
     *,
     strict: bool = False,
     mutate: bool = True,
+    target_nodes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Check whether selected TTS, RVC, and QC generation ids match."""
 
     if mutate and not strict:
         ensure_segment_generation_ids(segment)
     issues: list[str] = []
+    required_nodes = {str(node) for node in target_nodes or ()}
     selected_tts_generation_id = segment.tts.selected_tts_generation_id if segment.tts else None
     rvc_generation_id = segment.rvc.generation_id if segment.rvc else None
     qc_generation_id = segment.qc.generation_id if segment.qc else None
     if strict:
+        if "tts.select" in required_nodes and segment.tts is None:
+            issues.append("missing_tts_metadata")
+        if "rvc" in required_nodes and segment.rvc is None:
+            issues.append("missing_rvc_metadata")
+        if "qc" in required_nodes and segment.qc is None:
+            issues.append("missing_qc_metadata")
         if segment.tts is not None:
             if not segment.tts.selected_tts_generation_id:
                 issues.append("missing_selected_tts_generation_id")
