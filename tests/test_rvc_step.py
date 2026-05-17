@@ -178,7 +178,7 @@ def test_train_rvc_auto_epoch_records_effective_epochs(tmp_project_dir: Path) ->
 
     train_payload = json.loads(Path(trained.artifacts["rvc_train_manifest"]).read_text("utf-8"))
     assert train_payload["epoch_decision"]["policy"] == "auto"
-    assert train_payload["epoch_decision"]["configured_epochs"] == 20
+    assert train_payload["epoch_decision"]["configured_epochs"] == 100
     assert train_payload["epoch_decision"]["recommended_epoch_count"] == 25
     assert train_payload["epoch_decision"]["effective_epochs"] == 80
     assert train_payload["effective_train_epochs"] == 80
@@ -952,6 +952,88 @@ def test_regenerate_needs_step_rebuilds_only_regeneration_segments(
     assert manifest.segments[1].rvc.accepted is True
     assert manifest.stage_state["regenerate"]["status"] == "completed"
     assert manifest.stage_state["regenerate"]["target_segments"] == ["seg_0002"]
+
+
+def test_regenerate_needs_step_honors_explicit_only_segment_ids(
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    pipeline_steps.init_project(tmp_project_dir)
+    cfg = ProjectConfig(rvc_backend="mock")
+    skipped = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    skipped.status = "scripted"
+    skipped.tts = None
+    target = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    target.status = "scripted"
+    target.tts = None
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[skipped, target])
+    synthesized: list[str] = []
+    original_mock_synthesize = pipeline_steps._mock_synthesize
+
+    def counting_mock_synthesize(output_path: Path, duration: float, seed: int, sample_rate: int = 48_000) -> Path:
+        synthesized.append(output_path.name)
+        return original_mock_synthesize(output_path, duration, seed, sample_rate)
+
+    monkeypatch.setattr(pipeline_steps, "_mock_synthesize", counting_mock_synthesize)
+
+    manifest = pipeline_steps.regenerate_needs_step(
+        tmp_project_dir,
+        tts_backend="mock",
+        gemma_backend="mock",
+        confirm_rights=True,
+        only_segment_ids={"seg_0002"},
+    )
+
+    assert synthesized
+    assert all(name.startswith("seg_0002") for name in synthesized)
+    assert manifest.segments[0].status == "scripted"
+    assert manifest.segments[0].tts is None
+    assert manifest.segments[1].status == "ok"
+    assert manifest.stage_state["regenerate"]["target_segments"] == ["seg_0002"]
+
+
+def test_regenerate_needs_step_includes_recoverable_auto_repair_plan_segments(
+    tmp_project_dir: Path,
+    monkeypatch,
+) -> None:
+    pipeline_steps.init_project(tmp_project_dir)
+    cfg = ProjectConfig(rvc_backend="mock")
+    manual_recoverable = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    manual_recoverable.status = "needs_manual_review"
+    manual_recoverable.tts = None
+    manual_recoverable.rvc = None
+    manual_recoverable.qc = QCMetadata(
+        recommendation="manual_review",
+        status="needs_manual_review",
+        issues=["missing_selected_tts"],
+    )
+    manual_recoverable.analysis["ko_qc_repair_plan"] = {
+        "action": "regenerate_tts",
+        "terminal_manual": False,
+        "reasons": ["missing_selected_tts"],
+    }
+    _save_synth_manifest(tmp_project_dir, cfg, segments=[manual_recoverable])
+    synthesized: list[str] = []
+    original_mock_synthesize = pipeline_steps._mock_synthesize
+
+    def counting_mock_synthesize(output_path: Path, duration: float, seed: int, sample_rate: int = 48_000) -> Path:
+        synthesized.append(output_path.name)
+        return original_mock_synthesize(output_path, duration, seed, sample_rate)
+
+    monkeypatch.setattr(pipeline_steps, "_mock_synthesize", counting_mock_synthesize)
+
+    manifest = pipeline_steps.regenerate_needs_step(
+        tmp_project_dir,
+        tts_backend="mock",
+        gemma_backend="mock",
+        confirm_rights=True,
+    )
+
+    assert synthesized
+    assert all(name.startswith("seg_0001") for name in synthesized)
+    assert manifest.segments[0].status == "ok"
+    assert manifest.segments[0].rvc is not None
+    assert manifest.stage_state["regenerate"]["target_segments"] == ["seg_0001"]
 
 
 def test_all_candidates_failing_causes_hard_failure(tmp_project_dir: Path, monkeypatch) -> None:

@@ -26,6 +26,7 @@ from asmr_dub_pipeline.pipeline.stages.rvc import run_rvc_stage
 from asmr_dub_pipeline.pipeline.stages.qc import run_qc_stage
 from asmr_dub_pipeline.pipeline.stages.experimental_tts import run_synth_experimental_tts_stage
 from asmr_dub_pipeline.pipeline.stages.regenerate import run_regenerate_needs_stage
+from asmr_dub_pipeline.pipeline.stages.auto_repair import run_auto_repair_stage
 from asmr_dub_pipeline.pipeline.stages.mix import run_mix_stage
 from asmr_dub_pipeline.pipeline.stages.export import run_export_stage
 
@@ -54,6 +55,7 @@ __all__ = [
     "run_qc_stage",
     "run_synth_experimental_tts_stage",
     "run_regenerate_needs_stage",
+    "run_auto_repair_stage",
     "run_mix_stage",
     "run_export_stage",
 ]

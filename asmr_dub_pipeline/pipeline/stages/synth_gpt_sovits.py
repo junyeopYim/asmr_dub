@@ -14,6 +14,11 @@ from asmr_dub_pipeline.qc.pronunciation_qc import (
     evaluate_numeric_sequence_text,
     normalize_korean_pronunciation_text,
 )
+from asmr_dub_pipeline.qc.repair_plan import (
+    build_ko_qc_repair_plan,
+    is_micro_segment,
+    is_texture_like_micro_segment,
+)
 from asmr_dub_pipeline.pipeline.stages.numeric_phrase_renderer import (
     build_numeric_phrase_request,
     render_live_numeric_phrase,
@@ -140,6 +145,7 @@ def _gsv_refs_duration_preflight(
 ) -> dict[str, Any]:
     min_sec = max(float(cfg.gsv_ref_min_sec), GSV_API_MIN_REF_SEC)
     max_sec = float(cfg.gsv_ref_max_sec)
+    duration_epsilon_sec = 0.02
     rows: list[dict[str, Any]] = []
     invalid: list[dict[str, Any]] = []
     for style in required_styles:
@@ -168,11 +174,11 @@ def _gsv_refs_duration_preflight(
             invalid.append(row)
             continue
         reject_reasons: list[str] = []
-        if actual_duration < min_sec:
+        if actual_duration + duration_epsilon_sec < min_sec:
             reject_reasons.append(
                 f"actual_duration_below_ref_min:{actual_duration:.3f}<{min_sec:.3f}"
             )
-        if actual_duration > max_sec:
+        if actual_duration - duration_epsilon_sec > max_sec:
             reject_reasons.append(
                 f"actual_duration_above_ref_max:{actual_duration:.3f}>{max_sec:.3f}"
             )
@@ -189,6 +195,10 @@ def _gsv_refs_duration_preflight(
         if reject_reasons:
             invalid.append(row)
     return {"refs": rows, "invalid": invalid}
+
+
+def _uses_real_gsv_client() -> bool:
+    return getattr(GPTSoVITSClient, "__module__", "") == "asmr_dub_pipeline.gpt_sovits.client"
 
 
 def _close_open_korean_tts_sentence(text: str) -> tuple[str, bool]:
@@ -2833,7 +2843,13 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
     else:
         refs = load_refs(refs_path, project_dir=project_dir)
         actual_refs_path = resolve_refs_json_path(refs_path, project_dir)
-        if not mock:
+        refs_preflight: dict[str, Any] = {
+            "refs": [],
+            "invalid": [],
+            "skipped": True,
+            "reason": "countdown_only_or_non_api_client",
+        }
+        if not mock and not countdown_only and _uses_real_gsv_client():
             refs_preflight = _gsv_refs_duration_preflight(refs, cfg)
             if refs_preflight["invalid"]:
                 from asmr_dub_pipeline.pipeline.stages.voice_refs import (
@@ -11547,9 +11563,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
             selected: TTSCandidate,
             evaluated_candidates: Sequence[TTSCandidate],
         ) -> dict[str, Any] | None:
-            micro_max_sec = float(getattr(cfg, "gsv_rescue_micro_segment_max_sec", 0.6))
-            if micro_max_sec <= 0 or segment.duration > micro_max_sec:
+            if not is_micro_segment(segment, cfg):
                 return None
+            micro_max_sec = float(getattr(cfg, "gsv_micro_segment_max_sec", 1.2))
             duration_gated = [
                 candidate
                 for candidate in evaluated_candidates
@@ -11753,6 +11769,24 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
             source_language = _canonical_language(cfg.source_language)
             open_sentence_normalized = False
             if target_language == "ko":
+                if is_texture_like_micro_segment(segment, cfg):
+                    segment.status = "non_speech_texture"
+                    segment.keep_original_texture = True
+                    segment.tts = None
+                    segment.rvc = None
+                    segment.qc = None
+                    segment.mix = {}
+                    segment.analysis["micro_segment_auto_fallback"] = {
+                        "action": "keep_original_texture",
+                        "reason": "texture_like_micro_segment",
+                        "duration_sec": round(float(segment.duration), 6),
+                        "backend": "gpt-sovits",
+                    }
+                    segment.analysis["ko_qc_repair_plan"] = build_ko_qc_repair_plan(
+                        segment,
+                        cfg=cfg,
+                    )
+                    return index, segment
                 previous_tts_text = segment.script.tts_text
                 normalized = normalize_korean_tts_text(previous_tts_text)
                 normalized_text = normalized.text
@@ -12545,6 +12579,9 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                                 "micro_segment_unfit_policy": unfit_policy,
                             },
                         )
+                        fallback_backend = str(
+                            getattr(cfg, "gsv_micro_segment_fallback_backend", "qwen")
+                        ).strip().lower().replace("-", "_")
                         if unfit_policy == "keep_original":
                             segment.status = "absorbed"
                             segment.keep_original_texture = True
@@ -12557,6 +12594,23 @@ def run_synth_stage(ctx: PipelineContext, gsv_url: str | None, refs_path: Path, 
                             }
                         else:
                             segment.status = "needs_manual_review"
+                            if (
+                                not mock
+                                and target_language == "ko"
+                                and fallback_backend == "qwen"
+                            ):
+                                repair_plan = build_ko_qc_repair_plan(segment, cfg=cfg)
+                                repair_plan.update(
+                                    {
+                                        "action": "fallback_tts_qwen",
+                                        "root_cause": "gpt_sovits_micro_segment_unfit",
+                                        "terminal_manual": False,
+                                        "route": "micro_fallback",
+                                        "source": "gpt_sovits_micro_segment",
+                                        "gsv_retry_summary": micro_summary,
+                                    }
+                                )
+                                segment.analysis["ko_qc_repair_plan"] = repair_plan
                             segment.errors.append("Micro segment too short for Korean TTS.")
                         return index, segment
                 if not selected.acceptable_for_mix and not embedded_overlay_rescue:

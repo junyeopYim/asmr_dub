@@ -38,6 +38,7 @@ STANDARD_DIRS = [
     "work/rvc_train/logs",
     "work/rvc/candidates",
     "work/rvc/logs",
+    "work/auto_repair",
     "voice_bank",
     "voice_bank/sources",
     "voice_bank/speakers",

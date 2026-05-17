@@ -175,7 +175,7 @@ asmr-dub train-gsv --project ./project --confirm-rights
 asmr-dub synth --project ./project --gsv-url http://127.0.0.1:9880 --refs refs/refs.json --confirm-rights
 asmr-dub train-rvc --project ./project --confirm-rights
 asmr-dub rvc --project ./project --confirm-rights
-asmr-dub qc --project ./project --gemma-backend mock
+asmr-dub qc --project ./project --gemma-backend llama_cpp
 asmr-dub mix --project ./project --confirm-rights
 asmr-dub export ./owned_source.mp4 --project ./project --confirm-rights
 ```
@@ -214,6 +214,38 @@ asmr-dub full ./audio/RJ01012948.mp4 \
 After `extract`, derived-media stages require the existing confirmed audit. If you create or populate a project manually, pass `--confirm-rights` to the stage that first consumes the media. Non-mock `synth` always requires `--confirm-rights` for the current source and voice references. Real RVC also requires `--confirm-rights`.
 
 The HF Gemma backend is lazy and defaults to `local_files_only=True` to avoid hidden model downloads. GPT-SoVITS is called only when you run non-mock `synth` with an explicit endpoint. RVC is invoked only through your configured external command template. The pipeline can auto-start a repo-local GPT-SoVITS `api_v2.py` and can call a repo-local RVC-WebUI checkout, but it does not install RVC, PyTorch, model dependencies, or voice references for you.
+
+## Korean QC Auto-Repair
+
+Real Korean runs no longer silently downgrade QC to the mock backend. Use
+`gemma.qc_backend: auto` or `--ko-qc-backend auto` to let QC follow the real
+Gemma backend; `mock` is allowed only in mock runs or when explicitly enabled
+with `gemma.allow_mock_qc_for_real_korean_lane`.
+
+Korean QC stores a structured repair plan at
+`segment.analysis["ko_qc_repair_plan"]`. Recoverable causes such as missing TTS,
+duration drift, translation gaps, script rewrite needs, or ASR repair needs are
+queued for auto-repair instead of becoming terminal manual review. Safety,
+rights, and ambiguous cases still remain manual.
+
+The full pipeline runs auto-repair after QC and before mix by default. Tune it
+with `--auto-repair/--no-auto-repair`, `--auto-repair-max-rounds`, or
+`auto_repair_*` config fields. A standalone repair pass is also available:
+
+```bash
+asmr-dub auto-repair --project ./project --confirm-rights --gemma-backend llama_cpp
+```
+
+Each pass writes `work/auto_repair/summary.json` with per-segment actions,
+attempt counts, terminal reasons, and remaining problematic segment ids.
+
+Very short GPT-SoVITS Korean segments use dedicated micro routing. Texture-like
+breaths/moans/non-speech under the configured threshold are kept as original
+texture; short Korean speech that fails GPT-SoVITS duration or pronunciation
+gates receives a repair plan and can fall back to Qwen TTS promotion. The main
+knobs are `gsv.micro_segment_enabled`, `gsv.micro_segment_max_sec`,
+`gsv.micro_segment_texture_max_sec`, `gsv.micro_segment_fallback_backend`, and
+`--micro-segments/--no-micro-segments`.
 
 ## Mandatory RVC
 

@@ -5321,7 +5321,7 @@ def test_synth_closes_open_korean_text_and_retries_omission_with_static_ref(
     static_ref_audio = tmp_project_dir / "refs" / "whisper_close.wav"
     write_tiny_wav(static_ref_audio, duration=4.0)
     segment_audio = tmp_project_dir / "work" / "segments" / "audio" / "seg_0010_mix.wav"
-    write_tiny_wav(segment_audio, duration=8.04)
+    _write_tone_wav(segment_audio, duration=8.04)
     original_text = "하지만 눈만은 아직 뜨고 있어야 해요. 멍하니…"
     closed_text = "하지만 눈만은 아직 뜨고 있어야 해요. 멍하니 말이에요."
     segment = Segment(

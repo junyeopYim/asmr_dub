@@ -7,11 +7,12 @@ from typing import Any, TypeVar
 
 from .config import load_project_config, save_project_config
 from .gpu_memory import clear_gpu_vram
-from .pipeline.manifest_io import save_manifest
+from .pipeline.manifest_io import load_manifest, save_manifest
 from .pipeline.steps import (
     analyze_step,
     assign_speakers_step,
     audio_style_step,
+    auto_repair_step,
     countdown_synth_step,
     export_step,
     extract_step,
@@ -34,6 +35,7 @@ from .pipeline.steps import (
     transcribe_step,
     translate_ko_step,
 )
+from .qc.repair_plan import plan_is_repairable
 from .rvc import validate_rvc_config, validate_rvc_training_config
 from .schemas import PipelineManifest
 
@@ -91,6 +93,49 @@ def _set_source_separation_backend(project_dir: Path, backend: str) -> str:
     cfg.source_separation_backend = backend
     save_project_config(cfg, project_dir / "pipeline.yaml")
     return previous_backend
+
+
+def _normalize_backend_name(value: str | None) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _resolve_korean_qc_backend(
+    cfg: Any,
+    *,
+    mock: bool,
+    gemma_backend: str,
+    ko_qc_backend: str | None = None,
+) -> str:
+    if mock:
+        return "mock"
+    configured = _normalize_backend_name(ko_qc_backend or cfg.gemma_qc_backend)
+    if configured in {"", "auto"}:
+        configured = _normalize_backend_name(gemma_backend)
+        if configured in {"", "mock"}:
+            configured = _normalize_backend_name(cfg.default_gemma_backend)
+        if configured in {"", "mock"}:
+            configured = "llama_cpp"
+    if configured == "mock" and not cfg.gemma_allow_mock_qc_for_real_korean_lane:
+        raise ValueError(
+            "Real Korean lane QC cannot use mock unless "
+            "gemma_allow_mock_qc_for_real_korean_lane is enabled."
+        )
+    return configured
+
+
+def _auto_repair_targets_exist(project_dir: Path) -> bool:
+    try:
+        manifest = load_manifest(project_dir)
+    except Exception:
+        return False
+    for segment in manifest.segments:
+        if segment.status == "needs_regeneration":
+            return True
+        if segment.status in {"needs_manual_review", "failed"} and plan_is_repairable(
+            segment.analysis.get("ko_qc_repair_plan")
+        ):
+            return True
+    return False
 
 
 def _transcribe_with_optional_source_separation_fallback(
@@ -189,6 +234,10 @@ def run_pipeline(
     source_separation_cache_project: Path | None = None,
     regenerate_before_mix: bool = False,
     merge_input_parts: bool = False,
+    auto_repair: bool | None = None,
+    auto_repair_max_rounds: int | None = None,
+    ko_qc_backend: str | None = None,
+    micro_segments: bool | None = None,
 ) -> PipelineManifest:
     if mock:
         gemma_backend = "mock"
@@ -204,6 +253,24 @@ def run_pipeline(
         save_project_config(cfg, project_dir / "pipeline.yaml")
     if normalized_asr_backend is not None:
         cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "asr_backend": normalized_asr_backend})
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    if ko_qc_backend is not None:
+        cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "gemma_qc_backend": ko_qc_backend})
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    if auto_repair_max_rounds is not None:
+        cfg = type(cfg).model_validate(
+            {**cfg.model_dump(mode="json"), "auto_repair_max_rounds": auto_repair_max_rounds}
+        )
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    if auto_repair is not None:
+        cfg = type(cfg).model_validate(
+            {**cfg.model_dump(mode="json"), "auto_repair_enabled": auto_repair}
+        )
+        save_project_config(cfg, project_dir / "pipeline.yaml")
+    if micro_segments is not None:
+        cfg = type(cfg).model_validate(
+            {**cfg.model_dump(mode="json"), "gsv_micro_segment_enabled": micro_segments}
+        )
         save_project_config(cfg, project_dir / "pipeline.yaml")
     if asr_preset is not None:
         cfg = type(cfg).model_validate({**cfg.model_dump(mode="json"), "asr_preset": asr_preset.replace("-", "_")})
@@ -398,7 +465,16 @@ def run_pipeline(
             mock=mock,
         )
     run_stage("rvc", rvc_step, project_dir, confirm_rights=confirm_rights, mock=mock)
-    qc_backend = "mock" if use_korean_text_lane else gemma_backend
+    qc_backend = (
+        _resolve_korean_qc_backend(
+            cfg,
+            mock=mock,
+            gemma_backend=gemma_backend,
+            ko_qc_backend=ko_qc_backend,
+        )
+        if use_korean_text_lane
+        else gemma_backend
+    )
     run_stage("qc", qc_step, project_dir, qc_backend)
     if regenerate_before_mix:
         run_stage(
@@ -416,5 +492,37 @@ def run_pipeline(
             auto_gsv_server=auto_gsv_server,
             gsv_server_command=gsv_server_command,
         )
+    effective_auto_repair_enabled = cfg.auto_repair_enabled if auto_repair is None else auto_repair
+    effective_auto_repair_rounds = (
+        cfg.auto_repair_max_rounds
+        if auto_repair_max_rounds is None
+        else auto_repair_max_rounds
+    )
+    if (
+        not mock
+        and use_korean_text_lane
+        and effective_auto_repair_enabled
+        and cfg.auto_repair_run_after_qc
+        and effective_auto_repair_rounds > 0
+    ):
+        for _round_index in range(effective_auto_repair_rounds):
+            if not _auto_repair_targets_exist(project_dir):
+                break
+            run_stage(
+                "auto-repair",
+                auto_repair_step,
+                project_dir,
+                refs_path=refs_path or Path("refs/refs.json"),
+                confirm_rights=confirm_rights,
+                max_attempts=cfg.auto_repair_max_attempts,
+                gemma_backend=qc_backend,
+                tts_backend="gpt-sovits",
+                gsv_url=gsv_url,
+                gpt_weights_path=gpt_weights_path,
+                sovits_weights_path=sovits_weights_path,
+                use_trained_gpt=use_trained_gpt,
+                auto_gsv_server=auto_gsv_server,
+                gsv_server_command=gsv_server_command,
+            )
     run_stage("mix", mix_step, project_dir, confirm_rights)
     return run_stage("export", export_step, input_path, project_dir, confirm_rights)

@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from asmr_dub_pipeline.gemma.schemas import GemmaQCResult
+from asmr_dub_pipeline.qc.repair_plan import duration_qc_policy
 from asmr_dub_pipeline.schemas import QCMetadata
 
 ASMR_MAX_RMS_DBFS = -18.0
@@ -29,8 +30,9 @@ def score_qc(audio_metrics: dict[str, Any], gemma_qc: dict[str, Any] | None = No
         }
     issues: list[str] = list(gemma_qc.get("issues") or [])
     ratio = float(audio_metrics.get("duration_ratio") or 0.0)
+    duration_policy = duration_qc_policy(audio_metrics)
     timing_score = float(gemma_qc.get("timing_score", max(0.0, 1.0 - abs(1.0 - ratio))))
-    if ratio < 0.75 or ratio > 1.35:
+    if duration_policy.get("gate") in {"too_short", "too_long"}:
         issues.append("duration_ratio_out_of_range")
     if float(audio_metrics.get("clipping_ratio") or 0.0) > 0.001:
         issues.append("clipping_detected")
@@ -88,6 +90,7 @@ def score_qc(audio_metrics: dict[str, Any], gemma_qc: dict[str, Any] | None = No
         repetition_detected=repetition,
         omission_detected=omission,
         unsafe_or_rights_issue=unsafe,
+        duration_policy=duration_policy,
         recommendation=recommendation,
         issues=issues,
         score=score,

@@ -9,19 +9,41 @@ from asmr_dub_pipeline.pipeline.stages.qc import run_qc_stage
 from asmr_dub_pipeline.pipeline.stages.rvc import run_rvc_stage
 from asmr_dub_pipeline.pipeline.stages.synth_gpt_sovits import run_synth_stage
 from asmr_dub_pipeline.pipeline.stages.synth_qwen import run_synth_qwen_stage
+from asmr_dub_pipeline.qc.repair_plan import plan_is_repairable
 
 
-def run_regenerate_needs_stage(ctx: PipelineContext, *, refs_path: Path = Path('refs/refs.json'), confirm_rights: bool = False, gemma_backend: str = 'mock', tts_backend: str = 'gpt-sovits', gsv_url: str | None = None, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, use_trained_gpt: bool = False, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, qwen_model_id: str | None = None, qwen_candidate_count: int | None = None, qwen_local_files_only: bool | None = None, experimental_tts_base_url: str | None = None, experimental_tts_candidate_count: int | None = None) -> PipelineManifest:
+def run_regenerate_needs_stage(ctx: PipelineContext, *, refs_path: Path = Path('refs/refs.json'), confirm_rights: bool = False, gemma_backend: str = 'mock', tts_backend: str = 'gpt-sovits', gsv_url: str | None = None, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, use_trained_gpt: bool = False, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, qwen_model_id: str | None = None, qwen_candidate_count: int | None = None, qwen_local_files_only: bool | None = None, experimental_tts_base_url: str | None = None, experimental_tts_candidate_count: int | None = None, only_segment_ids: set[str] | None = None, target_segment_ids: set[str] | None = None) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
     _load_config_into_manifest(project_dir, manifest)
-    target_ids = {
-        segment.id
-        for segment in manifest.segments
-        if segment.status == "needs_regeneration"
-        and segment.qc is not None
-        and segment.qc.recommendation == "regenerate"
-    }
+    explicit_ids = None
+    if only_segment_ids is not None or target_segment_ids is not None:
+        explicit_ids = set(only_segment_ids or set()) | set(target_segment_ids or set())
+    terminal_statuses = {"absorbed", "no_speech_detected", "non_speech_texture"}
+
+    def has_recoverable_plan(segment: Segment) -> bool:
+        return plan_is_repairable(segment.analysis.get("ko_qc_repair_plan"))
+
+    if explicit_ids is not None:
+        target_ids = {
+            segment.id
+            for segment in manifest.segments
+            if segment.id in explicit_ids and segment.status not in terminal_statuses
+        }
+    else:
+        target_ids = {
+            segment.id
+            for segment in manifest.segments
+            if (
+                segment.status == "needs_regeneration"
+                and segment.qc is not None
+                and segment.qc.recommendation == "regenerate"
+            )
+            or (
+                segment.status in {"needs_manual_review", "failed"}
+                and has_recoverable_plan(segment)
+            )
+        }
     _log_stage_start("regenerate", f"segments={len(target_ids)}, tts_backend={tts_backend}")
     if not target_ids:
         mark_stage(
@@ -39,6 +61,8 @@ def run_regenerate_needs_stage(ctx: PipelineContext, *, refs_path: Path = Path('
     for segment in manifest.segments:
         if segment.id not in target_ids:
             continue
+        if segment.status in {"needs_manual_review", "failed", "needs_regeneration"} and segment.script:
+            segment.status = "scripted"
         segment.rvc = None
         segment.mix = {}
     _invalidate_downstream_after_tts_promotion(manifest)

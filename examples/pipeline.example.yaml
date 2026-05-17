@@ -70,7 +70,13 @@ asr:
   word_timestamps: false
 base_seed: 12345
 candidate_count: 5
+auto_repair_enabled: true
+auto_repair_max_rounds: 3
+auto_repair_run_after_qc: true
+auto_repair_max_attempts: 3
 gemma:
+  qc_backend: auto
+  allow_mock_qc_for_real_korean_lane: false
   default_backend: mock
   http_send_audio: false
   http_url: null
@@ -306,6 +312,14 @@ gsv:
   timefit_micro_max_tempo: 1.3
   timefit_long_min_sec: 7.0
   timefit_long_max_stretch: 1.15
+  micro_segment_enabled: true
+  micro_segment_max_sec: 1.2
+  micro_segment_texture_max_sec: 0.7
+  micro_segment_max_hangul_syllables: 4
+  micro_segment_fallback_backend: qwen
+  micro_segment_keep_original_texture_enabled: true
+  micro_segment_carrier_slice_enabled: true
+  micro_segment_unfit_policy: keep_original
   url: http://127.0.0.1:9880
 mix:
   allow_korean_timing_draft: false

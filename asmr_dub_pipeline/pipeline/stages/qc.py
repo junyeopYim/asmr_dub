@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from asmr_dub_pipeline.pipeline.context import PipelineContext
 from asmr_dub_pipeline.pipeline.stages.common import *
+from asmr_dub_pipeline.qc.repair_plan import build_ko_qc_repair_plan, plan_is_repairable
+from asmr_dub_pipeline.schemas import QCMetadata
 
 
 def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool = False, only_segment_ids: set[str] | None = None) -> PipelineManifest:
@@ -27,8 +29,32 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
                 "qc", index, total, segment, manifest, started_at, last_logged_at
             )
             continue
+        target_language = _canonical_language(
+            segment.script.target_language
+            if segment.script is not None
+            else segment.tts.target_language
+            if segment.tts is not None
+            else cfg.target_language
+        )
         if not segment.tts or not segment.tts.selected_candidate_path or not segment.script:
-            segment.status = "needs_manual_review"
+            issues = []
+            if not segment.script:
+                issues.append("missing_script")
+            if not segment.tts or not segment.tts.selected_candidate_path:
+                issues.append("missing_selected_tts")
+            qc = QCMetadata(
+                recommendation="manual_review",
+                status="needs_manual_review",
+                issues=issues,
+            )
+            if target_language == "ko":
+                plan = build_ko_qc_repair_plan(segment, qc=qc, cfg=cfg)
+                segment.analysis["ko_qc_repair_plan"] = plan
+                if plan_is_repairable(plan):
+                    qc.recommendation = "regenerate"
+                    qc.status = "needs_regeneration"
+            segment.qc = qc
+            segment.status = qc.status
             segment.errors.append("Cannot QC without selected TTS and script.")
             last_logged_at = _log_segment_progress(
                 "qc", index, total, segment, manifest, started_at, last_logged_at
@@ -40,6 +66,7 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
             else Path(segment.tts.selected_candidate_path)
         )
         audio_metrics = measure_audio_qc(audio_path, segment.duration)
+        audio_metrics["source_duration_sec"] = segment.duration
         selected_candidate = next(
             (candidate for candidate in segment.tts.candidates if candidate.selected),
             None,
@@ -62,14 +89,33 @@ def run_qc_stage(ctx: PipelineContext, backend_kind: str, confirm_rights: bool =
             gemma_result = {"recommendation": "manual_review", "issues": [str(exc)]}
         qc = score_qc(audio_metrics, gemma_result)
         segment.qc = qc
-        segment.status = qc.status
+        if target_language == "ko" and qc.status != "ok":
+            plan = build_ko_qc_repair_plan(segment, audio_metrics, gemma_result, qc, cfg)
+            segment.analysis["ko_qc_repair_plan"] = plan
+            if plan_is_repairable(plan) and qc.unsafe_or_rights_issue is False:
+                segment.status = "needs_regeneration"
+                segment.qc.status = "needs_regeneration"
+                segment.qc.recommendation = "regenerate"
+            else:
+                segment.status = qc.status
+        else:
+            if target_language == "ko":
+                segment.analysis.pop("ko_qc_repair_plan", None)
+            segment.status = qc.status
         last_logged_at = _log_segment_progress(
             "qc", index, total, segment, manifest, started_at, last_logged_at
         )
     out_path = project_dir / "work" / "qc" / "qc_manifest.json"
     write_json_atomic(out_path, {"segments": [s.model_dump(mode="json") for s in manifest.segments]})
     manifest.artifacts["qc"] = str(out_path)
-    mark_stage(manifest, "qc", "completed", backend=backend_kind, segment_counts=_segment_counts(manifest))
+    mark_stage(
+        manifest,
+        "qc",
+        "completed",
+        backend=backend_kind,
+        qc_backend=backend_kind,
+        segment_counts=_segment_counts(manifest),
+    )
     save_manifest(project_dir, manifest)
     _log_stage_complete("qc", manifest, f"backend={backend_kind}")
     return ctx.update_manifest(manifest)

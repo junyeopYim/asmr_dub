@@ -27,6 +27,7 @@ from .pipeline.manifest_io import manifest_path, write_json_atomic
 from .pipeline.steps import (
     analyze_step,
     audio_style_step,
+    auto_repair_step,
     countdown_synth_step,
     export_step,
     extract_step,
@@ -81,6 +82,12 @@ FULL_REAL_QUALITY_PRESET = {
     "asr_translation_backcheck_enabled": True,
     "candidate_count": 5,
     "duration_tolerance": 0.25,
+    "auto_repair_enabled": True,
+    "auto_repair_max_rounds": 3,
+    "auto_repair_run_after_qc": True,
+    "auto_repair_max_attempts": 3,
+    "gemma_qc_backend": "auto",
+    "gemma_allow_mock_qc_for_real_korean_lane": False,
     "gemma_llama_cpp_ctx_size": 16384,
     "gemma_llama_cpp_n_predict": 2048,
     "gemma_text_batch_size": 1,
@@ -136,6 +143,13 @@ FULL_REAL_QUALITY_PRESET = {
     "gsv_timefit_micro_max_tempo": 1.30,
     "gsv_timefit_long_min_sec": 7.0,
     "gsv_timefit_long_max_stretch": 1.15,
+    "gsv_micro_segment_enabled": True,
+    "gsv_micro_segment_max_sec": 1.2,
+    "gsv_micro_segment_texture_max_sec": 0.7,
+    "gsv_micro_segment_max_hangul_syllables": 4,
+    "gsv_micro_segment_fallback_backend": "qwen",
+    "gsv_micro_segment_keep_original_texture_enabled": True,
+    "gsv_micro_segment_carrier_slice_enabled": True,
     "gsv_top_k": 8,
     "gsv_top_p": 0.9,
     "gsv_temperature": 0.7,
@@ -1264,6 +1278,74 @@ def regenerate(
     console.print(f"Regeneration complete: {manifest.stage_state.get('regenerate')}")
 
 
+@app.command(name="auto-repair")
+def auto_repair(
+    project: Path = typer.Option(..., "--project", "-p"),
+    refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
+    confirm_rights: bool = typer.Option(False, "--confirm-rights", help=RIGHTS_HELP),
+    gemma_backend: str = typer.Option("mock", "--gemma-backend", help="mock|hf|http|llama_cpp"),
+    tts_backend: str = typer.Option("gpt-sovits", "--tts-backend", help="gpt-sovits|qwen|mock"),
+    max_attempts: int | None = typer.Option(
+        None,
+        "--max-attempts",
+        min=1,
+        max=12,
+        help="Override auto_repair_max_attempts for this run.",
+    ),
+    only_segments: str | None = typer.Option(
+        None,
+        "--only-segments",
+        help="Comma or whitespace separated segment ids to consider.",
+    ),
+    plan_only: bool = typer.Option(
+        False,
+        "--plan-only/--apply",
+        help="Write the auto-repair summary without invoking downstream repair stages.",
+    ),
+    gsv_url: str | None = typer.Option(None, "--gsv-url"),
+    gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
+    sovits_weights: str | None = typer.Option(None, "--sovits-weights", help="Optional SoVITS weights path for api_v2."),
+    use_trained_gpt: bool = typer.Option(False, "--use-trained-gpt", help=TRAINED_GPT_HELP),
+    auto_gsv_server: bool = typer.Option(
+        False,
+        "--auto-gsv-server/--no-auto-gsv-server",
+        help="Start a local GPT-SoVITS api_v2 server if needed.",
+    ),
+    gsv_server_command: str | None = typer.Option(
+        None,
+        "--gsv-server-command",
+        help="Shell-style command used when --auto-gsv-server needs to start api_v2.",
+    ),
+) -> None:
+    """Repair Korean QC failures that have deterministic recovery routes."""
+    try:
+        segment_ids = _parse_only_segment_ids(only_segments)
+        manifest = _run_cli_stage(
+            "auto-repair",
+            _backend_may_use_gpu(gemma_backend) or _backend_may_use_gpu(tts_backend),
+            auto_repair_step,
+            project.expanduser().resolve(),
+            refs_path=refs,
+            confirm_rights=confirm_rights,
+            max_attempts=max_attempts,
+            plan_only=plan_only,
+            only_segment_ids=segment_ids,
+            gemma_backend=gemma_backend,
+            tts_backend=tts_backend,
+            gsv_url=gsv_url,
+            gpt_weights_path=gpt_weights,
+            sovits_weights_path=sovits_weights,
+            use_trained_gpt=use_trained_gpt,
+            auto_gsv_server=auto_gsv_server,
+            gsv_server_command=gsv_server_command,
+        )
+    except RightsError as exc:
+        _handle_error(exc)
+    except Exception as exc:
+        _handle_error(exc)
+    console.print(f"Auto-repair complete: {manifest.stage_state.get('auto-repair')}")
+
+
 @app.command(name="train-rvc")
 def train_rvc(
     project: Path = typer.Option(..., "--project", "-p"),
@@ -1575,7 +1657,29 @@ def run(
     ),
     mock: bool = typer.Option(False, "--mock", help="Use mock Gemma and mock TTS."),
     gemma_backend: str = typer.Option("mock", "--gemma-backend", help="mock|hf|http|llama_cpp"),
+    ko_qc_backend: str | None = typer.Option(
+        None,
+        "--ko-qc-backend",
+        help="Korean QC backend override: auto|hf|http|llama_cpp|mock.",
+    ),
     target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
+    auto_repair: bool = typer.Option(
+        True,
+        "--auto-repair/--no-auto-repair",
+        help="Run the Korean QC auto-repair loop after QC.",
+    ),
+    auto_repair_max_rounds: int | None = typer.Option(
+        None,
+        "--auto-repair-max-rounds",
+        min=0,
+        max=12,
+        help="Override the auto-repair round budget.",
+    ),
+    micro_segments: bool = typer.Option(
+        True,
+        "--micro-segments/--no-micro-segments",
+        help="Use dedicated GPT-SoVITS micro-segment routing.",
+    ),
     gsv_url: str | None = typer.Option(None, "--gsv-url"),
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
     gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
@@ -1629,7 +1733,11 @@ def run(
             confirm_rights=confirm_rights,
             mock=mock,
             gemma_backend=gemma_backend,
+            ko_qc_backend=ko_qc_backend,
             target_language=target_language,
+            auto_repair=auto_repair,
+            auto_repair_max_rounds=auto_repair_max_rounds,
+            micro_segments=micro_segments,
             gsv_url=gsv_url,
             refs_path=refs,
             gpt_weights_path=gpt_weights,
@@ -1674,6 +1782,11 @@ def full(
         "--gemma-backend",
         help="hf|http|llama_cpp when --real is set.",
     ),
+    ko_qc_backend: str | None = typer.Option(
+        None,
+        "--ko-qc-backend",
+        help="Korean QC backend override for --real: auto|hf|http|llama_cpp|mock.",
+    ),
     asr_backend: str | None = typer.Option(
         None,
         "--asr-backend",
@@ -1715,6 +1828,23 @@ def full(
         help="Batch size for faster-whisper batched inference during full runs.",
     ),
     target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
+    auto_repair: bool = typer.Option(
+        True,
+        "--auto-repair/--no-auto-repair",
+        help="Run the Korean QC auto-repair loop after QC.",
+    ),
+    auto_repair_max_rounds: int | None = typer.Option(
+        None,
+        "--auto-repair-max-rounds",
+        min=0,
+        max=12,
+        help="Override the auto-repair round budget.",
+    ),
+    micro_segments: bool = typer.Option(
+        True,
+        "--micro-segments/--no-micro-segments",
+        help="Use dedicated GPT-SoVITS micro-segment routing.",
+    ),
     gsv_url: str | None = typer.Option(None, "--gsv-url"),
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
     gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
@@ -1797,6 +1927,7 @@ def full(
             confirm_rights=confirm_rights,
             mock=not real,
             gemma_backend=gemma_backend if real else "mock",
+            ko_qc_backend=ko_qc_backend,
             asr_backend=asr_backend,
             asr_preset=asr_preset,
             asr_vad_off=True if asr_vad_off else None,
@@ -1806,6 +1937,9 @@ def full(
             asr_batched_inference=asr_batched,
             asr_batch_size=asr_batch_size,
             target_language=target_language,
+            auto_repair=auto_repair,
+            auto_repair_max_rounds=auto_repair_max_rounds,
+            micro_segments=micro_segments,
             gsv_url=gsv_url,
             refs_path=refs,
             gpt_weights_path=gpt_weights,
@@ -1846,6 +1980,11 @@ def full_audio_batch(
         "llama_cpp",
         "--gemma-backend",
         help="hf|http|llama_cpp.",
+    ),
+    ko_qc_backend: str | None = typer.Option(
+        None,
+        "--ko-qc-backend",
+        help="Korean QC backend override: auto|hf|http|llama_cpp|mock.",
     ),
     asr_backend: str | None = typer.Option(
         None,
@@ -1888,6 +2027,23 @@ def full_audio_batch(
         help="Batch size for faster-whisper batched inference.",
     ),
     target_language: str = typer.Option("ko", "--target-language", help="Output TTS language. Currently supports ko/kr."),
+    auto_repair: bool = typer.Option(
+        True,
+        "--auto-repair/--no-auto-repair",
+        help="Run the Korean QC auto-repair loop after QC.",
+    ),
+    auto_repair_max_rounds: int | None = typer.Option(
+        None,
+        "--auto-repair-max-rounds",
+        min=0,
+        max=12,
+        help="Override the auto-repair round budget.",
+    ),
+    micro_segments: bool = typer.Option(
+        True,
+        "--micro-segments/--no-micro-segments",
+        help="Use dedicated GPT-SoVITS micro-segment routing.",
+    ),
     gsv_url: str | None = typer.Option(None, "--gsv-url"),
     refs: Path = typer.Option(Path("refs/refs.json"), "--refs"),
     gpt_weights: str | None = typer.Option(None, "--gpt-weights", help="Optional GPT weights path for api_v2."),
@@ -2003,6 +2159,7 @@ def full_audio_batch(
                 confirm_rights=confirm_rights,
                 mock=False,
                 gemma_backend=gemma_backend,
+                ko_qc_backend=ko_qc_backend,
                 asr_backend=asr_backend,
                 asr_preset=asr_preset,
                 asr_vad_off=True if asr_vad_off else None,
@@ -2012,6 +2169,9 @@ def full_audio_batch(
                 asr_batched_inference=asr_batched,
                 asr_batch_size=asr_batch_size,
                 target_language=target_language,
+                auto_repair=auto_repair,
+                auto_repair_max_rounds=auto_repair_max_rounds,
+                micro_segments=micro_segments,
                 gsv_url=gsv_url,
                 refs_path=refs,
                 gpt_weights_path=gpt_weights,

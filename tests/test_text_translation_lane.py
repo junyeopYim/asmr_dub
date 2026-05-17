@@ -10237,7 +10237,21 @@ def test_target_language_ko_full_uses_text_only_korean_lane(monkeypatch, tmp_pat
     assert calls[12][2]["mock"] is False
     assert calls[13][2]["mock"] is False
     assert calls[14][2]["mock"] is False
-    assert calls[15][1][1] == "mock"
+    assert calls[15][1][1] == "hf"
+
+    calls.clear()
+    orchestrator.run_pipeline(
+        tmp_path / "input.wav",
+        tmp_path / "project_mock",
+        confirm_rights=True,
+        mock=True,
+        gemma_backend="hf",
+        target_language="ko",
+        asr_backend="qwen_asr",
+    )
+    mock_qc_calls = [call for call in calls if call[0] == "qc"]
+    assert mock_qc_calls
+    assert mock_qc_calls[-1][1][1] == "mock"
 
     calls.clear()
     orchestrator.run_pipeline(

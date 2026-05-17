@@ -422,6 +422,8 @@ class ASRConfig(StrictBaseModel):
 class GemmaConfig(StrictBaseModel):
     sample_rate: int = 16_000
     default_backend: Literal["mock", "hf", "http", "llama_cpp"] = "mock"
+    qc_backend: Literal["auto", "mock", "hf", "http", "llama_cpp"] = "auto"
+    allow_mock_qc_for_real_korean_lane: bool = False
     model_id: str = "google/gemma-4-E4B-it"
     http_url: str | None = None
     http_send_audio: bool = False
@@ -774,6 +776,13 @@ class GSVConfig(StrictBaseModel):
     rescue_timefit_max_tempo: float = Field(default=1.45, ge=1.0, le=8.0)
     rescue_timefit_max_stretch: float = Field(default=1.25, ge=1.0, le=2.0)
     rescue_micro_segment_max_sec: float = Field(default=0.6, ge=0.0)
+    micro_segment_enabled: bool = True
+    micro_segment_max_sec: float = Field(default=1.2, gt=0.0)
+    micro_segment_texture_max_sec: float = Field(default=0.7, gt=0.0)
+    micro_segment_max_hangul_syllables: int = Field(default=4, ge=0)
+    micro_segment_fallback_backend: Literal["qwen", "gpt_sovits", "keep_original"] = "qwen"
+    micro_segment_keep_original_texture_enabled: bool = True
+    micro_segment_carrier_slice_enabled: bool = True
     micro_segment_unfit_policy: Literal["keep_original", "manual_review"] = "keep_original"
     few_shot_force: bool = False
     few_shot_version: Literal["auto", "v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"] = "auto"
@@ -909,6 +918,10 @@ class ProjectConfig(StrictBaseModel):
     mix: MixConfig = Field(default_factory=MixConfig)
     voice_bank: VoiceBankConfig = Field(default_factory=VoiceBankConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    auto_repair_enabled: bool = True
+    auto_repair_max_rounds: int = Field(default=3, ge=0, le=12)
+    auto_repair_run_after_qc: bool = True
+    auto_repair_max_attempts: int = Field(default=3, ge=1, le=12)
 
     @model_validator(mode="before")
     @classmethod
@@ -962,7 +975,11 @@ class ProjectConfig(StrictBaseModel):
     def __setattr__(self, name: str, value: Any) -> None:
         aliases = globals().get("_PROJECT_CONFIG_FLAT_ALIASES", {})
         if name in aliases:
-            _set_nested_config_value(self, aliases[name], value)
+            path = aliases[name]
+            if len(path) == 1 and path[0] == name:
+                super().__setattr__(name, value)
+                return
+            _set_nested_config_value(self, path, value)
             return
         super().__setattr__(name, value)
 
@@ -1001,6 +1018,9 @@ def _get_nested_config_value(config: ProjectConfig, path: FlatConfigPath) -> Any
 
 
 def _set_nested_config_value(config: ProjectConfig, path: FlatConfigPath, value: Any) -> None:
+    if len(path) == 1:
+        BaseModel.__setattr__(config, path[0], value)
+        return
     target: Any = config
     for part in path[:-1]:
         target = getattr(target, part)
@@ -1077,7 +1097,13 @@ _QWEN_ASR_FLAT_FIELDS = [
     "max_inference_batch_size",
     "max_new_tokens",
 ]
-_GEMMA_SIMPLE_FLAT_FIELDS = ["model_id", "http_url", "http_send_audio"]
+_GEMMA_SIMPLE_FLAT_FIELDS = [
+    "model_id",
+    "http_url",
+    "http_send_audio",
+    "qc_backend",
+    "allow_mock_qc_for_real_korean_lane",
+]
 _GEMMA_LLAMA_CPP_FLAT_FIELDS = [
     "cli_path",
     "model_path",
@@ -1312,6 +1338,13 @@ _GSV_FLAT_FIELDS = [
     "rescue_timefit_max_tempo",
     "rescue_timefit_max_stretch",
     "rescue_micro_segment_max_sec",
+    "micro_segment_enabled",
+    "micro_segment_max_sec",
+    "micro_segment_texture_max_sec",
+    "micro_segment_max_hangul_syllables",
+    "micro_segment_fallback_backend",
+    "micro_segment_keep_original_texture_enabled",
+    "micro_segment_carrier_slice_enabled",
     "micro_segment_unfit_policy",
     "few_shot_force",
     "few_shot_version",
@@ -1495,6 +1528,17 @@ _PROJECT_CONFIG_FLAT_ALIASES: dict[str, FlatConfigPath] = {
         "translation_backcheck_ko_patterns",
     ),
 }
+_PROJECT_CONFIG_FLAT_ALIASES.update(
+    {
+        field: (field,)
+        for field in (
+            "auto_repair_enabled",
+            "auto_repair_max_rounds",
+            "auto_repair_run_after_qc",
+            "auto_repair_max_attempts",
+        )
+    }
+)
 _PROJECT_CONFIG_FLAT_ALIASES.update(
     {f"asr_{field}": ("asr", field) for field in _ASR_DIRECT_FLAT_FIELDS}
 )
@@ -1794,6 +1838,7 @@ class QCMetadata(StrictBaseModel):
     repetition_detected: bool = False
     omission_detected: bool = False
     unsafe_or_rights_issue: bool = False
+    duration_policy: dict[str, Any] = Field(default_factory=dict)
     recommendation: QCRecommendation = "pass"
     issues: list[str] = Field(default_factory=list)
     score: float = Field(default=1.0, ge=0, le=1)

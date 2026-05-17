@@ -32,11 +32,13 @@ from asmr_dub_pipeline.pipeline.stages.rvc import run_rvc_stage
 from asmr_dub_pipeline.pipeline.stages.qc import run_qc_stage
 from asmr_dub_pipeline.pipeline.stages.experimental_tts import run_synth_experimental_tts_stage
 from asmr_dub_pipeline.pipeline.stages.regenerate import run_regenerate_needs_stage
+from asmr_dub_pipeline.pipeline.stages.auto_repair import run_auto_repair_stage
 from asmr_dub_pipeline.pipeline.stages.mix import run_mix_stage
 from asmr_dub_pipeline.pipeline.stages.export import run_export_stage
 
 from asmr_dub_pipeline.pipeline.stages import analyze as _analyze_stage
 from asmr_dub_pipeline.pipeline.stages import audio_style as _audio_style_stage
+from asmr_dub_pipeline.pipeline.stages import auto_repair as _auto_repair_stage
 from asmr_dub_pipeline.pipeline.stages import experimental_tts as _experimental_tts_stage
 from asmr_dub_pipeline.pipeline.stages import export as _export_stage
 from asmr_dub_pipeline.pipeline.stages import extract as _extract_stage
@@ -153,9 +155,13 @@ def synth_experimental_tts_step(project_dir: Path, refs_path: Path, *, backend: 
     ctx = PipelineContext.load(project_dir)
     return run_synth_experimental_tts_stage(ctx, refs_path, backend=backend, confirm_rights=confirm_rights, base_url=base_url, candidate_count=candidate_count, promote=promote, only_segment_ids=only_segment_ids)
 
-def regenerate_needs_step(project_dir: Path, *, refs_path: Path = Path('refs/refs.json'), confirm_rights: bool = False, gemma_backend: str = 'mock', tts_backend: str = 'gpt-sovits', gsv_url: str | None = None, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, use_trained_gpt: bool = False, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, qwen_model_id: str | None = None, qwen_candidate_count: int | None = None, qwen_local_files_only: bool | None = None, experimental_tts_base_url: str | None = None, experimental_tts_candidate_count: int | None = None) -> PipelineManifest:
+def regenerate_needs_step(project_dir: Path, *, refs_path: Path = Path('refs/refs.json'), confirm_rights: bool = False, gemma_backend: str = 'mock', tts_backend: str = 'gpt-sovits', gsv_url: str | None = None, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, use_trained_gpt: bool = False, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None, qwen_model_id: str | None = None, qwen_candidate_count: int | None = None, qwen_local_files_only: bool | None = None, experimental_tts_base_url: str | None = None, experimental_tts_candidate_count: int | None = None, only_segment_ids: set[str] | None = None, target_segment_ids: set[str] | None = None) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_regenerate_needs_stage(ctx, refs_path=refs_path, confirm_rights=confirm_rights, gemma_backend=gemma_backend, tts_backend=tts_backend, gsv_url=gsv_url, gpt_weights_path=gpt_weights_path, sovits_weights_path=sovits_weights_path, use_trained_gpt=use_trained_gpt, auto_gsv_server=auto_gsv_server, gsv_server_command=gsv_server_command, qwen_model_id=qwen_model_id, qwen_candidate_count=qwen_candidate_count, qwen_local_files_only=qwen_local_files_only, experimental_tts_base_url=experimental_tts_base_url, experimental_tts_candidate_count=experimental_tts_candidate_count)
+    return run_regenerate_needs_stage(ctx, refs_path=refs_path, confirm_rights=confirm_rights, gemma_backend=gemma_backend, tts_backend=tts_backend, gsv_url=gsv_url, gpt_weights_path=gpt_weights_path, sovits_weights_path=sovits_weights_path, use_trained_gpt=use_trained_gpt, auto_gsv_server=auto_gsv_server, gsv_server_command=gsv_server_command, qwen_model_id=qwen_model_id, qwen_candidate_count=qwen_candidate_count, qwen_local_files_only=qwen_local_files_only, experimental_tts_base_url=experimental_tts_base_url, experimental_tts_candidate_count=experimental_tts_candidate_count, only_segment_ids=only_segment_ids, target_segment_ids=target_segment_ids)
+
+def auto_repair_step(project_dir: Path, *, refs_path: Path = Path("refs/refs.json"), confirm_rights: bool = False, max_attempts: int | None = None, plan_only: bool = False, only_segment_ids: set[str] | None = None, gemma_backend: str = "mock", tts_backend: str = "gpt-sovits", gsv_url: str | None = None, gpt_weights_path: str | None = None, sovits_weights_path: str | None = None, use_trained_gpt: bool = False, auto_gsv_server: bool | None = None, gsv_server_command: list[str] | str | None = None) -> PipelineManifest:
+    ctx = PipelineContext.load(project_dir)
+    return run_auto_repair_stage(ctx, refs_path=refs_path, confirm_rights=confirm_rights, max_attempts=max_attempts, plan_only=plan_only, only_segment_ids=only_segment_ids, gemma_backend=gemma_backend, tts_backend=tts_backend, gsv_url=gsv_url, gpt_weights_path=gpt_weights_path, sovits_weights_path=sovits_weights_path, use_trained_gpt=use_trained_gpt, auto_gsv_server=auto_gsv_server, gsv_server_command=gsv_server_command)
 
 def mix_step(project_dir: Path, confirm_rights: bool) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
@@ -166,7 +172,7 @@ def export_step(input_path: Path, project_dir: Path, confirm_rights: bool) -> Pi
     return run_export_stage(ctx, input_path, confirm_rights)
 
 
-_COMPAT_MODULES = (_common_stage, _analyze_stage, _audio_style_stage, _experimental_tts_stage, _export_stage, _extract_stage, _gsv_few_shot_stage, _korean_script_stage, _mix_stage, _project_stage, _qc_stage, _regenerate_stage, _rvc_stage, _rvc_train_stage, _script_stage, _segment_stage, _source_separation_stage, _source_speakers_stage, _speaker_assignment_stage, _synth_gpt_sovits_stage, _synth_qwen_stage, _transcribe_stage, _translate_ko_stage, _voice_bank_cache_stage, _voice_refs_stage,)
+_COMPAT_MODULES = (_common_stage, _analyze_stage, _audio_style_stage, _auto_repair_stage, _experimental_tts_stage, _export_stage, _extract_stage, _gsv_few_shot_stage, _korean_script_stage, _mix_stage, _project_stage, _qc_stage, _regenerate_stage, _rvc_stage, _rvc_train_stage, _script_stage, _segment_stage, _source_separation_stage, _source_speakers_stage, _speaker_assignment_stage, _synth_gpt_sovits_stage, _synth_qwen_stage, _transcribe_stage, _translate_ko_stage, _voice_bank_cache_stage, _voice_refs_stage,)
 
 class _StepsCompatModule(types.ModuleType):
     def __setattr__(self, name: str, value: object) -> None:
