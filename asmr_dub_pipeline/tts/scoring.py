@@ -83,6 +83,37 @@ def _selector_weight(cfg: ProjectConfig, key: str, default: float) -> float:
     return float(value)
 
 
+def _candidate_numeric_qc(candidate: TTSCandidate) -> dict[str, Any] | None:
+    payload = candidate.payload
+    for key in ("numeric_sequence_qc", "numeric_qc"):
+        qc = payload.get(key)
+        if isinstance(qc, dict):
+            return qc
+    numeric_phrase = payload.get("numeric_phrase")
+    if isinstance(numeric_phrase, dict):
+        for key in ("numeric_sequence_qc", "numeric_qc"):
+            qc = numeric_phrase.get(key)
+            if isinstance(qc, dict):
+                return qc
+    return None
+
+
+def _is_numeric_phrase_candidate(candidate: TTSCandidate) -> bool:
+    payload = candidate.payload
+    return (
+        str(payload.get("renderer") or "").strip().lower() == "numeric_phrase"
+        or isinstance(payload.get("numeric_phrase"), dict)
+    )
+
+
+def _numeric_qc_passed(numeric_qc: dict[str, Any] | None) -> bool:
+    return (
+        isinstance(numeric_qc, dict)
+        and str(numeric_qc.get("gate") or "").strip().lower() == "pass"
+        and numeric_qc.get("exact_match") is not False
+    )
+
+
 def score_candidate(
     segment: Segment,
     candidate: TTSCandidate,
@@ -101,18 +132,19 @@ def score_candidate(
     duration = candidate.duration_sec or metrics.get("duration_sec")
     duration_ratio = (float(duration) / segment.duration) if duration and segment.duration > 0 else None
     duration_error = abs((duration_ratio or 0.0) - 1.0) if duration_ratio is not None else 1.0
+    numeric_segment = segment_has_numeric_sequence(segment)
+    numeric_qc = _candidate_numeric_qc(candidate)
+    numeric_phrase_duration_soft = _is_numeric_phrase_candidate(candidate) and _numeric_qc_passed(numeric_qc)
     tolerance = float(cfg.tts.selector.duration_tolerance)
     if duration_ratio is None:
         hard_fail_reasons.append("missing_duration")
-    elif duration_error > max(tolerance, 0.01):
+    elif duration_error > max(tolerance, 0.01) and not numeric_phrase_duration_soft:
         hard_fail_reasons.append("duration_tolerance_exceeded")
 
     preflight = candidate.payload.get("preflight") or candidate.payload.get("text_preflight")
     if isinstance(preflight, dict) and bool(preflight.get("blocked")):
         hard_fail_reasons.append("korean_preflight_blocked")
 
-    numeric_segment = segment_has_numeric_sequence(segment)
-    numeric_qc = candidate.payload.get("numeric_sequence_qc")
     if numeric_segment and cfg.tts.selector.require_numeric_sequence_qc:
         if isinstance(numeric_qc, dict):
             gate = str(numeric_qc.get("gate") or "").strip().lower()

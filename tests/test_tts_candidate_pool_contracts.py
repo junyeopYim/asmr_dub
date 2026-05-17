@@ -302,6 +302,72 @@ def test_selector_blocks_numeric_qc_failure_and_applies_qwen_bonus(tmp_path: Pat
     assert scores["qwen_numeric"].score_parts["backend_prior"] > 0
 
 
+def test_selector_accepts_numeric_phrase_numeric_qc_alias_and_soft_duration_mismatch(
+    tmp_path: Path,
+) -> None:
+    segment = _segment(
+        "seg_0001",
+        duration=3.0,
+        source_text="3 4 5 6",
+        tts_text="셋. 넷. 다섯. 여섯.",
+    )
+    numeric_phrase = _candidate(
+        tmp_path,
+        candidate_id="numeric_phrase",
+        backend="gpt_sovits",
+        duration_sec=1.0,
+        payload={
+            "renderer": "numeric_phrase",
+            "numeric_qc": {
+                "gate": "pass",
+                "expected_values": [3, 4, 5, 6],
+                "observed_values": [3, 4, 5, 6],
+            },
+        },
+    )
+
+    result = select_tts_candidate(segment, [numeric_phrase], ProjectConfig())
+
+    assert result.selected is not None
+    assert result.selected.candidate_id == "numeric_phrase"
+    score = result.scores[0]
+    assert score.blocked is False
+    assert "duration_tolerance_exceeded" not in score.hard_fail_reasons
+    assert "numeric_sequence_qc_missing" not in score.hard_fail_reasons
+    assert score.score_parts["numeric_accuracy"] == 1.0
+    assert score.score_parts["duration_fit"] < 0.5
+
+
+def test_selector_blocks_numeric_phrase_numeric_qc_alias_failure(tmp_path: Path) -> None:
+    segment = _segment(
+        "seg_0001",
+        duration=3.0,
+        source_text="10 9 8",
+        tts_text="열. 아홉. 여덟.",
+    )
+    collapsed = _candidate(
+        tmp_path,
+        candidate_id="numeric_phrase_collapsed",
+        backend="gpt_sovits",
+        duration_sec=1.0,
+        payload={
+            "renderer": "numeric_phrase",
+            "numeric_qc": {
+                "gate": "fail",
+                "expected_values": [10, 9, 8],
+                "observed_values": [19, 8],
+            },
+        },
+    )
+
+    result = select_tts_candidate(segment, [collapsed], ProjectConfig())
+
+    assert result.selected is None
+    score = result.scores[0]
+    assert score.blocked is True
+    assert "numeric_sequence_qc_failed" in score.hard_fail_reasons
+
+
 def test_selector_blocks_silent_audio(tmp_path: Path) -> None:
     segment = _segment("seg_0001", duration=1.0)
     silent_path = tmp_path / "silent.wav"
