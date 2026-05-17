@@ -10,6 +10,13 @@ from asmr_dub_pipeline.qc.repair_plan import plan_is_repairable
 
 
 _AUTO_REPAIR_TERMINAL_STATUSES = {"absorbed", "no_speech_detected", "non_speech_texture", "ok"}
+_AUTO_REPAIR_UNRESOLVED_STATUSES = {
+    "failed",
+    "needs_manual_review",
+    "needs_regeneration",
+    "quarantined",
+    "translation_blocked",
+}
 _SAFETY_ISSUE_MARKERS = ("unsafe", "rights", "consent", "copyright", "policy", "unauthorized")
 
 
@@ -154,6 +161,7 @@ def classify_auto_repair_segment(
             "reasons": ["missing_script"],
             "attempt_count": attempt_count,
             "max_attempts": effective_max_attempts,
+            "failure_signature": signature,
         }
 
     action = _plan_action(segment)
@@ -221,6 +229,9 @@ def _record_auto_repair_attempt(segment: Segment, plan: dict[str, Any]) -> dict[
     attempt_count = _auto_repair_attempt_count(segment) + 1
     record = {
         "attempt": attempt_count,
+        "round": attempt_count,
+        "segment_id": segment.id,
+        "input_status": segment.status,
         "action": plan["action"],
         "stage": plan["stage"],
         "terminal_manual": bool(plan.get("terminal_manual")),
@@ -245,6 +256,154 @@ def _record_auto_repair_attempt(segment: Segment, plan: dict[str, Any]) -> dict[
     else:
         payload.pop("terminal_reason", None)
     return payload
+
+
+def _latest_auto_repair_attempt(segment: Segment) -> dict[str, Any]:
+    payload = _analysis_dict(segment, "auto_repair")
+    attempts = payload.get("attempts")
+    if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
+        return attempts[-1]
+    return {}
+
+
+def _closure_verification_for_segment(segment: Segment) -> tuple[bool | None, list[str], list[str]]:
+    payload = _analysis_dict(segment, "auto_repair")
+    closure = payload.get("closure")
+    if not isinstance(closure, dict):
+        return None, [], []
+    executed_nodes = [str(node) for node in closure.get("executed_nodes") or []]
+    verification = closure.get("verification")
+    segment_verification = verification.get(segment.id) if isinstance(verification, dict) else None
+    if isinstance(segment_verification, dict):
+        verified = bool(segment_verification.get("ok"))
+        issues = [str(issue) for issue in segment_verification.get("issues") or []]
+        return verified, issues, executed_nodes
+    if "verified" in closure:
+        return bool(closure.get("verified")), [], executed_nodes
+    return None, [], executed_nodes
+
+
+def _failure_signature_after(segment: Segment) -> str:
+    if segment.status not in _AUTO_REPAIR_UNRESOLVED_STATUSES:
+        return segment.status
+    return _failure_signature(segment)
+
+
+def _apply_closure_verification_failures(manifest: PipelineManifest, plans: dict[str, dict[str, Any]]) -> None:
+    for segment in manifest.segments:
+        if segment.id not in plans:
+            continue
+        closure_verified, issues, _executed_nodes = _closure_verification_for_segment(segment)
+        if closure_verified is not False:
+            continue
+        payload = segment.analysis.setdefault("auto_repair", {})
+        if not isinstance(payload, dict):
+            payload = {}
+            segment.analysis["auto_repair"] = payload
+        payload["closure_verified"] = False
+        payload["closure_verification_issues"] = issues
+        payload["manual_review_reason"] = "closure_verification_failed"
+        payload["terminal_reason"] = "closure_verification_failed"
+        segment.status = "needs_manual_review"
+        message = "auto-repair closure verification failed"
+        if message not in segment.errors:
+            segment.errors.append(message)
+
+
+def _auto_repair_attempt_detail(segment: Segment, plan: dict[str, Any]) -> dict[str, Any]:
+    latest = _latest_auto_repair_attempt(segment)
+    auto_repair = _analysis_dict(segment, "auto_repair")
+    closure_verified, closure_issues, executed_nodes = _closure_verification_for_segment(segment)
+    selection = _analysis_dict(segment, "tts_selection")
+    quarantine = _analysis_dict(segment, "translate_ko_quarantine")
+    stale_filtered = selection.get("stale_candidate_filtered_count")
+    try:
+        stale_filtered_count = int(stale_filtered or 0)
+    except (TypeError, ValueError):
+        stale_filtered_count = 0
+    terminal_reason = auto_repair.get("terminal_reason")
+    manual_review_reason = auto_repair.get("manual_review_reason")
+    if closure_verified is False:
+        manual_review_reason = manual_review_reason or "closure_verification_failed"
+        terminal_reason = terminal_reason or "closure_verification_failed"
+    if bool(plan.get("terminal_manual")) and terminal_reason is None:
+        terminal_reason = ",".join(str(reason) for reason in plan.get("reasons") or [])
+    if segment.status == "needs_manual_review" and manual_review_reason is None:
+        manual_review_reason = terminal_reason or (segment.errors[-1] if segment.errors else None)
+    quarantine_reason = None
+    if quarantine:
+        quarantine_reason = quarantine.get("reason_code") or quarantine.get("kind") or quarantine.get("reason")
+    result = "repaired"
+    if closure_verified is False:
+        result = "verification_failed"
+    elif segment.status == "quarantined":
+        result = "quarantined"
+    elif segment.status in _AUTO_REPAIR_UNRESOLVED_STATUSES:
+        result = "manual_review" if segment.status == "needs_manual_review" else "unresolved"
+    detail = {
+        "round": latest.get("round") or latest.get("attempt") or plan.get("attempt_count"),
+        "segment_id": segment.id,
+        "input_status": latest.get("input_status"),
+        "output_status": segment.status,
+        "action": plan.get("action"),
+        "stage": plan.get("stage"),
+        "invalidated_from": _analysis_dict(segment, "_state").get("last_invalidation", {}).get("from_node"),
+        "executed_nodes": executed_nodes,
+        "closure_verified": closure_verified,
+        "closure_verification_issues": closure_issues,
+        "failure_signature_before": latest.get("failure_signature_before") or plan.get("failure_signature"),
+        "failure_signature_after": _failure_signature_after(segment),
+        "selected_backend": segment.tts.backend if segment.tts else None,
+        "selected_candidate_id": segment.tts.selected_candidate_id if segment.tts else None,
+        "selected_tts_generation_id": segment.tts.selected_tts_generation_id if segment.tts else None,
+        "rvc_generation_id": segment.rvc.generation_id if segment.rvc else None,
+        "qc_generation_id": segment.qc.generation_id if segment.qc else None,
+        "terminal_reason": terminal_reason,
+        "manual_review_reason": manual_review_reason,
+        "quarantine_reason": quarantine_reason,
+        "stale_candidate_filtered_count": stale_filtered_count,
+        "result": result,
+    }
+    payload = segment.analysis.setdefault("auto_repair", {})
+    if not isinstance(payload, dict):
+        payload = {}
+        segment.analysis["auto_repair"] = payload
+    attempts = payload.get("attempts")
+    if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
+        attempts[-1].update(detail)
+    payload.update(
+        {
+            "output_status": detail["output_status"],
+            "failure_signature_after": detail["failure_signature_after"],
+            "closure_verified": closure_verified,
+            "closure_verification_issues": closure_issues,
+            "manual_review_reason": manual_review_reason,
+            "terminal_reason": terminal_reason,
+            "quarantine_reason": quarantine_reason,
+            "stale_candidate_filtered_count": stale_filtered_count,
+        }
+    )
+    return detail
+
+
+def _auto_repair_observability(
+    manifest: PipelineManifest,
+    plans: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    details = [
+        _auto_repair_attempt_detail(segment, plans[segment.id])
+        for segment in manifest.segments
+        if segment.id in plans
+    ]
+    return {
+        "rounds": max((int(detail.get("round") or 0) for detail in details), default=0),
+        "per_segment_attempts": details,
+        "segment_results": {str(detail["segment_id"]): detail for detail in details},
+        "manual_review_count": sum(1 for detail in details if detail.get("output_status") == "needs_manual_review"),
+        "quarantined_count": sum(1 for detail in details if detail.get("output_status") == "quarantined"),
+        "verification_failed_count": sum(1 for detail in details if detail.get("closure_verified") is False),
+        "stale_candidate_filtered_count": sum(int(detail.get("stale_candidate_filtered_count") or 0) for detail in details),
+    }
 
 
 def _write_auto_repair_summary(project_dir: Path, manifest: PipelineManifest, summary: dict[str, Any]) -> Path:
@@ -321,8 +480,10 @@ def run_auto_repair_stage(
         summary["remaining_problematic_segment_ids"] = sorted(
             segment.id
             for segment in manifest.segments
-            if segment.status in {"failed", "needs_manual_review", "needs_regeneration"}
+            if segment.status in _AUTO_REPAIR_UNRESOLVED_STATUSES
         )
+        summary["remaining_problematic_segments"] = summary["remaining_problematic_segment_ids"]
+        summary.update(_auto_repair_observability(manifest, plans))
         _write_auto_repair_summary(project_dir, manifest, summary)
         mark_stage(
             manifest,
@@ -337,6 +498,13 @@ def run_auto_repair_stage(
             terminal_segments=sorted(terminal_segments),
             terminal_manual_count=summary["terminal_manual_count"],
             remaining_problematic_segment_ids=summary["remaining_problematic_segment_ids"],
+            remaining_problematic_segments=summary["remaining_problematic_segments"],
+            rounds=summary["rounds"],
+            manual_review_count=summary["manual_review_count"],
+            quarantined_count=summary["quarantined_count"],
+            verification_failed_count=summary["verification_failed_count"],
+            stale_candidate_filtered_count=summary["stale_candidate_filtered_count"],
+            per_segment_attempts=summary["per_segment_attempts"],
             segment_counts=_segment_counts(manifest),
         )
         save_manifest(project_dir, manifest)
@@ -449,6 +617,7 @@ def run_auto_repair_stage(
             confirm_rights=confirm_rights,
             retry_failed=True,
             force_retranslate_failed=True,
+            only_segment_ids=translation_ids,
         )
         run_korean_script_stage(ctx, confirm_rights=confirm_rights, only_segment_ids=translation_ids)
         closure = run_closure(
@@ -493,20 +662,23 @@ def run_auto_repair_stage(
         ctx.update_manifest(manifest)
 
     manifest = ctx.reload_manifest()
+    _apply_closure_verification_failures(manifest, plans)
+    observability = _auto_repair_observability(manifest, plans)
     remaining_problematic_ids = sorted(
         segment.id
         for segment in manifest.segments
-        if segment.status in {"failed", "needs_manual_review", "needs_regeneration"}
+        if segment.status in _AUTO_REPAIR_UNRESOLVED_STATUSES
     )
     repaired_ids = sorted(
-        segment.id
-        for segment in manifest.segments
-        if segment.id in plans and segment.status not in {"failed", "needs_manual_review", "needs_regeneration"}
+        str(detail["segment_id"])
+        for detail in observability["per_segment_attempts"]
+        if detail.get("result") == "repaired"
     )
     summary["completed_segment_counts"] = _segment_counts(manifest)
     summary["repaired_segments"] = repaired_ids
     summary["repaired_count"] = len(repaired_ids)
     summary["remaining_problematic_segment_ids"] = remaining_problematic_ids
+    summary["remaining_problematic_segments"] = remaining_problematic_ids
     summary["terminal_manual_count"] = len(
         [
             segment
@@ -514,6 +686,13 @@ def run_auto_repair_stage(
             if segment.id in plans and segment.status == "needs_manual_review"
         ]
     )
+    summary["manual_review_count"] = observability["manual_review_count"]
+    summary["quarantined_count"] = observability["quarantined_count"]
+    summary["verification_failed_count"] = observability["verification_failed_count"]
+    summary["stale_candidate_filtered_count"] = observability["stale_candidate_filtered_count"]
+    summary["rounds"] = observability["rounds"]
+    summary["per_segment_attempts"] = observability["per_segment_attempts"]
+    summary["segment_results"] = observability["segment_results"]
     _write_auto_repair_summary(project_dir, manifest, summary)
     mark_stage(
         manifest,
@@ -528,6 +707,13 @@ def run_auto_repair_stage(
         terminal_segments=sorted(terminal_segments),
         terminal_manual_count=summary["terminal_manual_count"],
         remaining_problematic_segment_ids=remaining_problematic_ids,
+        remaining_problematic_segments=remaining_problematic_ids,
+        rounds=summary["rounds"],
+        manual_review_count=summary["manual_review_count"],
+        quarantined_count=summary["quarantined_count"],
+        verification_failed_count=summary["verification_failed_count"],
+        stale_candidate_filtered_count=summary["stale_candidate_filtered_count"],
+        per_segment_attempts=summary["per_segment_attempts"],
         segment_counts=_segment_counts(manifest),
     )
     save_manifest(project_dir, manifest)

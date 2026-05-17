@@ -1878,6 +1878,16 @@ class TTSCandidate(StrictBaseModel):
     backend_config_hash: str | None = None
     attempt: int = Field(default=0, ge=0)
     generation_id: str | None = None
+    input_script_generation_id: str | None = None
+    input_script_hash: str | None = None
+    route_id: str | None = None
+    pool_generation_id: str | None = None
+    source_wav_sha256: str | None = None
+    wav_sha256: str | None = None
+    source_wav_size_bytes: int | None = Field(default=None, ge=0)
+    wav_size_bytes: int | None = Field(default=None, ge=0)
+    source_wav_mtime_ns: int | None = Field(default=None, ge=0)
+    wav_mtime_ns: int | None = Field(default=None, ge=0)
 
 
 class TTSMetadata(StrictBaseModel):
@@ -1904,6 +1914,9 @@ class TTSMetadata(StrictBaseModel):
     input_script_generation_id: str | None = None
     input_script_hash: str | None = None
     selected_candidate_id: str | None = None
+    selected_candidate_generation_id: str | None = None
+    source_wav_sha256: str | None = None
+    final_wav_sha256: str | None = None
     selected_metadata_path: str | None = None
     candidate_pool_manifest_path: str | None = None
     route_reason_codes: list[str] = Field(default_factory=list)

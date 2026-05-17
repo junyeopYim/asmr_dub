@@ -132,3 +132,38 @@ def test_generation_chain_verifies_selected_tts_rvc_qc_links() -> None:
 
     assert failed["ok"] is False
     assert "rvc_input_selected_tts_generation_mismatch" in failed["issues"]
+
+
+def test_strict_generation_chain_does_not_backfill_missing_ids() -> None:
+    segment = _segment()
+    assert segment.rvc is not None
+    assert segment.qc is not None
+    segment.rvc.input_selected_tts_generation_id = None
+    segment.qc.input_rvc_generation_id = None
+
+    strict = verify_segment_generation_chain(segment, strict=True, mutate=False)
+
+    assert strict["ok"] is False
+    assert "missing_rvc_input_selected_tts_generation_id" in strict["issues"]
+    assert "missing_qc_input_rvc_generation_id" in strict["issues"]
+    assert segment.rvc.input_selected_tts_generation_id is None
+    assert segment.qc.input_rvc_generation_id is None
+
+    legacy = verify_segment_generation_chain(segment, strict=False, mutate=True)
+    assert legacy["ok"] is True
+    assert segment.rvc.input_selected_tts_generation_id == segment.tts.selected_tts_generation_id
+    assert segment.qc.input_rvc_generation_id == segment.rvc.generation_id
+
+
+def test_strict_generation_chain_reports_rvc_and_qc_mismatches() -> None:
+    segment = _segment()
+    assert segment.rvc is not None
+    assert segment.qc is not None
+    segment.rvc.input_selected_tts_generation_id = "tts:stale"
+    segment.qc.input_rvc_generation_id = "rvc:stale"
+
+    result = verify_segment_generation_chain(segment, strict=True, mutate=False)
+
+    assert result["ok"] is False
+    assert "rvc_input_selected_tts_generation_mismatch" in result["issues"]
+    assert "qc_input_rvc_generation_mismatch" in result["issues"]

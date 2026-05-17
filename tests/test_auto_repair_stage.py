@@ -9,6 +9,7 @@ from asmr_dub_pipeline.schemas import (
     JapaneseScript,
     KoreanTranslation,
     PipelineManifest,
+    ProjectConfig,
     QCMetadata,
     Segment,
     SourceScript,
@@ -181,3 +182,100 @@ def test_run_auto_repair_stage_plan_only_records_retry_accounting(tmp_project_di
     assert auto_repair["attempt_count"] == 1
     assert auto_repair["terminal_manual"] is False
     assert manifest.stage_state["auto-repair"]["status"] == "planned"
+
+
+def test_auto_repair_does_not_count_unverified_closure_as_repaired(
+    tmp_project_dir,
+    monkeypatch,
+) -> None:
+    from asmr_dub_pipeline.pipeline.stages.auto_repair import run_auto_repair_stage
+
+    segment = _segment(
+        "seg_0001",
+        analysis={"ko_qc_repair_plan": {"action": "regenerate_tts", "terminal_manual": False}},
+    )
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            rights_audit=require_confirmed_rights(True, "test"),
+            project_config=ProjectConfig(rvc_backend="mock", rvc_required=False, rvc_train_required=False),
+            segments=[segment],
+        ),
+    )
+
+    def fake_closure(ctx: PipelineContext, target_nodes: list[str], segment_ids: set[str], **kwargs: object):
+        manifest = ctx.reload_manifest()
+        manifest.segments[0].status = "ok"
+        save_manifest(ctx.project_dir, manifest)
+        return {
+            "executed_nodes": target_nodes,
+            "segment_ids": sorted(segment_ids),
+            "verified": False,
+            "verification": {"seg_0001": {"ok": False, "issues": ["missing_qc_input_rvc_generation_id"]}},
+        }
+
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.stages.auto_repair.run_closure", fake_closure)
+
+    repaired = run_auto_repair_stage(PipelineContext.load(tmp_project_dir), confirm_rights=True)
+
+    assert repaired.stage_state["auto-repair"]["repaired_count"] == 0
+    assert repaired.stage_state["auto-repair"]["verification_failed_count"] == 1
+    assert repaired.segments[0].status == "needs_manual_review"
+    auto_repair = repaired.segments[0].analysis["auto_repair"]
+    assert auto_repair["closure_verified"] is False
+    assert auto_repair["manual_review_reason"] == "closure_verification_failed"
+
+
+def test_auto_repair_translation_retry_passes_only_target_segment_ids(
+    tmp_project_dir,
+    monkeypatch,
+) -> None:
+    from asmr_dub_pipeline.pipeline.stages.auto_repair import run_auto_repair_stage
+
+    target = _segment(
+        "seg_0002",
+        translation=False,
+        script=False,
+        selected_tts=None,
+        status="quarantined",
+        analysis={"translate_ko_quarantine": {"recoverable": True}},
+    )
+    untouched = _segment("seg_0001", status="ok")
+    save_manifest(
+        tmp_project_dir,
+        PipelineManifest(
+            rights_audit=require_confirmed_rights(True, "test"),
+            project_config=ProjectConfig(rvc_backend="mock", rvc_required=False, rvc_train_required=False),
+            segments=[untouched, target],
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_translate(ctx: PipelineContext, *args: object, **kwargs: object):
+        captured["only_segment_ids"] = kwargs.get("only_segment_ids")
+        manifest = ctx.reload_manifest()
+        manifest.segments[1].status = "transcribed"
+        manifest.segments[1].translation_ko = KoreanTranslation(
+            ko_literal="안녕하세요.",
+            ko_natural="안녕하세요.",
+            model="mock",
+            batch_id="batch_0001",
+        )
+        save_manifest(ctx.project_dir, manifest)
+        return manifest
+
+    def fake_korean_script(ctx: PipelineContext, *args: object, **kwargs: object):
+        captured["korean_script_only_segment_ids"] = kwargs.get("only_segment_ids")
+        return ctx.reload_manifest()
+
+    def fake_closure(ctx: PipelineContext, target_nodes: list[str], segment_ids: set[str], **kwargs: object):
+        return {"executed_nodes": target_nodes, "segment_ids": sorted(segment_ids), "verified": True, "verification": {}}
+
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.stages.translate_ko.run_translate_ko_stage", fake_translate)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.stages.korean_script.run_korean_script_stage", fake_korean_script)
+    monkeypatch.setattr("asmr_dub_pipeline.pipeline.stages.auto_repair.run_closure", fake_closure)
+
+    run_auto_repair_stage(PipelineContext.load(tmp_project_dir), confirm_rights=True)
+
+    assert captured["only_segment_ids"] == {"seg_0002"}
+    assert captured["korean_script_only_segment_ids"] == {"seg_0002"}

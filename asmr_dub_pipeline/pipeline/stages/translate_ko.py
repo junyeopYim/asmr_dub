@@ -32,16 +32,45 @@ def _translation_refusal_reason(error: object) -> str | None:
     return None
 
 
-def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None = None, confirm_rights: bool = False, force_retranslate: bool = False, retry_failed: bool = False, repair_only: bool = False, force_retranslate_failed: bool = False) -> PipelineManifest:
+def run_translate_ko_stage(
+    ctx: PipelineContext,
+    gemma_text_backend: str | None = None,
+    confirm_rights: bool = False,
+    force_retranslate: bool = False,
+    retry_failed: bool = False,
+    repair_only: bool = False,
+    force_retranslate_failed: bool = False,
+    *,
+    only_segment_ids: set[str] | None = None,
+) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
     _load_config_into_manifest(project_dir, manifest)
     cfg = manifest.project_config
     backend_kind = (gemma_text_backend or "llama_server").replace("-", "_")
     total = len(manifest.segments)
-    _log_stage_start("translate-ko", f"backend={backend_kind}, segments={total}")
+    target_id_set = set(only_segment_ids) if only_segment_ids is not None else None
+    target_segments = [
+        segment for segment in manifest.segments if target_id_set is None or segment.id in target_id_set
+    ]
+    target_segment_ids = [segment.id for segment in target_segments]
+    skipped_non_target_segments = [
+        segment.id for segment in manifest.segments if target_id_set is not None and segment.id not in target_id_set
+    ]
+    processed_by_only_segment_ids = target_id_set is not None
+    _log_stage_start(
+        "translate-ko",
+        f"backend={backend_kind}, segments={total}, targets={len(target_segments)}",
+    )
     _require_audio_stage_rights(
-        manifest, "translate-ko", confirm_rights, metadata={"backend": backend_kind}
+        manifest,
+        "translate-ko",
+        confirm_rights,
+        metadata={
+            "backend": backend_kind,
+            "processed_by_only_segment_ids": processed_by_only_segment_ids,
+            "target_segment_ids": target_segment_ids,
+        },
     )
     if manifest.stage_state.get("transcribe", {}).get("status") != "completed":
         raise ValueError("translate-ko requires a completed transcribe stage.")
@@ -148,7 +177,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             "values": values,
         }
 
-    for segment in manifest.segments:
+    for segment in target_segments:
         if segment.status in NO_SPEECH_STATUSES:
             no_speech_detected += 1
             rows.append(
@@ -180,12 +209,18 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 quarantine = {
                     "segment_id": segment.id,
                     "kind": "safety_critical_source_policy",
+                    "reason_code": "safety_critical_source_policy",
                     "recoverable": False,
                     "terminal": True,
                     "reason": "tts_safety_minor_sexualized_content",
                     "batch_id": "source_safety_preflight",
                     "next_action": "manual_review",
                     "attempt_count": 0,
+                    "attempt_mode": "source_safety_preflight",
+                    "processed_by_only_segment_ids": processed_by_only_segment_ids,
+                    "target_segment_ids": target_segment_ids,
+                    "final_status": "quarantined",
+                    "downstream_invalidated_from": "translate_ko",
                 }
                 segment.analysis["translate_ko_quarantine"] = quarantine
                 quarantine_rows.append(quarantine)
@@ -466,10 +501,17 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
     ) -> None:
         payload = {
             "attempt_type": attempt_type,
+            "attempt_mode": attempt_type,
             "batch_id": batch_id,
             "segment_ids": [segment.id for segment in segments],
             "accepted": accepted,
             "reason": reason,
+            "reason_code": reason,
+            "recoverable": accepted,
+            "terminal": not accepted,
+            "final_status": "accepted" if accepted else "failed",
+            "processed_by_only_segment_ids": processed_by_only_segment_ids,
+            "target_segment_ids": target_segment_ids,
             "returned_segment_ids": returned_segment_ids or [],
         }
         with diagnostics_lock:
@@ -496,10 +538,16 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         record = {
             "attempt": attempt,
             "mode": mode,
+            "attempt_mode": mode,
             "status": status,
             "reason_code": reason_code,
+            "recoverable": status == "failed" and reason_code != "safety_critical_source_policy",
+            "terminal": status != "success" and reason_code == "safety_critical_source_policy",
+            "final_status": status,
             "batch_id": batch_id,
             "parse_status": "parsed" if status == "success" else "failed",
+            "processed_by_only_segment_ids": processed_by_only_segment_ids,
+            "target_segment_ids": target_segment_ids,
         }
         if error:
             record["error"] = error
@@ -534,6 +582,7 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         quarantine = {
             "segment_id": segment.id,
             "kind": reason_code,
+            "reason_code": reason_code,
             "recoverable": recoverable,
             "terminal": not recoverable,
             "reason": error,
@@ -544,6 +593,11 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 if isinstance(segment.analysis.get("translation_safety"), dict)
                 else []
             ),
+            "attempt_mode": "translation_safety_retry_exhausted",
+            "processed_by_only_segment_ids": processed_by_only_segment_ids,
+            "target_segment_ids": target_segment_ids,
+            "final_status": "quarantined",
+            "downstream_invalidated_from": "translate_ko",
         }
         segment.analysis["translate_ko_quarantine"] = quarantine
         quarantine_rows.append(quarantine)
@@ -601,6 +655,9 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
                 "force_retranslate": force_retranslate,
                 "force_retranslate_failed": force_retranslate_failed,
                 "severe_backcheck_promotes_manual_review": True,
+                "processed_by_only_segment_ids": processed_by_only_segment_ids,
+                "target_segment_ids": target_segment_ids,
+                "skipped_non_target_segments": skipped_non_target_segments,
             },
         }
         server_metadata = build_server_metadata()
@@ -637,6 +694,10 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             "force_retranslate_failed": force_retranslate_failed,
             "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
             "partial": True,
+            "processed_by_only_segment_ids": processed_by_only_segment_ids,
+            "target_segment_ids": target_segment_ids,
+            "processed_target_segments": target_segment_ids,
+            "skipped_non_target_segments": skipped_non_target_segments,
         }
         server_metadata = build_server_metadata()
         if server_metadata is not None:
@@ -679,6 +740,10 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             force_retranslate_failed=force_retranslate_failed,
             base_urls=translation_base_urls if backend_kind == "llama_server" else [],
             partial=True,
+            processed_by_only_segment_ids=processed_by_only_segment_ids,
+            target_segment_ids=target_segment_ids,
+            processed_target_segments=target_segment_ids,
+            skipped_non_target_segments=skipped_non_target_segments,
             error=str(exc),
             server=server_metadata,
         )
@@ -1062,33 +1127,33 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             server_manager.stop()
 
     digit_pronunciation_postprocessed = _apply_korean_digit_pronunciation_postprocess(
-        manifest.segments,
+        target_segments,
         repaired_translation_bundles,
         quality_counters,
     )
     ordinal_postprocessed = _apply_korean_ordinal_postprocess(
-        manifest.segments,
+        target_segments,
         repaired_translation_bundles,
         quality_counters,
     )
     asr_homophone_postprocessed = _apply_korean_asr_homophone_postprocess(
-        manifest.segments,
+        target_segments,
         repaired_translation_bundles,
         quality_counters,
     )
     _apply_korean_onomatopoeia_postprocess(
-        manifest.segments,
+        target_segments,
         repaired_translation_bundles,
         quality_counters,
     )
     _apply_korean_fluency_postprocess(
-        manifest.segments,
+        target_segments,
         repaired_translation_bundles,
         quality_counters,
     )
-    colloquialized = _apply_korean_colloquial_postprocess(manifest.segments)
-    numeric_counting_postprocessed += _apply_korean_numeric_counting_postprocess(manifest.segments)
-    asr_backcheck_items = _apply_translation_asr_backcheck(manifest.segments, cfg)
+    colloquialized = _apply_korean_colloquial_postprocess(target_segments)
+    numeric_counting_postprocessed += _apply_korean_numeric_counting_postprocess(target_segments)
+    asr_backcheck_items = _apply_translation_asr_backcheck(target_segments, cfg)
     asr_backcheck_count = len(asr_backcheck_items)
     _refresh_translation_rows(rows, manifest.segments)
     _attach_asr_backcheck_to_translation_rows(rows, asr_backcheck_items)
@@ -1111,6 +1176,8 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
             "segments": quarantine_rows,
             "quarantine_count": quarantined,
             "policy": cfg.translate_ko_safety_block_policy,
+            "processed_by_only_segment_ids": processed_by_only_segment_ids,
+            "target_segment_ids": target_segment_ids,
         },
     )
     _write_jsonl_atomic(jsonl_path, rows)
@@ -1152,6 +1219,10 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         "force_retranslate_failed": force_retranslate_failed,
         "base_urls": translation_base_urls if backend_kind == "llama_server" else [],
         "quality_counters": dict(sorted(quality_counters.items())),
+        "processed_by_only_segment_ids": processed_by_only_segment_ids,
+        "target_segment_ids": target_segment_ids,
+        "processed_target_segments": target_segment_ids,
+        "skipped_non_target_segments": skipped_non_target_segments,
     }
     write_json_atomic(summary_path, summary)
     write_json_atomic(diagnostics_path, build_diagnostics_payload(partial=False))
@@ -1195,6 +1266,10 @@ def run_translate_ko_stage(ctx: PipelineContext, gemma_text_backend: str | None 
         retry_failed=retry_failed,
         repair_only=repair_only,
         force_retranslate_failed=force_retranslate_failed,
+        processed_by_only_segment_ids=processed_by_only_segment_ids,
+        target_segment_ids=target_segment_ids,
+        processed_target_segments=target_segment_ids,
+        skipped_non_target_segments=skipped_non_target_segments,
         server=server_metadata,
     )
     save_manifest(project_dir, manifest)

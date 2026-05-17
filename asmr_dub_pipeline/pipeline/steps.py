@@ -98,9 +98,28 @@ def script_step(project_dir: Path, backend_kind: str, confirm_rights: bool = Fal
     ctx = PipelineContext.load(project_dir)
     return run_script_stage(ctx, backend_kind, confirm_rights)
 
-def translate_ko_step(project_dir: Path, gemma_text_backend: str | None = None, confirm_rights: bool = False, force_retranslate: bool = False, retry_failed: bool = False, repair_only: bool = False, force_retranslate_failed: bool = False) -> PipelineManifest:
+def translate_ko_step(
+    project_dir: Path,
+    gemma_text_backend: str | None = None,
+    confirm_rights: bool = False,
+    force_retranslate: bool = False,
+    retry_failed: bool = False,
+    repair_only: bool = False,
+    force_retranslate_failed: bool = False,
+    *,
+    only_segment_ids: set[str] | None = None,
+) -> PipelineManifest:
     ctx = PipelineContext.load(project_dir)
-    return run_translate_ko_stage(ctx, gemma_text_backend, confirm_rights, force_retranslate, retry_failed, repair_only, force_retranslate_failed)
+    return run_translate_ko_stage(
+        ctx,
+        gemma_text_backend,
+        confirm_rights,
+        force_retranslate,
+        retry_failed,
+        repair_only,
+        force_retranslate_failed,
+        only_segment_ids=only_segment_ids,
+    )
 
 def korean_script_step(
     project_dir: Path,

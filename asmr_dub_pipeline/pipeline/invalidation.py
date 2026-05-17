@@ -39,7 +39,7 @@ STAGE_BY_NODE = {
 }
 
 ARTIFACTS_BY_NODE = {
-    "tts.candidate_pool": ("qwen_tts", "fish_tts", "cosyvoice_tts"),
+    "tts.candidate_pool": ("tts_candidate_pool", "qwen_tts", "fish_tts", "cosyvoice_tts"),
     "tts.select": ("tts_selected",),
     "rvc": ("rvc_manifest", "rvc"),
     "qc": ("qc",),
@@ -89,6 +89,12 @@ def invalidate_segment(
         segment.qc = None
     if "mix" in nodes or "export" in nodes:
         segment.mix = {}
+    if "tts.candidate_pool" in nodes:
+        segment.analysis.pop("tts_route", None)
+        segment.analysis.pop("tts_candidate_pool", None)
+        segment.analysis.pop("tts_candidate_pool_clear", None)
+    if "tts.select" in nodes:
+        segment.analysis.pop("tts_selection", None)
     if segment.status in {"ok", "synthesized", "rvc_converted", "needs_regeneration", "failed", "needs_manual_review"}:
         if normalize_node(from_node) in {"korean_script", "tts.candidate_pool"}:
             segment.status = "scripted" if segment.script is not None else "transcribed"

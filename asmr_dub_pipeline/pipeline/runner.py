@@ -71,7 +71,7 @@ def run_closure(
         executed_nodes.append("qc")
     manifest = ctx.reload_manifest()
     verification = {
-        segment.id: verify_segment_generation_chain(segment)
+        segment.id: verify_segment_generation_chain(segment, strict=True, mutate=False)
         for segment in manifest.segments
         if segment.id in segment_ids
     }

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from asmr_dub_pipeline.pipeline.artifacts import (
+    file_fingerprint,
     make_generation_id,
     make_script_generation_id,
     make_selected_tts_generation_id,
@@ -93,6 +94,16 @@ def _from_legacy_candidate(
         attempt=candidate.attempt,
         payload=payload,
         generation_id=generation_id,
+        input_script_generation_id=make_script_generation_id(segment.script),
+        input_script_hash=stable_hash(segment.script or {}),
+        route_id=candidate.route_id,
+        pool_generation_id=candidate.pool_generation_id,
+        source_wav_sha256=candidate.source_wav_sha256 or candidate.wav_sha256,
+        wav_sha256=candidate.wav_sha256 or candidate.source_wav_sha256,
+        source_wav_size_bytes=candidate.source_wav_size_bytes or candidate.wav_size_bytes,
+        wav_size_bytes=candidate.wav_size_bytes or candidate.source_wav_size_bytes,
+        source_wav_mtime_ns=candidate.source_wav_mtime_ns or candidate.wav_mtime_ns,
+        wav_mtime_ns=candidate.wav_mtime_ns or candidate.source_wav_mtime_ns,
     )
 
 
@@ -139,6 +150,32 @@ def collect_segment_candidates(segment: Segment) -> list[TTSCandidate]:
     return list(deduped.values())
 
 
+def _annotate_candidate_identity(
+    candidate: TTSCandidate,
+    *,
+    segment: Segment,
+    route: TTSRoute | None,
+    pool_generation_id: str | None,
+) -> TTSCandidate:
+    script_generation_id = make_script_generation_id(segment.script)
+    script_hash = stable_hash(segment.script or {})
+    fingerprint = file_fingerprint(candidate.wav_path)
+    return candidate.model_copy(
+        update={
+            "input_script_generation_id": script_generation_id,
+            "input_script_hash": script_hash,
+            "route_id": route.route_id if route else candidate.route_id,
+            "pool_generation_id": pool_generation_id or candidate.pool_generation_id,
+            "source_wav_sha256": fingerprint["sha256"] or candidate.source_wav_sha256,
+            "wav_sha256": fingerprint["sha256"] or candidate.wav_sha256,
+            "source_wav_size_bytes": fingerprint["size_bytes"] or candidate.source_wav_size_bytes,
+            "wav_size_bytes": fingerprint["size_bytes"] or candidate.wav_size_bytes,
+            "source_wav_mtime_ns": fingerprint["mtime_ns"] or candidate.source_wav_mtime_ns,
+            "wav_mtime_ns": fingerprint["mtime_ns"] or candidate.wav_mtime_ns,
+        }
+    )
+
+
 def _route_targets(
     manifest: PipelineManifest,
     segment_ids: set[str] | None,
@@ -183,6 +220,16 @@ def run_tts_candidate_pool_stage(
         mark_stage(manifest, "tts.candidate_pool", "skipped", target_segments=[])
         save_manifest(project_dir, manifest)
         return ctx.update_manifest(manifest)
+    store = CandidateStore(project_dir)
+    clear_results: dict[str, dict[str, Any]] = {}
+    for segment_id in sorted(routes):
+        clear_result = store.clear_segment(segment_id)
+        clear_result["clear_reason"] = "new_candidate_pool_run"
+        clear_results[segment_id] = clear_result
+    for segment in manifest.segments:
+        clear_result = clear_results.get(segment.id)
+        if clear_result is not None:
+            segment.analysis["tts_candidate_pool_clear"] = clear_result
     save_manifest(project_dir, manifest)
     gsv_ids = {segment_id for segment_id, route in routes.items() if "gpt_sovits" in route.backends or "mock" in route.backends}
     qwen_ids = {segment_id for segment_id, route in routes.items() if "qwen_tts" in route.backends}
@@ -214,7 +261,6 @@ def run_tts_candidate_pool_stage(
         )
     manifest = ctx.reload_manifest()
     _load_config_into_manifest(project_dir, manifest)
-    store = CandidateStore(project_dir)
     pool_manifest: dict[str, Any] = {"segments": [], "requested_backend": requested_backend}
     saved_count = 0
     for segment in manifest.segments:
@@ -222,9 +268,6 @@ def run_tts_candidate_pool_stage(
         if route is None:
             continue
         candidates = collect_segment_candidates(segment)
-        for candidate in candidates:
-            store.save_candidate(candidate)
-        saved_count += len(candidates)
         pool_generation_id = make_generation_id(
             "tts-pool",
             {
@@ -233,12 +276,28 @@ def run_tts_candidate_pool_stage(
                 "candidate_generation_ids": [candidate.generation_id for candidate in candidates],
             },
         )
+        candidates = [
+            _annotate_candidate_identity(
+                candidate,
+                segment=segment,
+                route=route,
+                pool_generation_id=pool_generation_id,
+            )
+            for candidate in candidates
+        ]
+        for candidate in candidates:
+            store.save_candidate(candidate)
+        saved_count += len(candidates)
+        clear_result = clear_results.get(segment.id, {})
         segment.analysis["tts_candidate_pool"] = {
             "status": "completed" if candidates else "empty",
             "route": route.model_dump(mode="json"),
             "candidate_count": len(candidates),
             "candidate_ids": [candidate.candidate_id for candidate in candidates],
             "generation_id": pool_generation_id,
+            "cleared_candidate_metadata": bool(clear_result.get("cleared_candidate_metadata")),
+            "cleared_selected_metadata": bool(clear_result.get("cleared_selected_metadata")),
+            "clear_reason": clear_result.get("clear_reason"),
         }
         pool_manifest["segments"].append(segment.analysis["tts_candidate_pool"])
     out_path = project_dir / "work" / "tts" / "candidate_pool_manifest.json"
@@ -291,6 +350,16 @@ def _legacy_candidates_from_common(
                 backend_config_hash=candidate.backend_config_hash,
                 attempt=candidate.attempt,
                 generation_id=candidate.generation_id,
+                input_script_generation_id=candidate.input_script_generation_id,
+                input_script_hash=candidate.input_script_hash,
+                route_id=candidate.route_id,
+                pool_generation_id=candidate.pool_generation_id,
+                source_wav_sha256=candidate.source_wav_sha256,
+                wav_sha256=candidate.wav_sha256,
+                source_wav_size_bytes=candidate.source_wav_size_bytes,
+                wav_size_bytes=candidate.wav_size_bytes,
+                source_wav_mtime_ns=candidate.source_wav_mtime_ns,
+                wav_mtime_ns=candidate.wav_mtime_ns,
             )
         )
     return legacy
@@ -313,19 +382,94 @@ def run_tts_select_stage(
             continue
         route_payload = segment.analysis.get("tts_route")
         route = TTSRoute.model_validate(route_payload) if isinstance(route_payload, dict) else None
-        candidates = store.load_segment_candidates(segment.id)
+        script_generation_id = make_script_generation_id(segment.script)
+        script_hash = stable_hash(segment.script or {})
+        pool_payload = segment.analysis.get("tts_candidate_pool")
+        pool_generation_id = None
+        if isinstance(pool_payload, dict):
+            pool_generation_id = str(pool_payload.get("generation_id") or "") or None
+        all_stored_candidates = store.load_segment_candidates(
+            segment.id,
+            expected_script_generation_id=script_generation_id,
+            expected_script_hash=script_hash,
+            expected_route_id=route.route_id if route else None,
+            expected_pool_generation_id=pool_generation_id,
+            discard_stale=False,
+        )
+        stale_candidates = [
+            candidate
+            for candidate in all_stored_candidates
+            if isinstance(candidate.payload.get("stale_filter"), dict)
+            and candidate.payload["stale_filter"].get("is_stale")
+        ]
+        stale_reasons: dict[str, list[str]] = {
+            candidate.candidate_id: list(candidate.payload["stale_filter"].get("reasons") or [])
+            for candidate in stale_candidates
+            if isinstance(candidate.payload.get("stale_filter"), dict)
+        }
+        candidates = store.load_segment_candidates(
+            segment.id,
+            expected_script_generation_id=script_generation_id,
+            expected_script_hash=script_hash,
+            expected_route_id=route.route_id if route else None,
+            expected_pool_generation_id=pool_generation_id,
+            discard_stale=True,
+        )
+        legacy_fallback_used = False
         if not candidates:
             candidates = collect_segment_candidates(segment)
+            if candidates:
+                legacy_fallback_used = True
+                candidates = [
+                    _annotate_candidate_identity(
+                        candidate,
+                        segment=segment,
+                        route=route,
+                        pool_generation_id=pool_generation_id,
+                    )
+                    for candidate in candidates
+                ]
             for candidate in candidates:
                 store.save_candidate(candidate)
+        if not candidates and stale_candidates:
+            store.clear_selected(segment.id)
+            segment.tts = None
+            segment.rvc = None
+            segment.qc = None
+            segment.mix = {}
+            segment.status = "needs_manual_review"
+            segment.analysis["tts_selection"] = {
+                "status": "manual_review",
+                "terminal_reason": "all_candidates_stale",
+                "scores": [],
+                "stale_candidate_filtered_count": len(stale_candidates),
+                "stale_candidate_filter_reasons": stale_reasons,
+                "expected_script_generation_id": script_generation_id,
+                "expected_script_hash": script_hash,
+                "expected_route_id": route.route_id if route else None,
+                "expected_pool_generation_id": pool_generation_id,
+            }
+            hard_failed_segments.append(segment.id)
+            continue
         result = select_tts_candidate(segment, candidates, manifest.project_config, route=route)
         selected = result.selected
         if selected is None:
+            store.clear_selected(segment.id)
+            segment.tts = None
+            segment.rvc = None
+            segment.qc = None
+            segment.mix = {}
             segment.status = "needs_manual_review"
             segment.analysis["tts_selection"] = {
                 "status": "manual_review",
                 "terminal_reason": result.terminal_reason,
                 "scores": [score.model_dump(mode="json") for score in result.scores],
+                "stale_candidate_filtered_count": len(stale_candidates),
+                "stale_candidate_filter_reasons": stale_reasons,
+                "expected_script_generation_id": script_generation_id,
+                "expected_script_hash": script_hash,
+                "expected_route_id": route.route_id if route else None,
+                "expected_pool_generation_id": pool_generation_id,
             }
             hard_failed_segments.append(segment.id)
             continue
@@ -335,17 +479,21 @@ def run_tts_select_stage(
             final_path.parent.mkdir(parents=True, exist_ok=True)
             if source_path.resolve() != final_path.resolve():
                 shutil.copy2(source_path, final_path)
-        script_generation_id = make_script_generation_id(segment.script)
+        source_fingerprint = file_fingerprint(source_path)
+        final_fingerprint = file_fingerprint(final_path)
         selected_generation_id = make_selected_tts_generation_id(
             segment_id=segment.id,
             candidate_id=selected.candidate_id,
             wav_path=str(final_path),
             input_script_generation_id=script_generation_id,
+            candidate_generation_id=selected.generation_id,
+            backend=selected.backend,
+            source_wav_path=selected.wav_path,
+            source_wav_sha256=source_fingerprint["sha256"],
+            final_wav_path=str(final_path),
+            final_wav_sha256=final_fingerprint["sha256"],
+            input_script_hash=script_hash,
         )
-        pool_generation_id = None
-        pool_payload = segment.analysis.get("tts_candidate_pool")
-        if isinstance(pool_payload, dict):
-            pool_generation_id = str(pool_payload.get("generation_id") or "")
         scores_by_id = {score.candidate_id: score for score in result.scores}
         selected_score = scores_by_id.get(selected.candidate_id)
         selection_payload = {
@@ -354,9 +502,19 @@ def run_tts_select_stage(
             "backend": selected.backend,
             "wav_path": str(final_path),
             "source_wav_path": selected.wav_path,
+            "selected_candidate_generation_id": selected.generation_id,
             "selected_tts_generation_id": selected_generation_id,
             "input_script_generation_id": script_generation_id,
-            "script_hash": stable_hash(segment.script or {}),
+            "input_script_hash": script_hash,
+            "script_hash": script_hash,
+            "route_id": route.route_id if route else None,
+            "pool_generation_id": pool_generation_id,
+            "source_wav_sha256": source_fingerprint["sha256"],
+            "source_wav_size_bytes": source_fingerprint["size_bytes"],
+            "source_wav_mtime_ns": source_fingerprint["mtime_ns"],
+            "final_wav_sha256": final_fingerprint["sha256"],
+            "final_wav_size_bytes": final_fingerprint["size_bytes"],
+            "final_wav_mtime_ns": final_fingerprint["mtime_ns"],
             "score": selected_score.score if selected_score else None,
             "score_parts": selected_score.score_parts if selected_score else {},
             "scores": [score.model_dump(mode="json") for score in result.scores],
@@ -366,6 +524,9 @@ def run_tts_select_stage(
                 if score.hard_fail_reasons
             },
             "route_reason_codes": result.route_reason_codes,
+            "legacy_candidate_fallback": legacy_fallback_used,
+            "stale_candidate_filtered_count": len(stale_candidates),
+            "stale_candidate_filter_reasons": stale_reasons,
         }
         selected_path = store.save_selected(segment.id, selection_payload)
         previous_generation_id = segment.tts.selected_tts_generation_id if segment.tts else None
@@ -386,8 +547,11 @@ def run_tts_select_stage(
             tts_pool_generation_id=pool_generation_id,
             selected_tts_generation_id=selected_generation_id,
             input_script_generation_id=script_generation_id,
-            input_script_hash=stable_hash(segment.script or {}),
+            input_script_hash=script_hash,
             route_reason_codes=result.route_reason_codes,
+            selected_candidate_generation_id=selected.generation_id,
+            source_wav_sha256=source_fingerprint["sha256"],
+            final_wav_sha256=final_fingerprint["sha256"],
             retry_summary={
                 "candidate_pool_selector": selection_payload,
                 "selected_generation_changed": previous_generation_id != selected_generation_id,
