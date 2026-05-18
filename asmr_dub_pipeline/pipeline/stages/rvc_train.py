@@ -138,9 +138,15 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
                 "effective_train_epochs": epoch_decision["effective_epochs"],
                 "dataset_quality_grade": dataset_summary.get("quality_grade"),
                 "low_data_mode": dataset_summary.get("low_data_mode", False),
+                "effective_epoch_reason": epoch_decision.get("effective_epoch_reason"),
+                "low_data_scale": epoch_decision.get("low_data_scale"),
+                "base_recommended_epoch_count": epoch_decision.get("base_recommended_epoch_count"),
+                "recommended_epoch_count_low_data": epoch_decision.get("recommended_epoch_count_low_data"),
+                "final_train_epochs": epoch_decision.get("final_train_epochs", epoch_decision["effective_epochs"]),
                 "low_data_warning": dataset_summary.get("low_data_warning"),
                 "target_clean_sec": dataset_summary.get("target_clean_sec"),
                 "absolute_min_clean_sec": dataset_summary.get("absolute_min_clean_sec"),
+                "official_recommended_min_sec": dataset_summary.get("official_recommended_min_sec"),
                 "model_path": str(result.model_path),
                 "index_path": str(result.index_path) if result.index_path else None,
                 "command": result.command,
@@ -188,6 +194,12 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
             low_data_modes={
                 speaker_id: result["dataset_summary"].get("low_data_mode", False)
                 for speaker_id, result in speaker_results.items()
+            },
+            effective_epoch_reasons={
+                speaker_id: result["effective_epoch_reason"] for speaker_id, result in speaker_results.items()
+            },
+            low_data_scales={
+                speaker_id: result["low_data_scale"] for speaker_id, result in speaker_results.items()
             },
         )
         save_manifest(project_dir, manifest)
@@ -249,6 +261,12 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
             "epoch_decision": epoch_decision,
             "configured_train_epochs": epoch_decision["configured_epochs"],
             "effective_train_epochs": epoch_decision["effective_epochs"],
+            "effective_epoch_reason": epoch_decision.get("effective_epoch_reason"),
+            "low_data_scale": epoch_decision.get("low_data_scale"),
+            "base_recommended_epoch_count": epoch_decision.get("base_recommended_epoch_count"),
+            "recommended_epoch_count_low_data": epoch_decision.get("recommended_epoch_count_low_data"),
+            "configured_train_epochs": epoch_decision.get("configured_train_epochs", epoch_decision["configured_epochs"]),
+            "final_train_epochs": epoch_decision.get("final_train_epochs", epoch_decision["effective_epochs"]),
             "dataset_quality_grade": dataset_summary.get("quality_grade"),
             "low_data_mode": dataset_summary.get("low_data_mode", False),
             "low_data_warning": dataset_summary.get("low_data_warning"),
@@ -287,6 +305,8 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
         base_recommended_epoch_count=epoch_decision["base_recommended_epoch_count"],
         recommended_epoch_count_low_data=epoch_decision.get("recommended_epoch_count_low_data"),
         effective_epoch_reason=epoch_decision.get("effective_epoch_reason"),
+        low_data_scale=epoch_decision.get("low_data_scale"),
+        final_train_epochs=epoch_decision.get("final_train_epochs", epoch_decision["effective_epochs"]),
         low_data_mode=dataset_summary.get("low_data_mode", False),
         low_data_warning=dataset_summary.get("low_data_warning"),
         target_clean_sec=dataset_summary.get("target_clean_sec"),

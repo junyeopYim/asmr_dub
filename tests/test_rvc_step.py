@@ -505,6 +505,8 @@ def test_low_data_soft_asmr_texture_tag_can_be_accepted_with_penalty(
         "manual_training_exclude_soft_allowed:whisper": 1,
         "voice_training_soft_effect_tag:whisper": 1,
     }
+    assert summary["training_selection_pass"] == "low_data_relaxed"
+    assert summary["soft_asmr_relaxation_applied"] is True
 
 
 def test_real_rvc_train_dataset_rejects_overly_fast_source_speech(tmp_project_dir: Path) -> None:

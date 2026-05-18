@@ -8368,6 +8368,7 @@ def _rvc_training_speaker_ids(project_dir: Path, manifest: PipelineManifest, bac
                 min_quality_score=cfg.rvc_train_min_quality_score,
                 require_source_script=False,
                 require_speaker_id=True,
+                soft_asmr_policy="strict",
             )
             if (
                 check.accepted
@@ -9492,10 +9493,13 @@ def _rvc_train_effective_epoch_config(
         "quality_preset": cfg.rvc_train_quality_preset,
         "quality_grade": dataset_summary.get("quality_grade"),
         "configured_epochs": configured_epochs,
+        "configured_train_epochs": configured_epochs,
         "base_recommended_epoch_count": base_recommended_epochs,
         "recommended_epoch_count": recommended_epochs,
         "recommended_epoch_count_low_data": recommended_low_data,
         "effective_epochs": effective_epochs,
+        "effective_train_epochs": effective_epochs,
+        "final_train_epochs": effective_epochs,
         "auto_epoch_min": auto_min,
         "auto_epoch_max": auto_max,
         "low_data_mode": low_data_mode,
@@ -9506,6 +9510,11 @@ def _rvc_train_effective_epoch_config(
     }
     dataset_summary["effective_train_epochs"] = effective_epochs
     dataset_summary["effective_epoch_reason"] = effective_epoch_reason
+    dataset_summary["low_data_scale"] = round(low_data_scale, 6) if low_data_scale is not None else None
+    dataset_summary["base_recommended_epoch_count"] = base_recommended_epochs
+    dataset_summary["recommended_epoch_count_low_data"] = recommended_low_data
+    dataset_summary["configured_train_epochs"] = configured_epochs
+    dataset_summary["final_train_epochs"] = effective_epochs
     if effective_epochs == configured_epochs:
         return cfg, decision
     payload = cfg.model_dump(mode="json")
@@ -9581,28 +9590,18 @@ def _trim_rvc_training_rows_to_target(
     return ordered_kept, rejected
 
 
-def _rvc_train_dataset(
+def _rvc_collect_training_rows_for_pass(
     project_dir: Path,
     manifest: PipelineManifest,
-    force: bool,
     *,
-    speaker_id: str | None = None,
-    dataset_dir: Path | None = None,
-) -> tuple[Path, list[dict[str, Any]]]:
-    dataset_dir = dataset_dir or project_dir / "work" / "rvc_train" / "dataset"
-    if force and dataset_dir.exists():
-        shutil.rmtree(dataset_dir)
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    augment_dir = dataset_dir.parent / "augmented"
-    if force and augment_dir.exists():
-        shutil.rmtree(augment_dir)
-    stale_manifest = dataset_dir / "dataset_manifest.json"
-    if stale_manifest.exists():
-        stale_manifest.unlink()
+    dataset_dir: Path,
+    strict_training_filter: bool,
+    speaker_id: str | None,
+    soft_asmr_policy: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     rejected_rows: list[dict[str, Any]] = []
     cfg = manifest.project_config
-    strict_training_filter = cfg.rvc_train_backend == "command"
     for segment in manifest.segments:
         if speaker_id is not None and segment.speaker_id != speaker_id:
             continue
@@ -9624,6 +9623,7 @@ def _rvc_train_dataset(
                 min_quality_score=cfg.rvc_train_min_quality_score,
                 require_source_script=False,
                 require_speaker_id=True,
+                soft_asmr_policy=soft_asmr_policy,  # type: ignore[arg-type]
             )
             row = {
                 "segment_id": segment.id,
@@ -9676,11 +9676,204 @@ def _rvc_train_dataset(
         if not source_path.exists():
             raise RVCCommandError(f"train-rvc source segment audio is missing: {source_path}")
         rows.append(row)
-    rows, duplicate_rows = _dedupe_rvc_training_rows(rows)
-    rejected_rows.extend(duplicate_rows)
-    rows, target_trimmed_rows = _trim_rvc_training_rows_to_target(rows, cfg)
-    rejected_rows.extend(target_trimmed_rows)
-    summary = _rvc_training_dataset_summary(rows, cfg, rejected_rows)
+    return rows, rejected_rows
+
+
+def _rvc_prepare_training_selection_pass(
+    rows: Sequence[dict[str, Any]],
+    rejected_rows: Sequence[dict[str, Any]],
+    cfg: ProjectConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    selected_rows, duplicate_rows = _dedupe_rvc_training_rows(rows)
+    selected_rejected_rows = [*rejected_rows, *duplicate_rows]
+    selected_rows, target_trimmed_rows = _trim_rvc_training_rows_to_target(selected_rows, cfg)
+    selected_rejected_rows.extend(target_trimmed_rows)
+    summary = _rvc_training_dataset_summary(selected_rows, cfg, selected_rejected_rows)
+    return selected_rows, selected_rejected_rows, summary
+
+
+def _rvc_summary_clean_duration(summary: dict[str, Any]) -> float:
+    value = summary.get("real_clean_duration_sec", summary.get("clean_duration_sec"))
+    parsed = _rvc_float(value)
+    return parsed if parsed is not None else 0.0
+
+
+def _rvc_low_data_soft_relaxation_needed(
+    strict_summary: dict[str, Any],
+    cfg: ProjectConfig,
+) -> bool:
+    target_clean_sec = _rvc_target_clean_sec(cfg)
+    if target_clean_sec <= 0:
+        return False
+    return (
+        bool(cfg.rvc_train_low_data_enabled)
+        and bool(cfg.rvc_train_soft_allow_asmr_texture_for_low_data)
+        and _rvc_summary_clean_duration(strict_summary) + 1e-6 < target_clean_sec
+    )
+
+
+def _rvc_training_selection_metadata(
+    *,
+    selected_pass: str,
+    strict_summary: dict[str, Any],
+    strict_rejected_rows: Sequence[dict[str, Any]],
+    relaxed_summary: dict[str, Any] | None,
+    relaxed_rejected_rows: Sequence[dict[str, Any]] | None,
+    selected_rows: Sequence[dict[str, Any]],
+    trigger: str | None,
+) -> dict[str, Any]:
+    accepted_override_counts = _rvc_reason_counts_from_rows(
+        selected_rows,
+        "training_soft_penalty_reasons",
+    )
+    soft_accepted_count = sum(
+        1
+        for row in selected_rows
+        if isinstance(row.get("training_soft_penalty_reasons"), list)
+        and row["training_soft_penalty_reasons"]
+    )
+    return {
+        "training_selection_pass": selected_pass,
+        "strict_clean_duration_sec": strict_summary.get("real_clean_duration_sec", strict_summary.get("clean_duration_sec", 0.0)),
+        "relaxed_clean_duration_sec": (
+            relaxed_summary.get("real_clean_duration_sec", relaxed_summary.get("clean_duration_sec", 0.0))
+            if relaxed_summary is not None
+            else None
+        ),
+        "soft_asmr_relaxation_applied": selected_pass == "low_data_relaxed",
+        "soft_asmr_relaxation_trigger": trigger if selected_pass == "low_data_relaxed" else None,
+        "soft_asmr_accepted_count": soft_accepted_count if selected_pass == "low_data_relaxed" else 0,
+        "accepted_override_reason_counts": accepted_override_counts,
+        "strict_reject_reason_counts": _rvc_reject_reason_counts(strict_rejected_rows),
+        "relaxed_reject_reason_counts": _rvc_reject_reason_counts(relaxed_rejected_rows or []),
+    }
+
+
+def _rvc_apply_training_selection_metadata(
+    summary: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    summary.update(metadata)
+    return summary
+
+
+def _rvc_select_training_rows(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    *,
+    dataset_dir: Path,
+    strict_training_filter: bool,
+    speaker_id: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    cfg = manifest.project_config
+    if not strict_training_filter:
+        rows, rejected_rows = _rvc_collect_training_rows_for_pass(
+            project_dir,
+            manifest,
+            dataset_dir=dataset_dir,
+            strict_training_filter=False,
+            speaker_id=speaker_id,
+            soft_asmr_policy="config",
+        )
+        rows, rejected_rows, summary = _rvc_prepare_training_selection_pass(rows, rejected_rows, cfg)
+        metadata = _rvc_training_selection_metadata(
+            selected_pass="strict",
+            strict_summary=summary,
+            strict_rejected_rows=rejected_rows,
+            relaxed_summary=None,
+            relaxed_rejected_rows=None,
+            selected_rows=rows,
+            trigger=None,
+        )
+        return rows, rejected_rows, _rvc_apply_training_selection_metadata(summary, metadata), metadata
+
+    strict_rows, strict_rejected_rows = _rvc_collect_training_rows_for_pass(
+        project_dir,
+        manifest,
+        dataset_dir=dataset_dir,
+        strict_training_filter=True,
+        speaker_id=speaker_id,
+        soft_asmr_policy="strict",
+    )
+    strict_rows, strict_rejected_rows, strict_summary = _rvc_prepare_training_selection_pass(
+        strict_rows,
+        strict_rejected_rows,
+        cfg,
+    )
+    relaxed_summary: dict[str, Any] | None = None
+    relaxed_rejected_rows: list[dict[str, Any]] | None = None
+    selected_rows = strict_rows
+    selected_rejected_rows = strict_rejected_rows
+    selected_summary = strict_summary
+    selected_pass = "strict"
+    trigger = None
+    if _rvc_low_data_soft_relaxation_needed(strict_summary, cfg):
+        trigger = (
+            "strict_clean_duration_below_target:"
+            f"{_rvc_summary_clean_duration(strict_summary):.3f}<{_rvc_target_clean_sec(cfg):.3f}"
+        )
+        relaxed_rows, relaxed_rejected = _rvc_collect_training_rows_for_pass(
+            project_dir,
+            manifest,
+            dataset_dir=dataset_dir,
+            strict_training_filter=True,
+            speaker_id=speaker_id,
+            soft_asmr_policy="relaxed",
+        )
+        relaxed_rows, relaxed_rejected_rows, relaxed_summary = _rvc_prepare_training_selection_pass(
+            relaxed_rows,
+            relaxed_rejected,
+            cfg,
+        )
+        if _rvc_summary_clean_duration(relaxed_summary) > _rvc_summary_clean_duration(strict_summary) + 1e-6:
+            selected_rows = relaxed_rows
+            selected_rejected_rows = relaxed_rejected_rows
+            selected_summary = relaxed_summary
+            selected_pass = "low_data_relaxed"
+    metadata = _rvc_training_selection_metadata(
+        selected_pass=selected_pass,
+        strict_summary=strict_summary,
+        strict_rejected_rows=strict_rejected_rows,
+        relaxed_summary=relaxed_summary,
+        relaxed_rejected_rows=relaxed_rejected_rows,
+        selected_rows=selected_rows,
+        trigger=trigger,
+    )
+    return (
+        selected_rows,
+        selected_rejected_rows,
+        _rvc_apply_training_selection_metadata(selected_summary, metadata),
+        metadata,
+    )
+
+
+def _rvc_train_dataset(
+    project_dir: Path,
+    manifest: PipelineManifest,
+    force: bool,
+    *,
+    speaker_id: str | None = None,
+    dataset_dir: Path | None = None,
+) -> tuple[Path, list[dict[str, Any]]]:
+    dataset_dir = dataset_dir or project_dir / "work" / "rvc_train" / "dataset"
+    if force and dataset_dir.exists():
+        shutil.rmtree(dataset_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    augment_dir = dataset_dir.parent / "augmented"
+    if force and augment_dir.exists():
+        shutil.rmtree(augment_dir)
+    stale_manifest = dataset_dir / "dataset_manifest.json"
+    if stale_manifest.exists():
+        stale_manifest.unlink()
+    cfg = manifest.project_config
+    strict_training_filter = cfg.rvc_train_backend == "command"
+    rows, rejected_rows, summary, selection_metadata = _rvc_select_training_rows(
+        project_dir,
+        manifest,
+        dataset_dir=dataset_dir,
+        strict_training_filter=strict_training_filter,
+        speaker_id=speaker_id,
+    )
     if not rows:
         _write_rvc_train_dataset_manifest(
             project_dir,
@@ -9696,6 +9889,7 @@ def _rvc_train_dataset(
     rows, summary = _maybe_augment_rvc_training_rows(rows, cfg, dataset_dir=dataset_dir, force=force)
     augmentation_skipped_reason = summary.get("augmentation_skipped_reason")
     summary = _rvc_training_dataset_summary(rows, cfg, rejected_rows)
+    _rvc_apply_training_selection_metadata(summary, selection_metadata)
     if augmentation_skipped_reason is not None:
         summary["augmentation_skipped_reason"] = augmentation_skipped_reason
     if summary["insufficient"]:

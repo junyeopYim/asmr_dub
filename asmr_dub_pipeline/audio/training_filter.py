@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import soundfile as sf
@@ -77,12 +77,17 @@ def evaluate_voice_training_candidate(
     require_source_script: bool,
     require_speaker_id: bool,
     source_language: str | None = None,
+    soft_asmr_policy: Literal["config", "strict", "relaxed"] = "config",
 ) -> VoiceTrainingCandidateCheck:
     reasons: list[str] = []
     source_audio_path: Path | None = None
     metrics: AudioQualityMetrics | None = None
 
-    manual_reasons, soft_penalty_reasons = _manual_training_reject_reasons(segment.analysis, cfg)
+    manual_reasons, soft_penalty_reasons = _manual_training_reject_reasons(
+        segment.analysis,
+        cfg,
+        soft_asmr_policy=soft_asmr_policy,
+    )
     reasons.extend(manual_reasons)
     if require_speaker_id and not segment.speaker_id:
         reasons.append("missing_speaker_id")
@@ -268,18 +273,41 @@ def _side_to_mid_db(stereo: np.ndarray) -> float:
     return _ratio_db(_rms(side), _rms(mid))
 
 
-def _manual_training_reject_reasons(analysis: dict[str, Any], cfg: ProjectConfig) -> tuple[list[str], list[str]]:
+def _soft_asmr_relaxation_allowed(
+    cfg: ProjectConfig,
+    soft_asmr_policy: Literal["config", "strict", "relaxed"],
+) -> bool:
+    if soft_asmr_policy == "strict":
+        return False
+    if soft_asmr_policy == "relaxed":
+        return True
+    return bool(cfg.rvc_train_soft_allow_asmr_texture_for_low_data)
+
+
+def _manual_training_reject_reasons(
+    analysis: dict[str, Any],
+    cfg: ProjectConfig,
+    *,
+    soft_asmr_policy: Literal["config", "strict", "relaxed"] = "config",
+) -> tuple[list[str], list[str]]:
     voice_training = analysis.get("voice_training")
     if not isinstance(voice_training, dict):
         return [], []
     reasons: list[str] = []
     soft_penalties: list[str] = []
     hard_effect_tags, soft_effect_tags = _voice_training_effect_tags(voice_training.get("effect_tags"))
+    allow_soft_asmr = _soft_asmr_relaxation_allowed(cfg, soft_asmr_policy)
     if voice_training.get("exclude") is True and cfg.rvc_train_respect_manual_exclude:
         if hard_effect_tags:
             reasons.extend(f"manual_training_exclude:hard_effect_tag:{tag}" for tag in hard_effect_tags)
-        elif cfg.rvc_train_soft_allow_asmr_texture_for_low_data and soft_effect_tags:
+        elif allow_soft_asmr and soft_effect_tags:
             soft_penalties.extend(f"manual_training_exclude_soft_allowed:{tag}" for tag in soft_effect_tags)
+        elif soft_effect_tags:
+            reasons.extend(
+                "manual_training_exclude:soft_effect_tag_requires_low_data_relaxation:"
+                f"{tag}"
+                for tag in soft_effect_tags
+            )
         else:
             reasons.append("manual_training_exclude")
     if voice_training.get("eligible") is False:
@@ -287,7 +315,13 @@ def _manual_training_reject_reasons(analysis: dict[str, Any], cfg: ProjectConfig
     if voice_training.get("clean_voice") is False:
         reasons.append("manual_not_clean_voice")
     reasons.extend(f"voice_training_effect_tag_not_none:{tag}" for tag in hard_effect_tags)
-    soft_penalties.extend(f"voice_training_soft_effect_tag:{tag}" for tag in soft_effect_tags)
+    if allow_soft_asmr:
+        soft_penalties.extend(f"voice_training_soft_effect_tag:{tag}" for tag in soft_effect_tags)
+    else:
+        reasons.extend(
+            f"voice_training_soft_effect_tag_requires_low_data_relaxation:{tag}"
+            for tag in soft_effect_tags
+        )
     return reasons, soft_penalties
 
 

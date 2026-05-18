@@ -590,6 +590,46 @@ def test_semantic_gsv_only_hard_fail_schedules_late_qwen(
     assert synth_state["true_manual_review_count"] == 0
 
 
+def test_late_qwen_does_not_loop_after_pre_rvc_attempt(
+    tmp_project_dir: Path,
+    tmp_path: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.artifacts import make_script_generation_id, stable_hash
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment(
+        "seg_semantic",
+        duration=3.0,
+        source_text="お願いします",
+        tts_text="부탁드려요.",
+        analysis={"late_qwen_pre_rvc": {"attempted": True, "attempt": 1}},
+    )
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    store = CandidateStore(tmp_project_dir)
+    store.save_candidate(
+        _candidate(
+            tmp_path,
+            segment_id=segment.id,
+            candidate_id="gsv_too_short",
+            backend="gpt_sovits",
+            duration_sec=1.0,
+            input_script_generation_id=make_script_generation_id(segment.script),
+            input_script_hash=stable_hash(segment.script or {}),
+        )
+    )
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir))
+
+    terminal = manifest.segments[0]
+    assert terminal.status == "needs_manual_review"
+    assert terminal.analysis["ko_qc_repair_plan"]["action"] == "manual_review"
+    route_codes = terminal.analysis["tts_selection"]["route_reason_codes"]
+    assert "late_qwen_pre_rvc_attempted" in route_codes
+    assert "late_qwen_terminal_after_retry" in route_codes
+    assert manifest.stage_state["synth"]["late_qwen_scheduled_count"] == 0
+    assert manifest.stage_state["synth"]["hard_failed_segments"] == [segment.id]
+
+
 def test_qwen_all_too_short_with_qc_pass_creates_duration_rescue_candidate(
     tmp_project_dir: Path,
     tmp_path: Path,
@@ -625,6 +665,67 @@ def test_qwen_all_too_short_with_qc_pass_creates_duration_rescue_candidate(
     assert selection["duration_rescue"]["source_candidate_id"] == "qwen_too_short"
     assert "duration_rescue_after_qwen_duration_mismatch" in selection["route_reason_codes"]
     assert manifest.stage_state["synth"]["duration_rescue_scheduled_count"] == 1
+
+
+def test_numeric_qwen_duration_mismatch_does_not_use_duration_rescue(
+    tmp_project_dir: Path,
+    tmp_path: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.artifacts import make_script_generation_id, stable_hash
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment("seg_numeric", duration=3.0, source_text="3 2 1", tts_text="삼, 이, 일.")
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    store = CandidateStore(tmp_project_dir)
+    store.save_candidate(
+        _candidate(
+            tmp_path,
+            segment_id=segment.id,
+            candidate_id="qwen_numeric_too_short",
+            backend="qwen_tts",
+            duration_sec=1.0,
+            input_script_generation_id=make_script_generation_id(segment.script),
+            input_script_hash=stable_hash(segment.script or {}),
+        )
+    )
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir))
+
+    failed = manifest.segments[0]
+    assert failed.status == "needs_manual_review"
+    assert failed.analysis["tts_failure_taxonomy"]["class"] == "numeric_renderer_required"
+    assert manifest.stage_state["synth"]["duration_rescue_scheduled_count"] == 0
+
+
+def test_qwen_duration_rescue_requires_content_qc_not_fail(
+    tmp_project_dir: Path,
+    tmp_path: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.artifacts import make_script_generation_id, stable_hash
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment("seg_qwen", duration=3.0, source_text="耳元で言うね", tts_text="귓가에 말할게요.")
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    store = CandidateStore(tmp_project_dir)
+    store.save_candidate(
+        _candidate(
+            tmp_path,
+            segment_id=segment.id,
+            candidate_id="qwen_too_short_bad_qc",
+            backend="qwen_tts",
+            duration_sec=1.0,
+            payload={"pronunciation_qc": {"gate": "fail", "coverage": 0.2}},
+            input_script_generation_id=make_script_generation_id(segment.script),
+            input_script_hash=stable_hash(segment.script or {}),
+        )
+    )
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir), force=True)
+
+    failed = manifest.segments[0]
+    assert failed.status == "needs_manual_review"
+    assert failed.tts is None
+    assert manifest.stage_state["synth"]["duration_rescue_scheduled_count"] == 0
 
 
 def test_numeric_hard_fail_does_not_use_late_qwen_or_duration_rescue(

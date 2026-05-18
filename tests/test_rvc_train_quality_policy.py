@@ -237,4 +237,11 @@ def test_rvc_low_data_epoch_scaling_increases_recommendation_under_cap(
     assert decision["effective_epochs"] == decision["recommended_epoch_count_low_data"]
     assert decision["effective_epochs"] <= 90
     assert decision["effective_epoch_reason"] == "low_data_scaled"
+    assert decision["configured_train_epochs"] == 60
+    assert decision["final_train_epochs"] == decision["effective_epochs"]
+    assert decision["base_recommended_epoch_count"] == summary["recommended_epoch_count"]
+    assert decision["recommended_epoch_count_low_data"] == summary["recommended_epoch_count_low_data"]
+    assert summary["configured_train_epochs"] == 60
+    assert summary["final_train_epochs"] == decision["effective_epochs"]
+    assert summary["official_recommended_min_sec"] == 600
     assert effective_cfg.rvc_train_epochs == decision["effective_epochs"]

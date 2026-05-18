@@ -98,3 +98,31 @@ def test_synth_readiness_partial_status_requires_selection_metadata() -> None:
     assert readiness["ready"] is False
     assert "<missing:selected_segments>" in readiness["blocking_segments"]
     assert "<missing:hard_failed_segments>" in readiness["blocking_segments"]
+
+
+def test_needs_regeneration_remains_blocking_for_synth_readiness() -> None:
+    from asmr_dub_pipeline.pipeline.stage_readiness import (
+        NON_BLOCKING_SYNTH_SEGMENT_STATUSES,
+        synth_ready_for_downstream,
+    )
+
+    manifest = PipelineManifest(
+        segments=[
+            _segment("seg_0001", "needs_regeneration"),
+        ]
+    )
+    mark_stage(
+        manifest,
+        "synth",
+        "completed_with_hard_failed_candidates",
+        selected_segments=[],
+        hard_failed_segments=[],
+        late_qwen_scheduled_segments=["seg_0001"],
+    )
+
+    readiness = synth_ready_for_downstream(manifest)
+
+    assert "needs_regeneration" not in NON_BLOCKING_SYNTH_SEGMENT_STATUSES
+    assert readiness["ready"] is False
+    assert readiness["blocking_segments"] == ["seg_0001"]
+    assert readiness["missing_selected_tts_segments"] == ["seg_0001"]

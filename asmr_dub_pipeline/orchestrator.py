@@ -35,6 +35,7 @@ from .pipeline.steps import (
     transcribe_step,
     translate_ko_step,
     tts_candidate_pool_step,
+    tts_late_qwen_pre_rvc_step,
     tts_select_step,
 )
 from .qc.repair_plan import plan_is_repairable
@@ -444,6 +445,13 @@ def run_pipeline(
             mock=mock,
         )
         run_stage("tts.select", tts_select_step, project_dir)
+        run_stage(
+            "late-qwen-pre-rvc",
+            tts_late_qwen_pre_rvc_step,
+            project_dir,
+            refs_path=refs_path or Path("refs/refs.json"),
+            confirm_rights=confirm_rights,
+        )
     else:
         run_stage(
             "synth",

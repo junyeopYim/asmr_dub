@@ -40,6 +40,19 @@ def synth_ready_for_downstream(
     synth_status = str(synth_state.get("status") or "unknown")
     hard_failed_segments = _stage_list(synth_state, "hard_failed_segments")
     selected_segments = _stage_list(synth_state, "selected_segments")
+    late_qwen_scheduled_segments = _stage_list(synth_state, "late_qwen_scheduled_segments")
+    late_qwen_pre_rvc_attempted_segments = _stage_list(
+        synth_state,
+        "late_qwen_pre_rvc_attempted_segments",
+    )
+    late_qwen_pre_rvc_resolved_segments = _stage_list(
+        synth_state,
+        "late_qwen_pre_rvc_resolved_segments",
+    )
+    late_qwen_pre_rvc_terminal_segments = _stage_list(
+        synth_state,
+        "late_qwen_pre_rvc_terminal_segments",
+    )
     selected_metadata_present = "selected_segments" in synth_state
     hard_failed_metadata_present = "hard_failed_segments" in synth_state
     segment_by_id = {segment.id: segment for segment in manifest.segments}
@@ -59,8 +72,13 @@ def synth_ready_for_downstream(
             "synth_status": synth_status,
             "reason": f"synth status is not downstream-ready: {synth_status}",
             "hard_failed_segments": hard_failed_segments,
+            "late_qwen_scheduled_segments": late_qwen_scheduled_segments,
+            "late_qwen_pre_rvc_attempted_segments": late_qwen_pre_rvc_attempted_segments,
+            "late_qwen_pre_rvc_resolved_segments": late_qwen_pre_rvc_resolved_segments,
+            "late_qwen_pre_rvc_terminal_segments": late_qwen_pre_rvc_terminal_segments,
             "non_blocking_segments": [],
             "blocking_segments": [],
+            "blocking_segment_statuses": {},
             "selected_segment_count": sum(1 for segment in scoped_segments if _has_selected_tts(segment)),
             "missing_selected_tts_count": 0,
             "selected_segments": selected_segments,
@@ -97,6 +115,11 @@ def synth_ready_for_downstream(
                 blocking_segments.append(segment_id)
 
     blocking_segments = list(dict.fromkeys(blocking_segments))
+    blocking_segment_statuses = {
+        segment_id: str(segment_by_id[segment_id].status)
+        for segment_id in blocking_segments
+        if segment_id in segment_by_id
+    }
     selected_segment_count = sum(1 for segment in scoped_segments if _has_selected_tts(segment))
     missing_selected_tts_count = len(missing_selected_tts_segments)
     ready = not blocking_segments
@@ -112,8 +135,13 @@ def synth_ready_for_downstream(
         "synth_status": synth_status,
         "reason": reason,
         "hard_failed_segments": hard_failed_segments,
+        "late_qwen_scheduled_segments": late_qwen_scheduled_segments,
+        "late_qwen_pre_rvc_attempted_segments": late_qwen_pre_rvc_attempted_segments,
+        "late_qwen_pre_rvc_resolved_segments": late_qwen_pre_rvc_resolved_segments,
+        "late_qwen_pre_rvc_terminal_segments": late_qwen_pre_rvc_terminal_segments,
         "non_blocking_segments": non_blocking_segments,
         "blocking_segments": blocking_segments,
+        "blocking_segment_statuses": blocking_segment_statuses,
         "selected_segment_count": selected_segment_count,
         "missing_selected_tts_count": missing_selected_tts_count,
         "selected_segments": selected_segments,
@@ -130,4 +158,6 @@ def require_synth_ready_for_downstream(
     readiness = synth_ready_for_downstream(manifest, only_segment_ids=only_segment_ids)
     if readiness["ready"]:
         return readiness
-    raise ValueError(f"{stage_name} requires synth downstream readiness. {readiness['reason']}")
+    statuses = readiness.get("blocking_segment_statuses") or {}
+    status_detail = f" statuses={statuses}" if statuses else ""
+    raise ValueError(f"{stage_name} requires synth downstream readiness. {readiness['reason']}{status_detail}")

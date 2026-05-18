@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from asmr_dub_pipeline.audio.ffmpeg import FFmpegError, fit_audio_duration
 from asmr_dub_pipeline.audio.features import load_audio, write_audio
 from asmr_dub_pipeline.pipeline.artifacts import (
     file_fingerprint,
@@ -382,6 +383,17 @@ def _dedupe_reason_codes(*groups: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _late_qwen_pre_rvc_attempted_for_script(
+    segment: Segment,
+    script_generation_id: str | None,
+) -> bool:
+    marker = segment.analysis.get("late_qwen_pre_rvc")
+    if not isinstance(marker, dict) or marker.get("attempted") is not True:
+        return False
+    marker_script_generation_id = marker.get("input_script_generation_id")
+    return marker_script_generation_id in {None, "", script_generation_id}
+
+
 def _apply_texture_or_micro_resolution(
     segment: Segment,
     taxonomy: dict[str, Any],
@@ -439,7 +451,7 @@ def _short_reaction_segment(segment: Segment) -> bool:
 
 
 def _duration_rescue_max_stretch_ratio(segment: Segment) -> float:
-    return 1.35 if _short_reaction_segment(segment) else 1.25
+    return 1.25 if _short_reaction_segment(segment) else 1.18
 
 
 def _resample_audio_to_frames(data: np.ndarray, target_frames: int) -> np.ndarray:
@@ -466,16 +478,28 @@ def _write_duration_rescue_audio(
     data, sample_rate = load_audio(source_path)
     target_frames = max(1, int(round(target_duration_sec * sample_rate)))
     stretch_ratio = target_duration_sec / max(source_duration_sec, 1e-6)
-    if stretch_ratio <= max_stretch_ratio:
-        rescued = _resample_audio_to_frames(data, target_frames)
-        method = "time_stretch"
+    fit_ratio = max(stretch_ratio, 1.0 / max(stretch_ratio, 1e-6))
+    if fit_ratio <= max_stretch_ratio:
+        try:
+            fit_audio_duration(
+                source_path,
+                output_path,
+                target_duration_sec=target_duration_sec,
+                sample_rate=sample_rate,
+                channels=data.shape[1],
+            )
+            rescued, rescued_sample_rate = load_audio(output_path)
+            method = "ffmpeg_atempo_timefit"
+            return method, len(rescued) / float(rescued_sample_rate)
+        except FFmpegError:
+            rescued = _resample_audio_to_frames(data, target_frames)
+            method = "linear_resample_timefit"
     elif source_duration_sec < target_duration_sec:
         pad_frames = max(0, target_frames - len(data))
         rescued = np.concatenate([data, np.zeros((pad_frames, data.shape[1]), dtype=np.float32)], axis=0)
-        method = "tail_pad"
+        method = "tail_pad_silence"
     else:
-        rescued = _resample_audio_to_frames(data, target_frames)
-        method = "time_compress"
+        return "rejected_timefit_ratio_exceeded", source_duration_sec
     write_audio(output_path, rescued, sample_rate)
     return method, len(rescued) / float(sample_rate)
 
@@ -525,10 +549,22 @@ def _create_qwen_duration_rescue_candidates(
         target_duration_sec=float(segment.duration),
         max_stretch_ratio=max_stretch_ratio,
     )
+    if method == "rejected_timefit_ratio_exceeded":
+        return [], None
     payload = copy.deepcopy(source.payload)
     rescue_payload = {
         "kind": "qwen_duration_rescue",
         "method": method,
+        "algorithm": (
+            "pitch_preserving_ffmpeg_atempo"
+            if method == "ffmpeg_atempo_timefit"
+            else "linear_interpolation_or_tail_pad"
+        ),
+        "quality_todo": (
+            "replace_tail_pad_with_room_tone_or_breath_bed"
+            if method == "tail_pad_silence"
+            else None
+        ),
         "source_candidate_id": source.candidate_id,
         "source_candidate_generation_id": source.generation_id,
         "source_wav_path": source.wav_path,
@@ -536,6 +572,7 @@ def _create_qwen_duration_rescue_candidates(
         "target_duration_sec": round(float(segment.duration), 6),
         "rescued_duration_sec": round(float(rescued_duration), 6),
         "max_stretch_ratio": max_stretch_ratio,
+        "stretch_ratio": round(float(segment.duration) / max(float(source.duration_sec), 1e-6), 6),
         "route_reason_codes": ["duration_rescue_after_qwen_duration_mismatch"],
     }
     payload["duration_rescue"] = rescue_payload
@@ -578,8 +615,12 @@ def _create_qwen_duration_rescue_candidates(
         "candidate_id": candidate_id,
         "source_candidate_id": source.candidate_id,
         "method": method,
+        "algorithm": rescue_payload["algorithm"],
+        "quality_todo": rescue_payload["quality_todo"],
         "target_duration_sec": round(float(segment.duration), 6),
         "rescued_duration_sec": round(float(rescued_duration), 6),
+        "max_stretch_ratio": max_stretch_ratio,
+        "stretch_ratio": rescue_payload["stretch_ratio"],
         "route_reason_codes": ["duration_rescue_after_qwen_duration_mismatch"],
     }
     return [rescued], summary
@@ -756,9 +797,64 @@ def run_tts_select_stage(
                 segment.qc = None
                 segment.mix = {}
                 if taxonomy["class"] == "gsv_only_needs_late_qwen":
+                    if _late_qwen_pre_rvc_attempted_for_script(segment, script_generation_id):
+                        segment.status = "needs_manual_review"
+                        hard_fail_reason_counts.update(segment_hard_fail_reasons)
+                        segment.analysis["ko_qc_repair_plan"] = {
+                            "action": "manual_review",
+                            "root_cause": "gsv_only_all_candidates_hard_failed",
+                            "route": "late_qwen_terminal_after_retry",
+                            "terminal_manual": True,
+                            "terminal_reason": "late_qwen_attempt_exhausted",
+                            "issues": segment_hard_fail_reasons or ["all_candidates_hard_failed"],
+                            "source": "tts_failure_taxonomy",
+                        }
+                        marker = segment.analysis.get("late_qwen_pre_rvc")
+                        marker_payload = dict(marker) if isinstance(marker, dict) else {}
+                        segment.analysis["late_qwen_pre_rvc"] = {
+                            **marker_payload,
+                            "attempted": True,
+                            "input_script_generation_id": script_generation_id,
+                            "output_status": "needs_manual_review",
+                            "resolved": False,
+                            "terminal_reason": "late_qwen_attempt_exhausted",
+                            "selected_candidate_id": None,
+                            "selected_tts_generation_id": None,
+                        }
+                        segment.analysis["tts_selection"] = {
+                            **selection_failure_payload,
+                            "status": "manual_review",
+                            "failure_taxonomy": taxonomy,
+                            "route_reason_codes": _dedupe_reason_codes(
+                                result.route_reason_codes,
+                                extra_route_reason_codes,
+                                [
+                                    "late_qwen_after_gsv_hard_fail",
+                                    "late_qwen_pre_rvc_attempted",
+                                    "late_qwen_terminal_after_retry",
+                                ],
+                            ),
+                        }
+                        hard_failed_segments.append(segment.id)
+                        continue
                     segment.status = "needs_regeneration"
                     extra_route_reason_codes.append("late_qwen_after_gsv_hard_fail")
                     late_qwen_scheduled_segments.append(segment.id)
+                    segment.analysis["tts_late_qwen"] = {
+                        "status": "scheduled",
+                        "requested_backend": "qwen",
+                        "source_taxonomy_class": "gsv_only_needs_late_qwen",
+                        "input_script_generation_id": script_generation_id,
+                        "scheduled_from_pool_generation_id": pool_generation_id,
+                        "attempt_count": int(
+                            (
+                                segment.analysis.get("tts_late_qwen")
+                                if isinstance(segment.analysis.get("tts_late_qwen"), dict)
+                                else {}
+                            ).get("attempt_count", 0)
+                        )
+                        + 1,
+                    }
                     segment.analysis["ko_qc_repair_plan"] = {
                         "action": "fallback_tts_qwen",
                         "root_cause": "gsv_only_all_candidates_hard_failed",
