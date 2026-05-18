@@ -158,3 +158,83 @@ def test_rvc_quality_policy_flat_config_fields_migrate_to_nested() -> None:
     assert cfg.rvc.train_quality_preset == "strict"
     assert cfg.rvc_train_epoch_policy == "auto"
     assert cfg.rvc_train_target_clean_sec == pytest.approx(900.0)
+
+
+def test_rvc_low_data_above_absolute_minimum_is_trainable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duration = 393.16 / 91
+    rows = [_dataset_row(tmp_path, index, duration_sec=duration) for index in range(1, 92)]
+    _patch_duration_from_rows(monkeypatch, rows)
+    cfg = ProjectConfig(
+        rvc_train_backend="command",
+        rvc_train_target_clean_sec=600.0,
+        rvc_train_absolute_min_clean_sec=180.0,
+        rvc_train_min_clean_segments=1,
+    )
+
+    summary = common._rvc_training_dataset_summary(rows, cfg)
+
+    assert summary["insufficient"] is False
+    assert summary["trainable"] is True
+    assert summary["low_data_mode"] is True
+    assert summary["clean_duration_sec"] == pytest.approx(393.16)
+    assert summary["target_clean_sec"] == pytest.approx(600.0)
+    assert summary["absolute_min_clean_sec"] == pytest.approx(180.0)
+    assert summary["official_recommended_min_sec"] == 600
+    assert "below_recommended_clean_duration" in summary["low_data_warning"]
+    assert summary["trainability_reason"] == "low_data_mode"
+
+
+def test_rvc_below_absolute_minimum_is_insufficient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [_dataset_row(tmp_path, index, duration_sec=50.0) for index in range(1, 4)]
+    _patch_duration_from_rows(monkeypatch, rows)
+    cfg = ProjectConfig(
+        rvc_train_backend="command",
+        rvc_train_target_clean_sec=600.0,
+        rvc_train_absolute_min_clean_sec=180.0,
+        rvc_train_min_clean_segments=1,
+    )
+
+    summary = common._rvc_training_dataset_summary(rows, cfg)
+
+    assert summary["insufficient"] is True
+    assert summary["trainable"] is False
+    assert summary["low_data_mode"] is False
+    assert summary["trainability_reason"] == "clean_duration_below_absolute_min"
+    assert summary["insufficient_reasons"] == ["clean_duration_sec_below_absolute_min:150<180"]
+
+
+def test_rvc_low_data_epoch_scaling_increases_recommendation_under_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duration = 393.16 / 91
+    rows = [_dataset_row(tmp_path, index, duration_sec=duration) for index in range(1, 92)]
+    _patch_duration_from_rows(monkeypatch, rows)
+    cfg = ProjectConfig(
+        rvc_train_backend="command",
+        rvc_train_epoch_policy="fixed",
+        rvc_train_epochs=60,
+        rvc_train_auto_epoch_min=60,
+        rvc_train_auto_epoch_max=300,
+        rvc_train_low_data_max_epochs=90,
+        rvc_train_target_clean_sec=600.0,
+        rvc_train_absolute_min_clean_sec=180.0,
+        rvc_train_min_clean_segments=1,
+    )
+    summary = common._rvc_training_dataset_summary(rows, cfg)
+
+    effective_cfg, decision = common._rvc_train_effective_epoch_config(cfg, summary)
+
+    assert decision["low_data_mode"] is True
+    assert decision["low_data_scale"] == pytest.approx((600.0 / 393.16) ** 0.5)
+    assert decision["recommended_epoch_count_low_data"] > summary["recommended_epoch_count"]
+    assert decision["effective_epochs"] == decision["recommended_epoch_count_low_data"]
+    assert decision["effective_epochs"] <= 90
+    assert decision["effective_epoch_reason"] == "low_data_scaled"
+    assert effective_cfg.rvc_train_epochs == decision["effective_epochs"]

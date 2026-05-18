@@ -8873,6 +8873,68 @@ def _rvc_recommended_epoch_count(quality_grade: str) -> int:
     return RVC_TRAIN_RECOMMENDED_EPOCHS_BY_GRADE.get(quality_grade, 60)
 
 
+def _rvc_target_clean_sec(cfg: ProjectConfig) -> float:
+    target = _rvc_float(getattr(cfg, "rvc_train_target_clean_sec", None))
+    if target is None or target <= 0:
+        target = _rvc_float(getattr(cfg, "rvc_train_min_clean_sec", None))
+    return float(target or 0.0)
+
+
+def _rvc_absolute_min_clean_sec(cfg: ProjectConfig) -> float:
+    if cfg.rvc_train_backend == "mock":
+        return 0.0
+    return float(getattr(cfg, "rvc_train_absolute_min_clean_sec", 0.0) or 0.0)
+
+
+def _rvc_warning_target_clean_sec(cfg: ProjectConfig, target_clean_sec: float) -> float:
+    warn_below = _rvc_float(getattr(cfg, "rvc_train_low_data_warn_below_sec", None))
+    if warn_below is None or warn_below <= 0:
+        return target_clean_sec
+    return float(warn_below)
+
+
+def _rvc_low_data_warning(
+    *,
+    low_data_mode: bool,
+    real_clean_duration: float,
+    warn_below_sec: float,
+) -> str | None:
+    if not low_data_mode:
+        return None
+    if real_clean_duration + 1e-6 < warn_below_sec:
+        return "below_recommended_clean_duration"
+    return "low_data_mode"
+
+
+def _rvc_low_data_recommended_epochs(
+    *,
+    base_epochs: int,
+    clean_duration_sec: float,
+    target_clean_sec: float,
+    cfg: ProjectConfig,
+) -> tuple[int | None, float | None]:
+    if clean_duration_sec <= 0 or target_clean_sec <= 0:
+        return None, None
+    scale = math.sqrt(target_clean_sec / clean_duration_sec)
+    recommended = int(math.ceil(base_epochs * scale))
+    capped = min(int(cfg.rvc_train_low_data_max_epochs), max(int(cfg.rvc_train_auto_epoch_min), recommended))
+    return capped, scale
+
+
+def _rvc_reason_counts_from_rows(
+    rows: Sequence[dict[str, Any]],
+    field_name: str,
+) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for row in rows:
+        raw = row.get(field_name)
+        if isinstance(raw, list):
+            counter.update(str(item) for item in raw)
+        elif raw:
+            counter.update([str(raw)])
+    return dict(sorted(counter.items()))
+
+
 def _rvc_training_dataset_summary(
     rows: Sequence[dict[str, Any]],
     cfg: ProjectConfig,
@@ -8893,17 +8955,8 @@ def _rvc_training_dataset_summary(
         else:
             real_durations.append(row_duration)
     clean_duration = round(sum(durations), 6)
+    real_clean_duration = round(sum(real_durations), 6)
     clean_segment_count = len(rows)
-    insufficient_reasons: list[str] = []
-    if clean_segment_count < cfg.rvc_train_min_clean_segments:
-        insufficient_reasons.append(
-            f"clean_segment_count_below_min:{clean_segment_count}<{cfg.rvc_train_min_clean_segments}"
-        )
-    min_clean_sec = 0.0 if cfg.rvc_train_backend == "mock" else cfg.rvc_train_min_clean_sec
-    if clean_duration + 1e-6 < min_clean_sec:
-        insufficient_reasons.append(
-            f"clean_duration_sec_below_min:{clean_duration:g}<{min_clean_sec:g}"
-        )
     quality_stats = _rvc_stats_for_rows(rows, "quality_score")
     estimated_snr_stats = _rvc_stats_for_rows(rows, "estimated_snr_db")
     background_stats = _rvc_stats_for_rows(rows, "background_bleed_db")
@@ -8919,18 +8972,85 @@ def _rvc_training_dataset_summary(
         dominant_speaker_ratio=speaker_summary["dominant_speaker_ratio"],
         missing_speaker_ratio=speaker_summary["missing_speaker_ratio"],
     )
+    target_clean_sec = _rvc_target_clean_sec(cfg)
+    absolute_min_clean_sec = _rvc_absolute_min_clean_sec(cfg)
+    warn_below_sec = _rvc_warning_target_clean_sec(cfg, target_clean_sec)
+    insufficient_reasons: list[str] = []
+    trainability_reason = "sufficient"
+    if clean_segment_count < cfg.rvc_train_min_clean_segments:
+        insufficient_reasons.append(
+            f"clean_segment_count_below_min:{clean_segment_count}<{cfg.rvc_train_min_clean_segments}"
+        )
+        trainability_reason = "clean_segment_count_below_min"
+    duration_gate_basis = "real_clean_duration_sec" if augmented_durations else "clean_duration_sec"
+    duration_for_hard_gate = real_clean_duration if augmented_durations else clean_duration
+    if duration_for_hard_gate + 1e-6 < absolute_min_clean_sec:
+        insufficient_reasons.append(
+            f"clean_duration_sec_below_absolute_min:{duration_for_hard_gate:g}<{absolute_min_clean_sec:g}"
+        )
+        if trainability_reason == "sufficient":
+            trainability_reason = "clean_duration_below_absolute_min"
+    if (
+        not bool(cfg.rvc_train_low_data_enabled)
+        and target_clean_sec > 0
+        and duration_for_hard_gate + 1e-6 < target_clean_sec
+    ):
+        insufficient_reasons.append(
+            f"clean_duration_sec_below_target:{duration_for_hard_gate:g}<{target_clean_sec:g}"
+        )
+        if trainability_reason == "sufficient":
+            trainability_reason = "clean_duration_below_target"
+    low_data_mode = (
+        not insufficient_reasons
+        and bool(cfg.rvc_train_low_data_enabled)
+        and target_clean_sec > 0
+        and real_clean_duration + 1e-6 < target_clean_sec
+    )
+    if low_data_mode:
+        trainability_reason = "low_data_mode"
+    trainable = not insufficient_reasons
+    base_recommended_epochs = _rvc_recommended_epoch_count(quality_grade)
+    low_data_epochs, low_data_scale = (
+        _rvc_low_data_recommended_epochs(
+            base_epochs=base_recommended_epochs,
+            clean_duration_sec=max(real_clean_duration, 1e-6),
+            target_clean_sec=target_clean_sec,
+            cfg=cfg,
+        )
+        if low_data_mode and cfg.rvc_train_low_data_epoch_scale
+        else (None, None)
+    )
+    augmented_ratio = (
+        round(sum(augmented_durations) / max(sum(real_durations), 1e-6), 6)
+        if augmented_durations
+        else 0.0
+    )
     return {
         "clean_segment_count": clean_segment_count,
         "clean_duration_sec": clean_duration,
         "min_clean_segments": cfg.rvc_train_min_clean_segments,
-        "min_clean_sec": min_clean_sec,
+        "min_clean_sec": target_clean_sec,
+        "target_clean_sec": target_clean_sec,
+        "absolute_min_clean_sec": absolute_min_clean_sec,
+        "official_recommended_min_sec": 600,
+        "low_data_mode": low_data_mode,
+        "low_data_warning": _rvc_low_data_warning(
+            low_data_mode=low_data_mode,
+            real_clean_duration=real_clean_duration,
+            warn_below_sec=warn_below_sec,
+        ),
+        "trainable": trainable,
+        "trainability_reason": trainability_reason,
+        "duration_gate_basis": duration_gate_basis,
         "insufficient": bool(insufficient_reasons),
         "insufficient_reasons": insufficient_reasons,
         "real_clean_segment_count": clean_segment_count - len(augmented_durations),
-        "real_clean_duration_sec": round(sum(real_durations), 6),
+        "real_clean_duration_sec": real_clean_duration,
         "augmented_segment_count": len(augmented_durations),
         "augmented_duration_sec": round(sum(augmented_durations), 6),
+        "augmented_to_real_duration_ratio": augmented_ratio,
         "augmentation_enabled": cfg.rvc_train_augment_enabled,
+        "low_data_augmentation_enabled": cfg.rvc_train_low_data_augmentation_enabled,
         "augmentation_applied": bool(augmented_durations),
         "augmentation_max_multiplier": cfg.rvc_train_augment_max_multiplier,
         "augmentation_min_real_sec": cfg.rvc_train_augment_min_real_sec,
@@ -8938,7 +9058,10 @@ def _rvc_training_dataset_summary(
         "quality_preset": cfg.rvc_train_quality_preset,
         "epoch_policy": cfg.rvc_train_epoch_policy,
         "quality_grade": quality_grade,
-        "recommended_epoch_count": _rvc_recommended_epoch_count(quality_grade),
+        "recommended_epoch_count": base_recommended_epochs,
+        "recommended_epoch_count_low_data": low_data_epochs,
+        "low_data_epoch_scale": round(low_data_scale, 6) if low_data_scale is not None else None,
+        "effective_epoch_reason": "low_data_scaled" if low_data_epochs is not None else "quality_grade_recommendation",
         "quality_score_stats": quality_stats,
         "estimated_snr_db_stats": estimated_snr_stats,
         "background_bleed_db_stats": background_stats,
@@ -8951,6 +9074,7 @@ def _rvc_training_dataset_summary(
         "speaker_counts": speaker_summary["speaker_counts"],
         "rejected_segment_count": len(rejected_rows or []),
         "reject_reason_counts": _rvc_reject_reason_counts(rejected_rows),
+        "accepted_override_reason_counts": _rvc_reason_counts_from_rows(rows, "training_soft_penalty_reasons"),
     }
 
 
@@ -8962,9 +9086,20 @@ def _maybe_augment_rvc_training_rows(
     force: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     summary = _rvc_training_dataset_summary(rows, cfg)
-    if not rows or not summary["insufficient"]:
+    low_data_augmentation = (
+        bool(summary.get("low_data_mode"))
+        and bool(cfg.rvc_train_low_data_augmentation_enabled)
+    )
+    if not rows or (not summary["insufficient"] and not low_data_augmentation):
         return rows, summary
-    if not cfg.rvc_train_augment_enabled:
+    if summary["insufficient"] and any(
+        str(reason).startswith("clean_segment_count_below_min")
+        or str(reason).startswith("clean_duration_sec_below_absolute_min")
+        for reason in summary.get("insufficient_reasons", [])
+    ):
+        summary["augmentation_skipped_reason"] = "hard_training_minimum_not_met"
+        return rows, summary
+    if not (cfg.rvc_train_augment_enabled or low_data_augmentation):
         summary["augmentation_skipped_reason"] = "disabled"
         return rows, summary
     if summary["real_clean_duration_sec"] + 1e-6 < cfg.rvc_train_augment_min_real_sec:
@@ -9008,12 +9143,21 @@ def _maybe_augment_rvc_training_rows(
                     "dataset_path": str(dataset_dir / f"{augmented_id}.wav"),
                     "augmentation_method": method,
                     "augmentation_source_segment_id": source_segment_id,
+                    "is_augmented": True,
+                    "real_source_duration_sec": row.get("duration_sec"),
+                    "augmentation_source_duration_sec": row.get("duration_sec"),
                 }
             )
             augmented_rows.append(augmented_row)
             trial_rows = [*rows, *augmented_rows]
             trial_summary = _rvc_training_dataset_summary(trial_rows, cfg)
-            if not trial_summary["insufficient"]:
+            if (
+                not trial_summary["insufficient"]
+                and (
+                    not low_data_augmentation
+                    or trial_summary["clean_duration_sec"] + 1e-6 >= trial_summary["target_clean_sec"]
+                )
+            ):
                 return trial_rows, trial_summary
         if len(rows) + len(augmented_rows) >= max_total_rows:
             break
@@ -9198,6 +9342,10 @@ def _rvc_training_rank_score(row: dict[str, Any], cfg: ProjectConfig) -> float:
     if duration is not None and max_clip_sec is not None and duration > max_clip_sec:
         score -= min(0.10, (duration - max_clip_sec) / max(max_clip_sec * 10.0, 1.0))
 
+    soft_penalty_reasons = row.get("training_soft_penalty_reasons")
+    if isinstance(soft_penalty_reasons, list) and soft_penalty_reasons:
+        score -= min(0.20, 0.06 * len(soft_penalty_reasons))
+
     return round(max(0.0, min(1.0, score)), 6)
 
 
@@ -9304,6 +9452,7 @@ def _rvc_rejected_training_row(row: dict[str, Any], reject_reasons: Sequence[str
         "text_normalization",
         "training_rank_score",
         "training_quality_tier",
+        "training_soft_penalty_reasons",
     ):
         if key in row:
             payload[key] = row.get(key)
@@ -9315,22 +9464,48 @@ def _rvc_train_effective_epoch_config(
     dataset_summary: dict[str, Any],
 ) -> tuple[ProjectConfig, dict[str, Any]]:
     configured_epochs = int(cfg.rvc_train_epochs)
-    recommended_epochs = int(dataset_summary.get("recommended_epoch_count") or configured_epochs)
+    base_recommended_epochs = int(dataset_summary.get("recommended_epoch_count") or configured_epochs)
+    recommended_epochs = base_recommended_epochs
     auto_min = int(cfg.rvc_train_auto_epoch_min)
     auto_max = int(cfg.rvc_train_auto_epoch_max)
     effective_epochs = configured_epochs
-    if cfg.rvc_train_epoch_policy == "auto":
+    low_data_mode = bool(dataset_summary.get("low_data_mode"))
+    low_data_scale: float | None = None
+    recommended_low_data = dataset_summary.get("recommended_epoch_count_low_data")
+    effective_epoch_reason = "fixed_policy"
+    if (
+        low_data_mode
+        and cfg.rvc_train_low_data_epoch_scale
+        and recommended_low_data is not None
+    ):
+        recommended_epochs = int(recommended_low_data)
+        low_data_scale = _rvc_float(dataset_summary.get("low_data_epoch_scale"))
+        effective_epochs = min(int(cfg.rvc_train_low_data_max_epochs), max(auto_min, recommended_epochs))
+        effective_epoch_reason = "low_data_scaled"
+    elif cfg.rvc_train_epoch_policy == "auto":
         effective_epochs = max(auto_min, min(auto_max, recommended_epochs))
+        effective_epoch_reason = "auto_quality_grade"
+    elif low_data_mode:
+        effective_epoch_reason = "low_data_fixed_policy_warning"
     decision = {
         "policy": cfg.rvc_train_epoch_policy,
         "quality_preset": cfg.rvc_train_quality_preset,
         "quality_grade": dataset_summary.get("quality_grade"),
         "configured_epochs": configured_epochs,
+        "base_recommended_epoch_count": base_recommended_epochs,
         "recommended_epoch_count": recommended_epochs,
+        "recommended_epoch_count_low_data": recommended_low_data,
         "effective_epochs": effective_epochs,
         "auto_epoch_min": auto_min,
         "auto_epoch_max": auto_max,
+        "low_data_mode": low_data_mode,
+        "low_data_scale": low_data_scale,
+        "low_data_epoch_scale_enabled": cfg.rvc_train_low_data_epoch_scale,
+        "low_data_max_epochs": cfg.rvc_train_low_data_max_epochs,
+        "effective_epoch_reason": effective_epoch_reason,
     }
+    dataset_summary["effective_train_epochs"] = effective_epochs
+    dataset_summary["effective_epoch_reason"] = effective_epoch_reason
     if effective_epochs == configured_epochs:
         return cfg, decision
     payload = cfg.model_dump(mode="json")
@@ -9467,6 +9642,11 @@ def _rvc_train_dataset(
                     cfg,
                 )
             )
+            if check.soft_penalty_reasons:
+                row["training_soft_penalty_reasons"] = list(check.soft_penalty_reasons)
+                rank_score = _rvc_training_rank_score(row, cfg)
+                row["training_rank_score"] = rank_score
+                row["training_quality_tier"] = _rvc_training_quality_tier(rank_score)
             reject_reasons = [
                 *check.reject_reasons,
                 *_rvc_train_text_reject_reasons(source_chars_per_sec, cfg),

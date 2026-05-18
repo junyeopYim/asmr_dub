@@ -487,6 +487,185 @@ def test_tts_select_rejects_only_stale_candidates(tmp_project_dir: Path, tmp_pat
     assert synth_state["hard_failed_segment_count"] == 1
 
 
+def test_tts_select_preserves_script_missing_asr_texture_as_non_speech_texture(
+    tmp_project_dir: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment(
+        "seg_texture",
+        duration=0.8,
+        analysis={
+            "speech_kind": "texture",
+            "asr_quality_gate": {
+                "gate": "texture",
+                "tts_blocked": True,
+                "reasons": ["asr_non_speech_texture"],
+            },
+        },
+    )
+    segment.script = None
+    segment.source_script = None
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir))
+
+    resolved = manifest.segments[0]
+    assert resolved.status == "non_speech_texture"
+    assert resolved.tts is None
+    assert resolved.rvc is None
+    assert resolved.qc is None
+    assert resolved.analysis["tts_texture_or_micro_resolution"]["action"] == "non_speech_texture"
+    assert resolved.analysis["tts_failure_taxonomy"]["class"] == "missing_script_texture"
+    synth_state = manifest.stage_state["synth"]
+    assert synth_state["texture_bypassed_segments"] == ["seg_texture"]
+    assert synth_state["hard_failed_segments"] == []
+    assert synth_state["true_manual_review_count"] == 0
+
+
+def test_tts_select_absorbs_short_micro_segment_with_neighbor_evidence(
+    tmp_project_dir: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment(
+        "seg_micro",
+        duration=0.5,
+        analysis={
+            "korean_tts_absorption": {
+                "absorbed_into_segment_id": "seg_0001",
+                "reason": "micro_absorb",
+            }
+        },
+    )
+    segment.script = None
+    segment.source_script = None
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir))
+
+    resolved = manifest.segments[0]
+    assert resolved.status == "absorbed"
+    assert resolved.keep_original_texture is True
+    assert resolved.analysis["tts_texture_or_micro_resolution"]["action"] == "absorbed"
+    assert resolved.analysis["tts_failure_taxonomy"]["class"] == "micro_absorb"
+    assert manifest.stage_state["synth"]["absorbed_segments"] == ["seg_micro"]
+
+
+def test_semantic_gsv_only_hard_fail_schedules_late_qwen(
+    tmp_project_dir: Path,
+    tmp_path: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.artifacts import make_script_generation_id, stable_hash
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment("seg_semantic", duration=3.0, source_text="お願いします", tts_text="부탁드려요.")
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    store = CandidateStore(tmp_project_dir)
+    store.save_candidate(
+        _candidate(
+            tmp_path,
+            segment_id=segment.id,
+            candidate_id="gsv_too_short",
+            backend="gpt_sovits",
+            duration_sec=1.0,
+            input_script_generation_id=make_script_generation_id(segment.script),
+            input_script_hash=stable_hash(segment.script or {}),
+        )
+    )
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir))
+
+    scheduled = manifest.segments[0]
+    assert scheduled.status == "needs_regeneration"
+    assert scheduled.tts is None
+    taxonomy = scheduled.analysis["tts_failure_taxonomy"]
+    assert taxonomy["class"] == "gsv_only_needs_late_qwen"
+    assert taxonomy["suggested_action"] == "late_qwen"
+    assert scheduled.analysis["ko_qc_repair_plan"]["action"] == "fallback_tts_qwen"
+    assert "late_qwen_after_gsv_hard_fail" in scheduled.analysis["tts_selection"]["route_reason_codes"]
+    synth_state = manifest.stage_state["synth"]
+    assert synth_state["late_qwen_scheduled_segments"] == ["seg_semantic"]
+    assert synth_state["late_qwen_scheduled_count"] == 1
+    assert synth_state["true_manual_review_count"] == 0
+
+
+def test_qwen_all_too_short_with_qc_pass_creates_duration_rescue_candidate(
+    tmp_project_dir: Path,
+    tmp_path: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.artifacts import make_script_generation_id, stable_hash
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment("seg_qwen", duration=3.0, source_text="耳元で言うね", tts_text="귓가에 말할게요.")
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    store = CandidateStore(tmp_project_dir)
+    store.save_candidate(
+        _candidate(
+            tmp_path,
+            segment_id=segment.id,
+            candidate_id="qwen_too_short",
+            backend="qwen_tts",
+            duration_sec=1.0,
+            payload={"pronunciation_qc": {"gate": "pass", "coverage": 1.0}},
+            input_script_generation_id=make_script_generation_id(segment.script),
+            input_script_hash=stable_hash(segment.script or {}),
+        )
+    )
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir), force=True)
+
+    selected = manifest.segments[0]
+    assert selected.status == "synthesized"
+    assert selected.tts is not None
+    assert selected.tts.selected_candidate_id is not None
+    assert "duration_rescue" in selected.tts.selected_candidate_id
+    selection = selected.analysis["tts_selection"]
+    assert selection["duration_rescue"]["created"] is True
+    assert selection["duration_rescue"]["source_candidate_id"] == "qwen_too_short"
+    assert "duration_rescue_after_qwen_duration_mismatch" in selection["route_reason_codes"]
+    assert manifest.stage_state["synth"]["duration_rescue_scheduled_count"] == 1
+
+
+def test_numeric_hard_fail_does_not_use_late_qwen_or_duration_rescue(
+    tmp_project_dir: Path,
+    tmp_path: Path,
+) -> None:
+    from asmr_dub_pipeline.pipeline.artifacts import make_script_generation_id, stable_hash
+    from asmr_dub_pipeline.pipeline.stages.tts_candidates import run_tts_select_stage
+
+    segment = _segment("seg_numeric", duration=3.0, source_text="3 2 1", tts_text="삼, 이, 일.")
+    save_manifest(tmp_project_dir, PipelineManifest(segments=[segment]))
+    store = CandidateStore(tmp_project_dir)
+    store.save_candidate(
+        _candidate(
+            tmp_path,
+            segment_id=segment.id,
+            candidate_id="gsv_numeric_bad",
+            backend="gpt_sovits",
+            duration_sec=1.0,
+            input_script_generation_id=make_script_generation_id(segment.script),
+            input_script_hash=stable_hash(segment.script or {}),
+        )
+    )
+
+    manifest = run_tts_select_stage(PipelineContext.load(tmp_project_dir))
+
+    failed = manifest.segments[0]
+    assert failed.status == "needs_manual_review"
+    taxonomy = failed.analysis["tts_failure_taxonomy"]
+    assert taxonomy["class"] == "numeric_renderer_required"
+    assert taxonomy["suggested_action"] == "numeric_renderer"
+    assert "late_qwen_after_gsv_hard_fail" not in failed.analysis["tts_selection"]["route_reason_codes"]
+    assert manifest.stage_state["synth"]["late_qwen_scheduled_count"] == 0
+    assert manifest.stage_state["synth"]["duration_rescue_scheduled_count"] == 0
+    selection_manifest = json.loads(Path(manifest.artifacts["tts_selected"]).read_text("utf-8"))
+    assert selection_manifest["failure_taxonomy_counts"]["numeric_renderer_required"] == 1
+    assert selection_manifest["true_manual_review_count"] == 1
+    assert selection_manifest["actionable_manual_review_rate"] == 1.0
+    assert selection_manifest["texture_or_absorbed_rate"] == 0.0
+
+
 def test_selected_tts_generation_changes_when_wav_content_changes(
     tmp_project_dir: Path,
     tmp_path: Path,

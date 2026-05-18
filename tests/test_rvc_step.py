@@ -373,7 +373,7 @@ def test_real_rvc_train_dataset_filters_effected_and_multi_speaker_segments(tmp_
     effected.analysis = {"speaker_count": 1, "risk_flags": ["voice_effect"]}
     multi_speaker = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0003")
     multi_speaker.analysis = {"speaker_count": 2}
-    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0)
+    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0, rvc_train_absolute_min_clean_sec=0.0)
     manifest = PipelineManifest(
         project_config=cfg,
         rights_audit=require_confirmed_rights(True, "test"),
@@ -412,7 +412,7 @@ def test_real_rvc_train_dataset_requires_none_effect_tag(tmp_project_dir: Path) 
             "effect_tags": ["pitch_shift"],
         },
     }
-    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0)
+    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0, rvc_train_absolute_min_clean_sec=0.0)
     manifest = PipelineManifest(
         project_config=cfg,
         rights_audit=require_confirmed_rights(True, "test"),
@@ -429,6 +429,82 @@ def test_real_rvc_train_dataset_requires_none_effect_tag(tmp_project_dir: Path) 
         for item in dataset_manifest["rejected_segments"]
     }
     assert rejected[effected.id] == ["voice_training_effect_tag_not_none:pitch_shift"]
+
+
+def test_real_rvc_train_dataset_keeps_manual_hard_effect_excluded(
+    tmp_project_dir: Path,
+) -> None:
+    clean = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    excluded = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
+    excluded.analysis = {
+        "speaker_count": 1,
+        "voice_training": {
+            "exclude": True,
+            "clean_voice": True,
+            "eligible": True,
+            "effect_tags": ["reverb"],
+        },
+    }
+    cfg = ProjectConfig(rvc_train_min_clean_sec=0.0, rvc_train_absolute_min_clean_sec=0.0)
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[clean, excluded],
+    )
+
+    _dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert [row["segment_id"] for row in rows] == [clean.id]
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    rejected = {
+        item["segment_id"]: item["reject_reasons"]
+        for item in dataset_manifest["rejected_segments"]
+    }
+    assert "manual_training_exclude:hard_effect_tag:reverb" in rejected[excluded.id]
+    assert "voice_training_effect_tag_not_none:reverb" in rejected[excluded.id]
+
+
+def test_low_data_soft_asmr_texture_tag_can_be_accepted_with_penalty(
+    tmp_project_dir: Path,
+) -> None:
+    whisper = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
+    whisper.analysis = {
+        "speaker_count": 1,
+        "voice_training": {
+            "exclude": True,
+            "clean_voice": True,
+            "eligible": True,
+            "effect_tags": ["whisper"],
+        },
+    }
+    cfg = ProjectConfig(
+        rvc_train_min_clean_sec=0.0,
+        rvc_train_absolute_min_clean_sec=0.0,
+        rvc_train_target_clean_sec=600.0,
+        rvc_train_respect_manual_exclude=True,
+        rvc_train_soft_allow_asmr_texture_for_low_data=True,
+    )
+    manifest = PipelineManifest(
+        project_config=cfg,
+        rights_audit=require_confirmed_rights(True, "test"),
+        segments=[whisper],
+    )
+
+    _dataset_dir, rows = pipeline_steps._rvc_train_dataset(tmp_project_dir, manifest, force=False)
+
+    assert [row["segment_id"] for row in rows] == [whisper.id]
+    assert rows[0]["training_soft_penalty_reasons"] == [
+        "manual_training_exclude_soft_allowed:whisper",
+        "voice_training_soft_effect_tag:whisper",
+    ]
+    assert rows[0]["training_rank_score"] < rows[0]["quality_score"]
+    dataset_manifest = json.loads((tmp_project_dir / "work" / "rvc_train" / "dataset_manifest.json").read_text("utf-8"))
+    summary = dataset_manifest["summary"]
+    assert summary["low_data_mode"] is True
+    assert summary["accepted_override_reason_counts"] == {
+        "manual_training_exclude_soft_allowed:whisper": 1,
+        "voice_training_soft_effect_tag:whisper": 1,
+    }
 
 
 def test_real_rvc_train_dataset_rejects_overly_fast_source_speech(tmp_project_dir: Path) -> None:
@@ -451,6 +527,7 @@ def test_real_rvc_train_dataset_rejects_overly_fast_source_speech(tmp_project_di
     cfg = ProjectConfig(
         rvc_train_backend="command",
         rvc_train_min_clean_sec=0.0,
+        rvc_train_absolute_min_clean_sec=0.0,
         rvc_train_preferred_chars_per_sec=4.5,
         rvc_train_max_chars_per_sec=5.2,
     )
@@ -485,7 +562,8 @@ def test_rvc_train_dataset_augments_borderline_clean_data(tmp_project_dir: Path)
     cfg = ProjectConfig(
         rvc_train_backend="command",
         rvc_train_min_clean_sec=2.4,
-        rvc_train_min_clean_segments=3,
+        rvc_train_absolute_min_clean_sec=0.0,
+        rvc_train_min_clean_segments=1,
         rvc_train_augment_enabled=True,
         rvc_train_augment_min_real_sec=0.5,
         rvc_train_augment_max_multiplier=3,
@@ -521,7 +599,11 @@ def test_rvc_train_dataset_rejects_duplicate_source_audio_segments(tmp_project_d
     first = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0001")
     duplicate = _segment_with_tts(tmp_project_dir, duration=1.0, segment_id="seg_0002")
     duplicate.audio_for_mix = first.audio_for_mix
-    cfg = ProjectConfig(rvc_train_backend="command", rvc_train_min_clean_sec=0.0)
+    cfg = ProjectConfig(
+        rvc_train_backend="command",
+        rvc_train_min_clean_sec=0.0,
+        rvc_train_absolute_min_clean_sec=0.0,
+    )
     manifest = PipelineManifest(
         project_config=cfg,
         rights_audit=require_confirmed_rights(True, "test"),
@@ -577,6 +659,8 @@ def test_rvc_skips_training_and_uses_pre_rvc_fallback_when_clean_data_is_too_sma
         rvc_train_backend="command",
         rvc_train_command=["train-rvc", "{dataset}", "{output_model}", "{output_index}"],
         rvc_train_min_clean_sec=2.0,
+        rvc_train_absolute_min_clean_sec=0.0,
+        rvc_train_low_data_enabled=False,
         rvc_train_min_clean_segments=2,
         rvc_allow_pre_rvc_fallback=True,
     )
@@ -597,7 +681,7 @@ def test_rvc_skips_training_and_uses_pre_rvc_fallback_when_clean_data_is_too_sma
     assert trained.stage_state["train-rvc"]["clean_segment_count"] == 1
     assert trained.stage_state["train-rvc"]["clean_duration_sec"] == pytest.approx(1.0)
     assert trained.stage_state["train-rvc"]["augmentation_applied"] is False
-    assert trained.stage_state["train-rvc"]["augmentation_skipped_reason"] == "disabled"
+    assert trained.stage_state["train-rvc"]["augmentation_skipped_reason"] == "hard_training_minimum_not_met"
     assert converted.stage_state["rvc"]["status"] == "completed"
     assert converted.stage_state["rvc"]["execution_mode"] == "pre_rvc_fallback"
     converted_segment = converted.segments[0]

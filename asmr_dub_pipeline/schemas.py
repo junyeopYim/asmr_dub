@@ -859,14 +859,22 @@ class RVCConfig(StrictBaseModel):
     train_min_snr_db: float | None = Field(default=None, ge=0.0)
     train_max_background_bleed_db: float | None = None
     train_max_side_to_mid_db: float | None = None
-    train_target_clean_sec: float | None = Field(default=None, gt=0.0)
+    train_target_clean_sec: float | None = Field(default=600.0, gt=0.0)
     train_auto_epoch_min: int = Field(default=100, ge=1)
     train_auto_epoch_max: int = Field(default=200, ge=1)
     train_min_clean_sec: float = Field(default=600.0, ge=0.0)
+    train_absolute_min_clean_sec: float = Field(default=180.0, ge=0.0)
+    train_low_data_enabled: bool = True
+    train_low_data_warn_below_sec: float = Field(default=600.0, ge=0.0)
+    train_low_data_epoch_scale: bool = True
+    train_low_data_max_epochs: int = Field(default=350, ge=1)
+    train_low_data_augmentation_enabled: bool = True
     train_min_clean_segments: int = Field(default=1, ge=1)
     train_augment_enabled: bool = False
     train_augment_min_real_sec: float = Field(default=300.0, ge=0.0)
     train_augment_max_multiplier: int = Field(default=3, ge=1, le=8)
+    train_respect_manual_exclude: bool = True
+    train_soft_allow_asmr_texture_for_low_data: bool = True
     train_preprocess_processes: int = Field(default=0, ge=0)
     train_f0_workers: int = Field(default=0, ge=0)
     train_feature_workers: int = Field(default=0, ge=0)
@@ -902,6 +910,10 @@ class RVCConfig(StrictBaseModel):
     def _validate_train_auto_epoch_bounds(self) -> RVCConfig:
         if self.train_auto_epoch_max < self.train_auto_epoch_min:
             raise ValueError("rvc_train_auto_epoch_max must be >= rvc_train_auto_epoch_min")
+        if self.train_low_data_max_epochs < self.train_auto_epoch_min:
+            raise ValueError("rvc_train_low_data_max_epochs must be >= rvc_train_auto_epoch_min")
+        if "train_target_clean_sec" not in self.model_fields_set and "train_min_clean_sec" in self.model_fields_set:
+            self.train_target_clean_sec = self.train_min_clean_sec or None
         return self
 
 
@@ -1418,10 +1430,18 @@ _RVC_FLAT_FIELDS = [
     "train_auto_epoch_min",
     "train_auto_epoch_max",
     "train_min_clean_sec",
+    "train_absolute_min_clean_sec",
+    "train_low_data_enabled",
+    "train_low_data_warn_below_sec",
+    "train_low_data_epoch_scale",
+    "train_low_data_max_epochs",
+    "train_low_data_augmentation_enabled",
     "train_min_clean_segments",
     "train_augment_enabled",
     "train_augment_min_real_sec",
     "train_augment_max_multiplier",
+    "train_respect_manual_exclude",
+    "train_soft_allow_asmr_texture_for_low_data",
     "train_preprocess_processes",
     "train_f0_workers",
     "train_feature_workers",

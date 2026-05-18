@@ -36,6 +36,16 @@ DISALLOWED_TRAINING_TAGS = {
     "telephone",
     "voice_effect",
 }
+SOFT_ASMR_TRAINING_TAGS = {
+    "breathy",
+    "close_mic",
+    "close_miked",
+    "quiet",
+    "low_energy",
+    "short_reaction",
+    "whisper",
+    "whispered",
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +55,7 @@ class VoiceTrainingCandidateCheck:
     metrics: AudioQualityMetrics | None
     reject_reasons: tuple[str, ...]
     clean_source_metrics: dict[str, float | None] = field(default_factory=dict)
+    soft_penalty_reasons: tuple[str, ...] = ()
 
 
 def resolve_project_audio_path(project_dir: Path, raw_path: str, field_name: str) -> Path:
@@ -71,7 +82,8 @@ def evaluate_voice_training_candidate(
     source_audio_path: Path | None = None
     metrics: AudioQualityMetrics | None = None
 
-    reasons.extend(_manual_training_reject_reasons(segment.analysis))
+    manual_reasons, soft_penalty_reasons = _manual_training_reject_reasons(segment.analysis, cfg)
+    reasons.extend(manual_reasons)
     if require_speaker_id and not segment.speaker_id:
         reasons.append("missing_speaker_id")
     speaker_count = _analysis_speaker_count(segment.analysis)
@@ -111,6 +123,7 @@ def evaluate_voice_training_candidate(
         metrics=metrics,
         clean_source_metrics=clean_source_metrics,
         reject_reasons=tuple(dict.fromkeys(reasons)),
+        soft_penalty_reasons=tuple(dict.fromkeys(soft_penalty_reasons)),
     )
 
 
@@ -255,22 +268,35 @@ def _side_to_mid_db(stereo: np.ndarray) -> float:
     return _ratio_db(_rms(side), _rms(mid))
 
 
-def _manual_training_reject_reasons(analysis: dict[str, Any]) -> list[str]:
+def _manual_training_reject_reasons(analysis: dict[str, Any], cfg: ProjectConfig) -> tuple[list[str], list[str]]:
     voice_training = analysis.get("voice_training")
     if not isinstance(voice_training, dict):
-        return []
+        return [], []
     reasons: list[str] = []
-    if voice_training.get("exclude") is True:
-        reasons.append("manual_training_exclude")
+    soft_penalties: list[str] = []
+    hard_effect_tags, soft_effect_tags = _voice_training_effect_tags(voice_training.get("effect_tags"))
+    if voice_training.get("exclude") is True and cfg.rvc_train_respect_manual_exclude:
+        if hard_effect_tags:
+            reasons.extend(f"manual_training_exclude:hard_effect_tag:{tag}" for tag in hard_effect_tags)
+        elif cfg.rvc_train_soft_allow_asmr_texture_for_low_data and soft_effect_tags:
+            soft_penalties.extend(f"manual_training_exclude_soft_allowed:{tag}" for tag in soft_effect_tags)
+        else:
+            reasons.append("manual_training_exclude")
     if voice_training.get("eligible") is False:
         reasons.append("manual_training_ineligible")
     if voice_training.get("clean_voice") is False:
         reasons.append("manual_not_clean_voice")
-    reasons.extend(_voice_training_effect_tag_reject_reasons(voice_training.get("effect_tags")))
-    return reasons
+    reasons.extend(f"voice_training_effect_tag_not_none:{tag}" for tag in hard_effect_tags)
+    soft_penalties.extend(f"voice_training_soft_effect_tag:{tag}" for tag in soft_effect_tags)
+    return reasons, soft_penalties
 
 
 def _voice_training_effect_tag_reject_reasons(raw_tags: Any) -> list[str]:
+    hard_tags, _soft_tags = _voice_training_effect_tags(raw_tags)
+    return [f"voice_training_effect_tag_not_none:{tag}" for tag in hard_tags]
+
+
+def _voice_training_effect_tags(raw_tags: Any) -> tuple[list[str], list[str]]:
     if isinstance(raw_tags, list):
         values = raw_tags
     elif raw_tags is not None:
@@ -282,7 +308,14 @@ def _voice_training_effect_tag_reject_reasons(raw_tags: Any) -> list[str]:
         for value in values
         if _normalize_token(value) and _normalize_token(value) != "none"
     ]
-    return [f"voice_training_effect_tag_not_none:{tag}" for tag in dict.fromkeys(tags)]
+    hard_tags: list[str] = []
+    soft_tags: list[str] = []
+    for tag in dict.fromkeys(tags):
+        if tag in SOFT_ASMR_TRAINING_TAGS:
+            soft_tags.append(tag)
+        else:
+            hard_tags.append(tag)
+    return hard_tags, soft_tags
 
 
 def _analysis_speaker_count(analysis: dict[str, Any]) -> int | None:

@@ -17,6 +17,18 @@ def _synth_readiness_stage_metadata(readiness: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _update_rvc_dataset_manifest_summary(project_dir: Path, dataset_dir: Path | None, summary: dict[str, Any]) -> None:
+    dataset_manifest = _rvc_train_dataset_manifest_path(project_dir, dataset_dir)
+    try:
+        payload = json.loads(dataset_manifest.read_text("utf-8"))
+    except Exception:
+        payload = {"segments": [], "rejected_segments": []}
+    if not isinstance(payload, dict):
+        payload = {"segments": [], "rejected_segments": []}
+    payload["summary"] = summary
+    write_json_atomic(dataset_manifest, payload)
+
+
 def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, force: bool = False, mock: bool | None = None, runner: Any | None = None) -> PipelineManifest:
     project_dir = ctx.project_dir
     manifest = ctx.reload_manifest()
@@ -83,6 +95,7 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
                 raise
             dataset_summary = _rvc_train_dataset_summary_from_manifest(project_dir, dataset_dir)
             speaker_effective_cfg, epoch_decision = _rvc_train_effective_epoch_config(speaker_cfg, dataset_summary)
+            _update_rvc_dataset_manifest_summary(project_dir, dataset_dir, dataset_summary)
             model_path, index_path = rvc_train_output_paths(project_dir, speaker_effective_cfg)
             console.print(
                 f"[cyan]train-rvc[/cyan] speaker={escape(speaker_id)} "
@@ -124,6 +137,10 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
                 "configured_train_epochs": epoch_decision["configured_epochs"],
                 "effective_train_epochs": epoch_decision["effective_epochs"],
                 "dataset_quality_grade": dataset_summary.get("quality_grade"),
+                "low_data_mode": dataset_summary.get("low_data_mode", False),
+                "low_data_warning": dataset_summary.get("low_data_warning"),
+                "target_clean_sec": dataset_summary.get("target_clean_sec"),
+                "absolute_min_clean_sec": dataset_summary.get("absolute_min_clean_sec"),
                 "model_path": str(result.model_path),
                 "index_path": str(result.index_path) if result.index_path else None,
                 "command": result.command,
@@ -168,6 +185,10 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
             dataset_quality_grades={
                 speaker_id: result["dataset_quality_grade"] for speaker_id, result in speaker_results.items()
             },
+            low_data_modes={
+                speaker_id: result["dataset_summary"].get("low_data_mode", False)
+                for speaker_id, result in speaker_results.items()
+            },
         )
         save_manifest(project_dir, manifest)
         _log_stage_complete("train-rvc", manifest, f"backend={backend} speaker_count={len(speaker_ids)}")
@@ -183,6 +204,7 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
     work_dir = project_dir / "work" / "rvc_train"
     dataset_summary = _rvc_train_dataset_summary_from_manifest(project_dir, dataset_dir)
     effective_cfg, epoch_decision = _rvc_train_effective_epoch_config(cfg, dataset_summary)
+    _update_rvc_dataset_manifest_summary(project_dir, dataset_dir, dataset_summary)
     model_path, index_path = rvc_train_output_paths(project_dir, effective_cfg)
     console.print(
         f"[cyan]train-rvc[/cyan] dataset ready: {len(dataset_rows)} wav(s) -> {escape(str(dataset_dir))}"
@@ -228,6 +250,11 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
             "configured_train_epochs": epoch_decision["configured_epochs"],
             "effective_train_epochs": epoch_decision["effective_epochs"],
             "dataset_quality_grade": dataset_summary.get("quality_grade"),
+            "low_data_mode": dataset_summary.get("low_data_mode", False),
+            "low_data_warning": dataset_summary.get("low_data_warning"),
+            "target_clean_sec": dataset_summary.get("target_clean_sec"),
+            "absolute_min_clean_sec": dataset_summary.get("absolute_min_clean_sec"),
+            "official_recommended_min_sec": dataset_summary.get("official_recommended_min_sec"),
             "model_path": str(result.model_path),
             "index_path": str(result.index_path) if result.index_path else None,
             "command": result.command,
@@ -257,6 +284,14 @@ def run_rvc_train_stage(ctx: PipelineContext, confirm_rights: bool = False, forc
         configured_train_epochs=epoch_decision["configured_epochs"],
         effective_train_epochs=epoch_decision["effective_epochs"],
         recommended_epoch_count=epoch_decision["recommended_epoch_count"],
+        base_recommended_epoch_count=epoch_decision["base_recommended_epoch_count"],
+        recommended_epoch_count_low_data=epoch_decision.get("recommended_epoch_count_low_data"),
+        effective_epoch_reason=epoch_decision.get("effective_epoch_reason"),
+        low_data_mode=dataset_summary.get("low_data_mode", False),
+        low_data_warning=dataset_summary.get("low_data_warning"),
+        target_clean_sec=dataset_summary.get("target_clean_sec"),
+        absolute_min_clean_sec=dataset_summary.get("absolute_min_clean_sec"),
+        official_recommended_min_sec=dataset_summary.get("official_recommended_min_sec"),
         dataset_quality_grade=dataset_summary.get("quality_grade"),
     )
     save_manifest(project_dir, manifest)
@@ -321,6 +356,10 @@ def _maybe_skip_rvc_train_for_insufficient_data(
         augmentation_skipped_reason=summary.get("augmentation_skipped_reason"),
         min_clean_segments=summary.get("min_clean_segments", cfg.rvc_train_min_clean_segments),
         min_clean_sec=summary.get("min_clean_sec", cfg.rvc_train_min_clean_sec),
+        target_clean_sec=summary.get("target_clean_sec", cfg.rvc_train_target_clean_sec),
+        absolute_min_clean_sec=summary.get("absolute_min_clean_sec", cfg.rvc_train_absolute_min_clean_sec),
+        low_data_mode=summary.get("low_data_mode", False),
+        low_data_warning=summary.get("low_data_warning"),
         insufficient_reasons=summary.get("insufficient_reasons", []),
     )
     save_manifest(project_dir, manifest)
